@@ -6,6 +6,8 @@ use std::process::{Command, Output};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use libc::socket;
+
 fn serve(
     listener: TcpListener,
     maximum_requests: usize,
@@ -493,4 +495,87 @@ fn http_redirect_can_be_disabled() {
         1,
         "redirect target must not be requested"
     );
+}
+
+#[test]
+fn http_head_works_with_positional_and_request_struct_calls(){
+    let (address, server) = serve(
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        2,
+        |request, socket| {
+            assert!(request.starts_with("HEAD "));
+
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 123\r\nConnection: close\r\n\r\n",).unwrap();
+        },
+    );
+
+    assert_success(run(
+        &format!(
+            r#"
+        result = jsonDeserialize(http("http://{address}/", "head").get());
+
+        if (result.status != 200 || result.body != "" || result.file_content != "")
+            throw "positional HEAD must return an empty body";
+
+        result = jsonDeserialize(http({{
+            url: "http://{address}/",
+            method: "HEAD"
+        }}).get());
+
+        if (result.status != 200 || result.body != "" || result.file_content != "")
+            throw "request-struct HEAD must return an empty body";
+            "#
+        ),&[],
+    ));
+    let requests = server.join().unwrap();
+
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn http_patch_works_with_positional_and_request_struct_calls() {
+    let (address, server) = serve(
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        2,
+        |request, socket| {
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .unwrap();
+        },
+    );
+
+    assert_success(run(
+        &format!(
+            r#"
+        result = jsonDeserialize(http("http://{address}/", "patch").get());
+        if (result.status != 200 || result.body != "ok")
+            throw "positional PATCH must work";
+
+        result = jsonDeserialize(http({{
+            url: "http://{address}/",
+            method: "PATCH",
+            headers: {{ "X-Test": "patch-header" }},
+            body: "patch-body"
+        }}).get());
+
+        if (result.status != 200 || result.body != "ok")
+            throw "request-struct PATCH must work";
+    "#
+        ),
+        &[],
+    ));
+
+    let requests = server.join().unwrap();
+
+    assert_eq!(requests.len(), 2);
+
+    assert!(requests[0].starts_with("PATCH "));
+
+    assert!(requests[1].starts_with("PATCH "));
+    assert!(requests[1]
+        .to_ascii_lowercase()
+        .contains("x-test: patch-header"));
+    assert!(requests[1].ends_with("patch-body"));
 }

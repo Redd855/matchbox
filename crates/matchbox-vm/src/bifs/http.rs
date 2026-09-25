@@ -134,6 +134,9 @@ fn send_http(
         "POST" => client.post(url),
         "PUT" => client.put(url),
         "DELETE" => client.delete(url),
+        "PATCH" => client.patch(url),
+        "HEAD" => client.head(url),
+        "OPTIONS" => client.request(reqwest::Method::OPTIONS, url),
         _ => return Err(format!("Unsupported HTTP method: {method}")),
     };
     for (name, value) in headers {
@@ -210,7 +213,11 @@ pub fn http_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> 
             let result = (|| {
                 let mut response = send_http(&url, &method, &headers, body, &options)?;
                 let status = response.status().as_u16();
-                if let Some(p) = path {
+
+                if method == "HEAD"{
+                    Ok(serde_json::json!({"status": status, "file_content": "", "body": ""}))
+
+                }else if let Some(p) = path {
                     let mut file =
                         File::create(&p).map_err(|e| format!("Failed to create file: {e}"))?;
                     response.copy_to(&mut file).map_err(request_error)?;

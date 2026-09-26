@@ -579,3 +579,44 @@ fn http_patch_works_with_positional_and_request_struct_calls() {
         .contains("x-test: patch-header"));
     assert!(requests[1].ends_with("patch-body"));
 }
+
+#[test]
+fn http_options_works_with_positional_and_request_struct_calls() {
+    let (address, server) = serve( 
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        2, 
+        |request, socket| {
+            assert!(
+                request.starts_with("OPTIONS ")
+            );
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+        },
+    );
+    assert_success(run(
+        &format!(
+            r#"
+        result = jsonDeserialize(http("http://{address}/", "options").get());
+        if (result.status != 200 || result.body != "ok")
+            throw "positional OPTIONS must return status and body";
+        result = jsonDeserialize(http({{
+            url: "http://{address}/",
+            method: "OPTIONS",
+            headers: {{ "X-Test": "options-header" }},
+            body: "options-body"
+        }}).get());
+        if (result.status != 200 || result.body != "ok")
+            throw "request-struct OPTIONS must return status and body";
+    "#
+        ),
+        &[],
+    ));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    
+    assert!(requests[0].starts_with("OPTIONS "));
+    assert!(requests[1].starts_with("OPTIONS "));
+    assert!(requests[1]
+        .to_ascii_lowercase()
+        .contains("x-test: options-header"));
+    assert!(requests[1].ends_with("options-body"));
+}

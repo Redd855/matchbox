@@ -231,6 +231,12 @@ pub trait BxVM {
     fn get_global_value(&self, _name: &str) -> Option<BxValue> {
         None
     }
+    fn has_global_function(&self, name: &str) -> bool {
+        self.get_global_value(name).is_some_and(|value| self.value_matches_type_name(value, "function"))
+    }
+    fn global_function_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn soap_client_get(&self, _url: &str) -> Option<BxValue> {
         None
     }

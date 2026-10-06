@@ -69,8 +69,20 @@ fn package(dir: &Path) -> PathBuf {
         r#"
 class {
     property name="moduleRecord";
-    function configure() { settings = { width: 1, nested: { first: 1, second: 2 } }; }
-    function onLoad() { assert getModuleSettings("module").width == 32; println("loaded"); }
+    function configure() {
+        assert moduleRecord.name == "module";
+        assert moduleRecord.invocationPath == "bxModules.module";
+        assert !moduleRecord.isActivated();
+        assert boxRuntime.getModuleService().getModuleRecord("module") == moduleRecord;
+        settings = { width: 1, nested: { first: 1, second: 2 } };
+    }
+    function onLoad() {
+        assert getModuleSettings("module").width == 32;
+        assert moduleRecord.settings.width == 32;
+        assert moduleRecord.asStruct().name == "module";
+        assert !moduleRecord.isActivated();
+        println("loaded");
+    }
     function onUnload() { println("unloaded"); }
 }
 "#,
@@ -78,7 +90,25 @@ class {
     .unwrap();
     fs::write(
         module.join("bifs/SharedDouble.bx"),
-        "class { function invoke(required numeric value) { return value * 2; } }",
+        r#"class {
+            function invoke(required numeric value) {
+                assert moduleRecord.name == "module";
+                assert moduleRecord.settings.width == 32;
+                assert functionService.hasGlobalFunction("SharedDouble");
+                assert !functionService.hasGlobalFunction("ordinaryUserFunction");
+                assert boxRuntime.getFunctionService() == functionService;
+                assert arrayFindNoCase(functionService.getGlobalFunctionNames(), "SharedDouble") > 0;
+                return value * 2;
+            }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/GenericInfo.bx"),
+        r#"
+@BoxMember({any: {name: "info"}})
+class { function invoke(required any value) { return {value:-9}; } }
+"#,
     )
     .unwrap();
     let artifact = artifact();
@@ -275,8 +305,10 @@ fn module_contract_direct_bytecode_and_standalone() {
     fs::write(
         dir.path().join("app.bxs"),
         r#"
+function ordinaryUserFunction() { return "user function"; }
 assert sharedDouble(value=4) == 8;
 assert fixtureCreate().info().value == 42;
+assert (3).info().value == -9;
 object = fixtureNew(VALUE=32);
 assert fixtureInfo(object).value == 32;
 assert object.info().value == 32;
@@ -469,6 +501,201 @@ class {
     let output = cli(dir.path(), &["app.bxs", "--module", "consumer-dir"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires missing module provider"));
+}
+
+#[test]
+fn shared_bif_annotations_bind_members_independently_of_global_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("boxlang_modules/annotations");
+    fs::create_dir_all(module.join("bifs")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(
+        module.join("bifs/StringDecorate.bx"),
+        r#"
+@BoxBIF( ["decorate", "decorateAlias"] )
+@BoxMember( {string: {name: "decorate", objectArgument: "text"}} )
+class {
+    function invoke(required string prefix, required string text, string suffix = "!") {
+        return prefix & text & suffix;
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/ArrayLabel.bx"),
+        r#"
+@BoxBIF( "onlyArrayLabel" )
+@BoxMember( "array" )
+class { function invoke(required array value) { return "array-" & arrayLen(value); } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/StructLabel.bx"),
+        r#"
+class boxBIF="onlyStructLabel" boxMember={struct: {}} {
+    function invoke(required struct value) { return "struct-" & structCount(value); }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/IntegerLabel.bx"),
+        r#"
+@BoxBIF("signedLabel", "signedAlias")
+@BoxMember("integer")
+class { function invoke(required integer value) { return "integer-" & value; } }
+"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+function check(required boolean condition) { if (!condition) { throw "annotation assertion failed"; } }
+check(stringDecorate("[", "value") == "[value!");
+check(decorateAlias(TEXT="value", PREFIX="[", SUFFIX="]") == "[value]");
+check("value".decorate("[") == "[value!");
+check("value".decorate(SUFFIX="]", PREFIX="[") == "[value]");
+check([1,2].label() == "array-2");
+check({}.label() == "struct-0");
+check(onlyArrayLabel([1]) == "array-1");
+check(onlyStructLabel({a:1}) == "struct-1");
+check(integerLabel(3) == "integer-3");
+check(signedAlias(3) == "integer-3");
+check(signedLabel(3) == "integer-3");
+check((3).label() == "integer-3");
+check("3".label() == "integer-3");
+check((42).decorate("[") == "[42!");
+decorate = function() { return "replaced"; };
+decorateAlias = decorate;
+stringDecorate = decorate;
+check("value".decorate("[") == "[value!");
+check(!isDefined("arrayLabel"));
+check(!isDefined("structLabel"));
+println("annotations OK");
+"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs"]);
+    success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "annotations OK"
+    );
+    success(&cli(
+        dir.path(),
+        &["--build", "app.bxs", "--output", "app.bxb"],
+    ));
+    fs::remove_dir_all(dir.path().join("boxlang_modules")).unwrap();
+    let output = cli(dir.path(), &["app.bxb"]);
+    success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "annotations OK"
+    );
+}
+
+#[test]
+fn startup_failures_unwind_partial_modules_and_preserve_the_original_error() {
+    for phase in ["configure", "onLoad", "application"] {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            let module = dir.path().join("boxlang_modules").join(name);
+            fs::create_dir_all(&module).unwrap();
+            let dependency = if name == "b" {
+                "this.dependencies = ['a'];"
+            } else {
+                ""
+            };
+            let fail_configure = if name == "b" && phase == "configure" {
+                "throw 'startup failure';"
+            } else {
+                ""
+            };
+            let fail_load = if name == "b" && phase == "onLoad" {
+                "throw 'startup failure';"
+            } else {
+                ""
+            };
+            let fail_unload = if name == "b" {
+                "throw 'shutdown failure';"
+            } else {
+                ""
+            };
+            fs::write(
+                module.join("ModuleConfig.bx"),
+                format!(
+                    r#"
+class {{
+    {dependency}
+    function configure() {{ settings = {{}}; {fail_configure} }}
+    function onLoad() {{ assert !moduleRecord.isActivated(); {fail_load} println("load-{name}"); }}
+    function onUnload() {{
+        println("unload-{name}-" & moduleRecord.isActivated());
+        {fail_unload}
+    }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(dir.path().join("app.bxs"), "throw 'application failure';").unwrap();
+        let output = cli(dir.path(), &["app.bxs"]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(if phase == "application" {
+                "application failure"
+            } else {
+                "startup failure"
+            }),
+            "{stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = match phase {
+            "configure" => "unload-b-false\nunload-a-false",
+            "onLoad" => "load-a\nunload-b-false\nunload-a-true",
+            _ => "load-a\nload-b\nunload-b-true\nunload-a-true",
+        };
+        assert_eq!(stdout.trim(), expected);
+    }
+}
+
+#[test]
+fn runtime_home_modules_are_discovered_and_project_packages_take_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let global = home.join("modules/location");
+    let local = dir.path().join("boxlang_modules/location");
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("ModuleConfig.bx"),
+        "class { function configure() { settings = {source:'home'}; } }",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app.bxs"),
+        "println(getModuleSettings('location').source);",
+    )
+    .unwrap();
+    let execute = || {
+        Command::new(env!("CARGO_BIN_EXE_matchbox"))
+            .current_dir(dir.path())
+            .env("BOXLANG_HOME", &home)
+            .args(["app.bxs"])
+            .output()
+            .unwrap()
+    };
+    let output = execute();
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "home");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(
+        local.join("ModuleConfig.bx"),
+        "class { function configure() { settings = {source:'project'}; } }",
+    )
+    .unwrap();
+    let output = execute();
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "project");
 }
 
 #[test]

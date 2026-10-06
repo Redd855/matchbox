@@ -1,6 +1,8 @@
 pub mod chunk;
 pub mod gc;
 pub mod intern;
+#[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+mod members;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod opcode;
@@ -493,6 +495,7 @@ pub struct VM {
     pub fibers: Vec<BxFiber>,
     pub global_names: HashMap<u32, usize>,
     pub global_values: Vec<BxValue>,
+    global_bifs: HashSet<String>,
     pub script_variables: Rc<RefCell<HashMap<String, BxValue>>>,
     pub current_fiber_idx: Option<usize>,
     pub shapes: ShapeRegistry,
@@ -501,6 +504,8 @@ pub struct VM {
     pub interner: StringInterner,
     pub cli_args: Vec<String>,
     soap_clients: HashMap<String, BxValue>,
+    #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+    members: HashMap<String, HashMap<String, members::RegisteredMember>>,
     pub output_buffer: Option<String>,
     pub gc_suspended: bool,
     thread_futures: HashSet<usize>,
@@ -1459,9 +1464,19 @@ impl BxVM for VM {
             .is_some_and(|fiber| self.thread_futures.contains(&fiber.future_id))
     }
 
+    fn has_global_function(&self, name: &str) -> bool {
+        self.global_bifs.contains(&name.to_lowercase())
+    }
+
+    fn global_function_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.global_bifs.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
     fn register_callback(&mut self, name: &str, callback: crate::types::NativeCallback) -> Result<(), String> {
         let id = self.heap.alloc(GcObject::NativeCallback(callback));
-        self.insert_global(name.to_string(), BxValue::new_ptr(id));
+        self.register_global_bif(name.to_string(), BxValue::new_ptr(id));
         Ok(())
     }
 
@@ -2238,6 +2253,7 @@ impl VM {
             fibers: Vec::new(),
             global_names: HashMap::new(),
             global_values: Vec::new(),
+            global_bifs: HashSet::new(),
             script_variables: Self::new_variables_scope(),
             current_fiber_idx: None,
             shapes: ShapeRegistry::new(),
@@ -2250,6 +2266,8 @@ impl VM {
             interner: StringInterner::new(),
             cli_args: Vec::new(),
             soap_clients: HashMap::new(),
+            #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+            members: HashMap::new(),
             output_buffer: None,
             gc_suspended: false,
             thread_futures: HashSet::new(),
@@ -2285,13 +2303,13 @@ impl VM {
         // Register standard BIFs
         for (name, func) in crate::bifs::register_all() {
             let id = vm.heap.alloc(GcObject::NativeFunction(func));
-            vm.insert_global(name, BxValue::new_ptr(id));
+            vm.register_global_bif(name, BxValue::new_ptr(id));
         }
 
         // Register external/plugin BIFs
         for (name, func) in external_bifs {
             let id = vm.heap.alloc(GcObject::NativeFunction(func));
-            vm.insert_global(name, BxValue::new_ptr(id));
+            vm.register_global_bif(name, BxValue::new_ptr(id));
         }
 
         // Initialize 'server' scope
@@ -2517,6 +2535,11 @@ impl VM {
 
         let server_ptr = self.heap.alloc(GcObject::Struct(server_struct));
         self.insert_global("server".to_string(), BxValue::new_ptr(server_ptr));
+    }
+
+    pub fn register_global_bif(&mut self, name: String, value: BxValue) {
+        self.global_bifs.insert(name.to_lowercase());
+        self.insert_global(name, value);
     }
 
     pub fn insert_global(&mut self, name: String, val: BxValue) {
@@ -7249,6 +7272,12 @@ impl VM {
         name: &str,
         args: Vec<BxValue>,
     ) -> Result<BxValue> {
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+        if let Some((member, receiver)) = self.registered_member(receiver, name) {
+            let function = self.heap.read_retained_value(&member.function).map_err(anyhow::Error::msg)?;
+            let args = member.arguments(receiver, args, None)?;
+            return self.call_function_by_value(&function, args, Rc::new(RefCell::new(Chunk::default()))).map_err(anyhow::Error::msg);
+        }
         let id = receiver
             .as_gc_id()
             .ok_or_else(|| anyhow::anyhow!("Value is not an object instance"))?;
@@ -7442,6 +7471,20 @@ impl VM {
             GcObject::Instance(instance) => instance.variables.borrow().get(&name.to_lowercase()).copied(),
             _ => None,
         }
+    }
+
+    pub fn set_instance_variable(&mut self, receiver: BxValue, name: &str, value: BxValue) -> Result<()> {
+        let id = receiver.as_gc_id().ok_or_else(|| anyhow::anyhow!("Value is not an object instance"))?;
+        match self.heap.get_mut(id) {
+            GcObject::Instance(instance) => { instance.variables.borrow_mut().insert(name.to_lowercase(), value); Ok(()) }
+            _ => bail!("Value is not an object instance"),
+        }
+    }
+
+    pub fn instance_property(&self, receiver: BxValue, name: &str) -> Option<BxValue> {
+        let GcObject::Instance(instance) = self.heap.get_opt(receiver.as_gc_id()?)? else { return None; };
+        let index = self.shapes.get_index(instance.shape_id, self.interner.get_id(name)?)?;
+        instance.properties.get(index as usize).copied()
     }
 
     pub fn instance_has_method(&self, receiver: BxValue, name: &str) -> bool {
@@ -8028,6 +8071,20 @@ impl VM {
     ) -> Result<()> {
         let receiver_idx = self.fibers[fiber_idx].stack.len() - 1 - arg_count as usize;
         let receiver_val = self.fibers[fiber_idx].stack[receiver_idx];
+
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+        if let Some((member, member_receiver)) = self.registered_member(receiver_val, &name) {
+            let args = self.fibers[fiber_idx].stack.drain(receiver_idx + 1..).collect();
+            let args = match member.arguments(member_receiver, args, names) {
+                Ok(args) => args,
+                Err(error) => return self.throw_error(fiber_idx, &error.to_string()),
+            };
+            let function = self.heap.read_retained_value(&member.function).map_err(anyhow::Error::msg)?;
+            self.fibers[fiber_idx].stack[receiver_idx] = function;
+            let count = args.len();
+            self.fibers[fiber_idx].stack.extend(args);
+            return self.execute_call(fiber_idx, count, None);
+        }
 
         if let Some(id) = receiver_val.as_gc_id() {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]

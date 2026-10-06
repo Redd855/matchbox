@@ -29,11 +29,19 @@ Publish separate artifacts for OS, architecture, and libc. Authors must choose a
 
 ## Runtime startup
 
-Discovery reads metadata and compiles descriptors without executing lifecycle hooks. Module names honor `boxlang.moduleName`; literal descriptor mappings and dependency arrays are supported. Dependencies initialize first; missing dependencies and cycles fail. Disabled modules are omitted. Application overrides come from `boxlang.json` → `modules.<name>.settings`.
+Modules are discovered in project-local `boxlang_modules/` and in `BOXLANG_HOME/modules/` when that environment variable is set; project packages and explicit selections take precedence for the same directory name. Arbitrary locations can be selected with `--module` or explicit manifest paths. Discovery reads metadata and compiles descriptors without executing lifecycle hooks. Module names honor `boxlang.moduleName`; literal descriptor mappings and dependency arrays are supported. Dependencies initialize first; missing dependencies and cycles fail. Disabled modules are omitted. Application overrides come from `boxlang.json` → `modules.<name>.settings`.
 
 At execution, load native providers, instantiate descriptors, call `configure()`, read the descriptor's **variables-scope `settings`**, deep-merge application settings, and register BoxLang class BIFs using their `invoke()` method. After initialization, call `onLoad()` in dependency order. Call `onUnload()` in reverse order at normal shutdown, including application errors. This does not provide cleanup after process abort/crash.
 
-`configure()` populates `settings`; its return value is ignored. Old build-time lifecycle execution and baked settings are removed. Class BIF names currently come from filenames; class annotation aliases/member declarations, tags, interceptors, dynamic/struct-valued mappings, and moduleRecord/service injection are not yet implemented. Native objects can declare member-to-BIF mappings. A module relying on unsupported JVM APIs must provide an alternative backend.
+`configure()` populates `settings`; its return value is ignored. Old build-time lifecycle execution and baked settings are removed. Class BIFs honor `@BoxBIF` aliases and `@BoxMember` declarations (also supported as class-header attributes). A string alias replaces the filename name; an alias array includes the filename name. Members retain their callable independently of global aliases and bind the receiver to `objectArgument`, or the first declared argument by default, for positional and named calls. The currently supported member targets are the VM's core scalar, array, struct, date, class, and callable types; JVM-specific targets fail explicitly. Members currently require a declared receiver parameter. Doc-comment annotations, tags, interceptors, and dynamic/struct-valued mappings are not yet implemented. Native objects can declare member-to-BIF mappings. A module relying on unsupported JVM APIs must provide an alternative backend.
+
+### Injected references and startup cleanup
+
+Descriptors and class BIFs receive a live `moduleRecord`, `boxRuntime`, and `log` in their variables scope, after construction and before `configure()`/`invoke()`. BIFs also receive `functionService`. The record exposes name, source-package path, mapping, dependencies, descriptor metadata, merged settings, class BIF/member registrations, `moduleConfig`, and activation state; `asStruct()`, `isEnabled()`, and `isActivated()` are supported. Settings remain the same mutable struct visible to the descriptor and `getModuleSettings()`.
+
+The core adapters currently support `boxRuntime.getFunctionService()` / `getModuleService()`, function-service `hasGlobalFunction()` / `getGlobalFunctionNames()` for registered native and class BIFs (not ordinary UDFs), module-service `getModuleRecord()` / `hasModule()` / `getRegistry()`, and single-message logger methods. Unsupported service calls fail explicitly; this is not a complete JVM service API. Interceptor, component, cache, async, scheduler, and datasource-service injection remain pending.
+
+Activation is marked only after `onLoad()` succeeds. Reverse-order cleanup includes partially configured modules when startup fails, continues if an `onUnload()` hook fails, and preserves the original startup/application error.
 
 ## Native SDK / ABI
 
@@ -83,7 +91,7 @@ matchbox --target native app.bxs --module /path/to/package --output app
 
 Native libraries are extracted into a private content-addressed cache by target/hash. Publication is atomic across concurrent launches; cached bytes are verified before loading. Tampered entries fail rather than being silently trusted. Set `MATCHBOX_NATIVE_CACHE` to choose the directory. Otherwise use the platform's user cache directory (or a process-specific temporary directory when no home/cache directory is available).
 
-Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly.
+Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 2; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
 
 ## Checks
 

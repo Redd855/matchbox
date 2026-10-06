@@ -351,7 +351,7 @@ impl<'a> Parser<'a> {
 
         match self.peek_kind() {
             Some(TokenKind::Import) => self.parse_import(line),
-            Some(TokenKind::Class) | Some(TokenKind::Abstract) | Some(TokenKind::Final)
+            Some(TokenKind::Class) | Some(TokenKind::Abstract) | Some(TokenKind::Final) | Some(TokenKind::At)
                 if self.is_class_decl() =>
             {
                 self.parse_class(line)
@@ -396,8 +396,50 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn is_function_decl(&self) -> bool {
+    fn declaration_start(&self) -> usize {
         let mut i = self.pos;
+        while self.tokens.get(i).is_some_and(|t| t.kind == TokenKind::At) {
+            i += 2; // @ and annotation name
+            if self.tokens.get(i).is_some_and(|t| t.kind == TokenKind::LeftParen) {
+                let mut depth = 0;
+                while let Some(token) = self.tokens.get(i) {
+                    i += 1;
+                    match token.kind {
+                        TokenKind::LeftParen => depth += 1,
+                        TokenKind::RightParen => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            while self.tokens.get(i).is_some_and(|t| t.kind == TokenKind::Semicolon) { i += 1; }
+        }
+        i
+    }
+
+    fn parse_attributes(&mut self) -> Result<Vec<Attribute>> {
+        let mut attributes = Vec::new();
+        while self.peek_is(TokenKind::At) {
+            self.pos += 1;
+            let name = self.expect_get(TokenKind::Identifier)?;
+            let args = if self.peek_is(TokenKind::LeftParen) {
+                self.pos += 1;
+                let args = self.parse_args()?;
+                self.expect(TokenKind::RightParen)?;
+                args
+            } else {
+                vec![]
+            };
+            attributes.push(Attribute { name, args });
+            while self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
+        }
+        Ok(attributes)
+    }
+
+    fn is_function_decl(&self) -> bool {
+        let mut i = self.declaration_start();
         while i < self.tokens.len() {
             match self.tokens[i].kind {
                 TokenKind::At | TokenKind::Public | TokenKind::Private | TokenKind::Remote
@@ -427,7 +469,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_class_decl(&self) -> bool {
-        let mut i = self.pos;
+        let mut i = self.declaration_start();
         while i < self.tokens.len() {
             match self.tokens[i].kind {
                 TokenKind::Abstract | TokenKind::Final => {
@@ -473,6 +515,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_class(&mut self, line: u32) -> Result<Statement> {
+        let mut attributes = self.parse_attributes()?;
         let mut modifiers = crate::ast::ClassModifiers::default();
         while matches!(self.peek_kind(), Some(TokenKind::Abstract) | Some(TokenKind::Final)) {
             match self.peek_kind() {
@@ -483,7 +526,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         self.expect(TokenKind::Class)?;
-        let name = if self.peek_is(TokenKind::Identifier) {
+        let name = if self.peek_is(TokenKind::Identifier)
+            && !matches!(self.kind(1), Some(TokenKind::Equal | TokenKind::Colon))
+            && !self.peek_lexeme().is_some_and(|s| s.eq_ignore_ascii_case("boxBif") || s.eq_ignore_ascii_case("boxMember"))
+        {
             self.advance_lexeme().unwrap_or_default()
         } else {
             String::new()
@@ -496,27 +542,23 @@ impl<'a> Parser<'a> {
             Some(TokenKind::Extends) | Some(TokenKind::Accessors) | Some(TokenKind::Implements)
             | Some(TokenKind::Identifier)
         ) {
-            let attr_name = self.peek_lexeme().unwrap_or("").to_string();
-            if matches!(attr_name.as_str(), "extends" | "accessors" | "implements") {
-                self.pos += 1; // attr name
-                self.expect(TokenKind::Equal)?;
-                let val = if self.peek_kind() == Some(TokenKind::String) {
-                    let s = self.peek_lexeme().unwrap_or("").to_string();
-                    self.pos += 1;
-                    if s.len() >= 2 { s[1..s.len() - 1].to_string() } else { s }
-                } else {
-                    return Err(self
-                        .error_current(format!("expected string value for '{}'", attr_name))
-                        .into());
-                };
-                match attr_name.as_str() {
-                    "extends" => extends = Some(val),
-                    "accessors" => accessors = val.to_lowercase() == "true",
-                    "implements" => implements = val.split(',').map(|s| s.trim().to_string()).collect(),
-                    _ => {}
-                }
-            } else {
-                break;
+            let attr_name = self.advance_lexeme().unwrap_or_default();
+            let value = if matches!(self.peek_kind(), Some(TokenKind::Equal | TokenKind::Colon)) {
+                self.pos += 1;
+                Some(self.parse_expression()?)
+            } else { None };
+            let text = value.as_ref().and_then(|v| match &v.kind {
+                ExpressionKind::Literal(Literal::String(parts)) => parts.iter().map(|part| {
+                    match part { StringPart::Text(text) => Some(text.as_str()), _ => None }
+                }).collect::<Option<String>>(),
+                ExpressionKind::Literal(Literal::Boolean(value)) => Some(value.to_string()),
+                _ => None,
+            });
+            match attr_name.to_ascii_lowercase().as_str() {
+                "extends" => extends = Some(text.ok_or_else(|| self.error_current("extends requires a string"))?),
+                "accessors" => accessors = text.as_deref().unwrap_or("true").eq_ignore_ascii_case("true"),
+                "implements" => implements = text.ok_or_else(|| self.error_current("implements requires a string"))?.split(',').map(|s| s.trim().to_string()).collect(),
+                _ => attributes.push(Attribute { name: attr_name, args: value.into_iter().map(|value| Argument { name: None, value }).collect() }),
             }
         }
 
@@ -540,7 +582,7 @@ impl<'a> Parser<'a> {
         }
         self.pos += 1; // }
         Ok(Statement::new(
-            StatementKind::ClassDecl { name, modifiers, extends, accessors, implements, members },
+            StatementKind::ClassDecl { name, attributes, modifiers, extends, accessors, implements, members },
             line,
         ))
     }
@@ -562,19 +604,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_decl(&mut self, line: u32) -> Result<Statement> {
-        let mut attributes = Vec::new();
-        while self.peek_is(TokenKind::At) {
-            self.pos += 1; // @
-            let attr_name = self.expect_get(TokenKind::Identifier)?;
-            let mut args = Vec::new();
-            if self.peek_is(TokenKind::LeftParen) {
-                self.pos += 1; // (
-                args = self.parse_args()?;
-                self.expect(TokenKind::RightParen)?;
-            }
-            attributes.push(Attribute { name: attr_name, args });
-        }
-
+        let attributes = self.parse_attributes()?;
         let mut modifiers = crate::ast::FunctionModifiers::default();
         loop {
             match self.peek_kind() {

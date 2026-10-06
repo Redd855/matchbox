@@ -77,6 +77,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/matchbox-runner/src/main.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-runner/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/mod.rs");
+    println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/members.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/intern.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/opcode.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/bifs");
@@ -86,6 +87,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/matchbox-vm/build.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/plugins.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/bundle.rs");
+    println!("cargo:rerun-if-changed=crates/matchbox-vm/src/module_services.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-plugin-sdk");
     println!("cargo:rerun-if-changed=build.rs");
 

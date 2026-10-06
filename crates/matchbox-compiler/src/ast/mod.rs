@@ -46,6 +46,7 @@ pub enum StatementKind {
     },
     ClassDecl {
         name: String,
+        attributes: Vec<Attribute>,
         modifiers: ClassModifiers,
         extends: Option<String>,
         accessors: bool,

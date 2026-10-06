@@ -87,8 +87,9 @@ fn default_max_connections() -> u32 {
 /// directory name):
 /// 1. `box.json` dependencies (following CommandBox conventions)
 /// 2. `matchbox.toml` in `project_dir`
-/// 3. `modules/` and `boxlang_modules/` directory scanning
+/// 3. Project-local `boxlang_modules/` directory scanning
 /// 4. `extra_module_paths` collected from `--module <path>` CLI flags
+/// 5. `BOXLANG_HOME/modules/` supplies packages not installed/selected locally
 ///
 /// Returns an empty `Vec` when neither source provides any modules, so callers can always
 /// call this unconditionally.
@@ -126,15 +127,9 @@ pub fn discover_modules(
                 }
             }
 
-            // Otherwise, look in modules/ or boxlang_modules/
-            let mod_path = project_dir.join("modules").join(&name);
+            let mod_path = project_dir.join("boxlang_modules").join(&name);
             if mod_path.exists() {
                 entries.push((name, mod_path));
-            } else {
-                let bx_mod_path = project_dir.join("boxlang_modules").join(&name);
-                if bx_mod_path.exists() {
-                    entries.push((name, bx_mod_path));
-                }
             }
         }
     }
@@ -158,23 +153,22 @@ pub fn discover_modules(
         }
     }
 
-    // 3. Scan modules/ and boxlang_modules/ for any folders with ModuleConfig.bx not already added
-    for dir_name in &["modules", "boxlang_modules"] {
-        let dir_path = project_dir.join(dir_name);
-        if dir_path.is_dir() {
-            if let Ok(dir_entries) = std::fs::read_dir(dir_path) {
-                for entry in dir_entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() && path.join("ModuleConfig.bx").exists() {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        if !entries.iter().any(|(n, _)| n == &name) {
-                            entries.push((name, path));
-                        }
-                    }
+    // 3. Scan the project installation directory for packages not explicitly configured.
+    let dir_path = project_dir.join("boxlang_modules");
+    if dir_path.is_dir() {
+        let mut paths = std::fs::read_dir(dir_path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        paths.sort();
+        for path in paths {
+            if path.is_dir() && path.join("ModuleConfig.bx").is_file() {
+                let name = path
+                    .file_name()
+                    .context("Module directory has no name")?
+                    .to_string_lossy()
+                    .into_owned();
+                if !entries.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    entries.push((name, path));
                 }
             }
         }
@@ -197,7 +191,34 @@ pub fn discover_modules(
         entries.push((name, path));
     }
 
-    // 3. Validate and resolve each entry.
+    // The runtime home is lower priority than project packages and explicit selections.
+    if let Some(home) = std::env::var_os("BOXLANG_HOME") {
+        let directory = PathBuf::from(home).join("modules");
+        if directory.is_dir() {
+            let mut paths = std::fs::read_dir(directory)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            paths.sort();
+            for path in paths {
+                if !path.is_dir() || !path.join("ModuleConfig.bx").is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .context("Module directory has no name")?
+                    .to_string_lossy()
+                    .into_owned();
+                if !entries
+                    .iter()
+                    .any(|(local, _)| local.eq_ignore_ascii_case(&name))
+                {
+                    entries.push((name, path));
+                }
+            }
+        }
+    }
+
+    // Validate and resolve each entry.
     let mut modules = Vec::new();
     for (mut name, path) in entries {
         let path = path.canonicalize().with_context(|| {

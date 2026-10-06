@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use matchbox_compiler::{ast::*, parser};
 use matchbox_vm::{
     Chunk,
-    bundle::{Artifact, Module, TARGET},
+    bundle::{Artifact, Bif, BifMember, Module, TARGET},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, fs, path::Path};
@@ -50,10 +50,19 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 modules,
             )?;
             let mut bifs_ast = Vec::new();
+            let mut bif_registrations = Vec::new();
             for (bif_index, (name, source)) in module.bif_classes.iter().enumerate() {
                 let class = format!("__mb_bif_{index}_{bif_index}");
                 let instance = format!("__mb_bif_instance_{index}_{bif_index}");
                 let mut ast = parser::parse(source, Some(name))?;
+                let function = format!("__mb_bif_function_{index}_{bif_index}");
+                let (aliases, members) = bif_annotations(&ast, name)?;
+                bif_registrations.push(Bif {
+                    instance: instance.clone(),
+                    function: function.clone(),
+                    aliases,
+                    members,
+                });
                 rename_class(&mut ast, &class)?;
                 let (params, return_type) = ast
                     .iter()
@@ -110,7 +119,7 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 )?);
                 ast.push(Statement::new(
                     StatementKind::FunctionDecl {
-                        name: name.clone(),
+                        name: function,
                         attributes: vec![],
                         modifiers: FunctionModifiers::default(),
                         return_type,
@@ -136,14 +145,151 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
             let artifact = read_artifact(&module.path, target)?;
             Ok(Module {
                 name: module.name.clone(),
+                path: module.path.to_string_lossy().into_owned(),
+                mapping: module.mapping.clone(),
+                dependencies: module.dependencies.clone(),
                 instance,
                 descriptor,
                 bifs,
+                bif_registrations,
                 settings: module.settings.clone(),
                 artifact,
             })
         })
         .collect()
+}
+fn annotation_value(expression: &Expression) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    Ok(match &expression.kind {
+        ExpressionKind::Identifier(name) => Value::String(name.clone()),
+        ExpressionKind::Literal(Literal::String(parts)) => Value::String(
+            parts
+                .iter()
+                .map(|part| match part {
+                    StringPart::Text(text) => Ok(text.as_str()),
+                    _ => bail!("BIF annotations must be literals"),
+                })
+                .collect::<Result<String>>()?,
+        ),
+        ExpressionKind::Literal(Literal::Array(values)) => {
+            Value::Array(values.iter().map(annotation_value).collect::<Result<_>>()?)
+        }
+        ExpressionKind::Literal(Literal::Struct(values)) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let key = annotation_value(key)?;
+                    Ok((
+                        key.as_str()
+                            .context("Annotation keys must be strings")?
+                            .to_lowercase(),
+                        annotation_value(value)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        ExpressionKind::Literal(Literal::Boolean(value)) => Value::Bool(*value),
+        ExpressionKind::Literal(Literal::Number(value)) => serde_json::json!(value),
+        ExpressionKind::Literal(Literal::Null) => Value::Null,
+        _ => bail!("BIF annotations must be literals"),
+    })
+}
+fn bif_annotations(ast: &[Statement], name: &str) -> Result<(Vec<String>, Vec<BifMember>)> {
+    let attributes = ast
+        .iter()
+        .find_map(|statement| match &statement.kind {
+            StatementKind::ClassDecl { attributes, .. } => Some(attributes),
+            _ => None,
+        })
+        .context("BIF needs a class")?;
+    let annotation = |key: &str| -> Result<serde_json::Value> {
+        let Some(attribute) = attributes
+            .iter()
+            .rev()
+            .find(|a| a.name.eq_ignore_ascii_case(key))
+        else {
+            return Ok(serde_json::Value::Null);
+        };
+        if attribute.args.len() > 1 {
+            return Ok(serde_json::Value::Array(
+                attribute
+                    .args
+                    .iter()
+                    .map(|arg| annotation_value(&arg.value))
+                    .collect::<Result<_>>()?,
+            ));
+        }
+        attribute
+            .args
+            .first()
+            .map(|arg| annotation_value(&arg.value))
+            .unwrap_or_else(|| Ok(serde_json::Value::String(String::new())))
+    };
+    let mut aliases = match annotation("boxBif")? {
+        serde_json::Value::String(alias) if !alias.trim().is_empty() => vec![alias],
+        serde_json::Value::Array(aliases) => {
+            let mut result = aliases
+                .iter()
+                .map(|alias| {
+                    alias
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("BoxBIF aliases must be strings")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            result.push(name.into());
+            result
+        }
+        _ => vec![name.into()],
+    };
+    if aliases.iter().any(|name| name.trim().is_empty()) {
+        bail!("BoxBIF aliases cannot be empty");
+    }
+    let mut seen = std::collections::HashSet::new();
+    aliases.retain(|name| seen.insert(name.to_lowercase()));
+    let mut members = Vec::new();
+    let mut add_member = |type_name: &str, record: &serde_json::Value| -> Result<()> {
+        let type_name = type_name.to_lowercase();
+        let default_name = name.to_lowercase().replace(&type_name, "");
+        let member = record
+            .get("name")
+            .map(|name| name.as_str().context("BoxMember name must be a string"))
+            .transpose()?
+            .unwrap_or(&default_name)
+            .to_owned();
+        let object_argument = record
+            .get("objectargument")
+            .map(|argument| {
+                argument
+                    .as_str()
+                    .context("BoxMember objectArgument must be a string")
+            })
+            .transpose()?
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        members.push(BifMember {
+            name: member,
+            type_name,
+            object_argument,
+        });
+        Ok(())
+    };
+    match annotation("boxMember")? {
+        serde_json::Value::String(type_name) if type_name.trim().is_empty() => {
+            bail!("BoxMember requires a type")
+        }
+        serde_json::Value::String(type_name) => add_member(&type_name, &serde_json::json!({}))?,
+        serde_json::Value::Object(types) => {
+            for (type_name, record) in types {
+                if !record.is_object() {
+                    bail!("BoxMember value must be a struct");
+                }
+                add_member(&type_name, &record)?;
+            }
+        }
+        _ => (),
+    }
+    Ok((aliases, members))
 }
 fn rename_class(ast: &mut [Statement], name: &str) -> Result<()> {
     let mut found = false;

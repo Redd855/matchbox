@@ -149,6 +149,7 @@ impl Compiler {
                 accessors,
                 implements,
                 members,
+                ..
             } => {
                 let mut constructor_compiler = Compiler::with_chunk(self.chunk.new_sub_chunk());
                 constructor_compiler.is_class = true;

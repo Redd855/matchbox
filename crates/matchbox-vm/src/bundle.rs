@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x01";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x02";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Artifact {
@@ -135,11 +135,28 @@ pub fn cache_root() -> PathBuf {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct BifMember {
+    pub name: String,
+    pub type_name: String,
+    pub object_argument: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Bif {
+    pub instance: String,
+    pub function: String,
+    pub aliases: Vec<String>,
+    pub members: Vec<BifMember>,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Module {
     pub name: String,
+    pub path: String,
+    pub mapping: String,
+    pub dependencies: Vec<String>,
     pub instance: String,
     pub descriptor: Chunk,
     pub bifs: Chunk,
+    pub bif_registrations: Vec<Bif>,
     #[serde(with = "json_string")]
     pub settings: serde_json::Value,
     pub artifact: Option<Artifact>,
@@ -174,6 +191,7 @@ impl Application {
     pub fn run(mut self, vm: &mut VM, cache: &Path) -> Result<BxValue> {
         let mut records = Vec::new();
         let result = (|| {
+            let services = crate::module_services::Services::new(vm);
             let settings_id = vm.struct_new();
             vm.insert_global(
                 "__matchbox_module_settings".into(),
@@ -208,12 +226,21 @@ impl Application {
                 let instance = vm
                     .get_global(&module.instance)
                     .context("Module descriptor did not create an instance")?;
+                let defaults = vm
+                    .instance_variable(instance, "settings")
+                    .unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
+                vm.set_instance_variable(instance, "settings", defaults)?;
+                let record = crate::module_services::record(vm, module, instance, defaults);
+                services.register(vm, &module.name, record);
+                services.inject(vm, instance, record, false)?;
+                // Include partially initialized descriptors in reverse-order error cleanup.
+                records.push((instance, record));
                 if vm.instance_has_method(instance, "configure") {
                     vm.call_method_value(instance, "configure", vec![])?;
                 }
                 let settings = vm
                     .instance_variable(instance, "settings")
-                    .unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
+                    .context("Module settings missing")?;
                 if !vm.is_struct_value(settings) {
                     bail!("Module {} settings must be a struct", module.name);
                 }
@@ -222,24 +249,65 @@ impl Application {
                     merge_settings(vm, id, overrides);
                 }
                 vm.struct_set(settings_id, &module.name, settings);
+                crate::module_services::set_record(vm, record, "settings", settings)?;
                 module.bifs.reconstruct_functions();
                 vm.interpret(module.bifs.clone())?;
-                records.push(instance);
+                for bif in &module.bif_registrations {
+                    let bif_instance = vm
+                        .get_global(&bif.instance)
+                        .context("Module BIF instance missing")?;
+                    services.inject(vm, bif_instance, record, true)?;
+                    let function = vm
+                        .get_global(&bif.function)
+                        .context("Module BIF wrapper missing")?;
+                    for alias in &bif.aliases {
+                        vm.register_global_bif(alias.clone(), function);
+                    }
+                    for member in &bif.members {
+                        vm.register_member_method(function, member)?;
+                    }
+                }
+                let aliases: Vec<_> = module
+                    .bif_registrations
+                    .iter()
+                    .flat_map(|bif| &bif.aliases)
+                    .collect();
+                let aliases = vm.json_to_bx(serde_json::json!(aliases));
+                crate::module_services::set_record(vm, record, "bifs", aliases)?;
+                let members: Vec<_> = module.bif_registrations.iter().flat_map(|bif| &bif.members).map(|member| serde_json::json!({
+                    "name": member.name, "type": member.type_name, "objectArgument": member.object_argument.as_deref().unwrap_or("")
+                })).collect();
+                let members = vm.json_to_bx(serde_json::json!(members));
+                crate::module_services::set_record(vm, record, "memberMethods", members)?;
             }
-            for &instance in &records {
+            for &(instance, record) in &records {
                 if vm.instance_has_method(instance, "onLoad") {
                     vm.call_method_value(instance, "onLoad", vec![])?;
                 }
+                crate::module_services::set_record(
+                    vm,
+                    record,
+                    "activated",
+                    BxValue::new_bool(true),
+                )?;
             }
             self.chunk.reconstruct_functions();
             vm.interpret(self.chunk)
         })();
         let mut shutdown_error = None;
-        for instance in records.into_iter().rev() {
+        for (instance, record) in records.into_iter().rev() {
             if vm.instance_has_method(instance, "onUnload") {
                 if let Err(error) = vm.call_method_value(instance, "onUnload", vec![]) {
                     shutdown_error.get_or_insert(error);
                 }
+            }
+            if let Err(error) = crate::module_services::set_record(
+                vm,
+                record,
+                "activated",
+                BxValue::new_bool(false),
+            ) {
+                shutdown_error.get_or_insert(error);
             }
         }
         match (result, shutdown_error) {

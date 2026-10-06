@@ -338,7 +338,7 @@ impl Application {
                     services.inject(vm, bif_instance, record, true)?;
                     let function = vm
                         .get_global(&bif.function)
-                        .context("Module BIF wrapper missing")?;
+                        .context("Module BIF callable missing")?;
                     for alias in &bif.aliases {
                         vm.register_global_bif(alias.clone(), function);
                     }

@@ -14,7 +14,7 @@ use std::rc::Rc;
 pub(super) struct RegisteredMember {
     pub function: Rc<RootedValue>,
     pub parameters: Vec<String>,
-    pub object_index: usize,
+    pub object_argument: Option<String>,
 }
 impl RegisteredMember {
     pub fn arguments(
@@ -22,58 +22,45 @@ impl RegisteredMember {
         receiver: BxValue,
         args: Vec<BxValue>,
         names: Option<Vec<String>>,
-    ) -> Result<Vec<BxValue>> {
-        if self.parameters.is_empty() {
-            if names
-                .as_ref()
-                .is_some_and(|names| names.iter().any(|name| !name.is_empty()))
-            {
-                bail!(
-                    "Function does not accept any arguments and can't be used as a member method with named arguments."
-                );
-            }
-            // ponytail: undeclared positional values are not retained in the arguments scope; add alongside general UDF varargs support.
-            return Ok(vec![]);
+    ) -> Result<(Vec<BxValue>, Option<Vec<String>>)> {
+        let named = names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| !name.is_empty()));
+        if self.object_argument.is_none() && !named {
+            let mut values = vec![receiver];
+            values.extend(args);
+            return Ok((values, None));
         }
-        let mut values = vec![BxValue::new_null(); self.parameters.len()];
-        let mut assigned = vec![false; values.len()];
-        values[self.object_index] = receiver;
-        assigned[self.object_index] = true;
-        let mut positional = 0;
+        let receiver_name = self
+            .object_argument
+            .as_ref()
+            .or_else(|| self.parameters.first())
+            .context(
+                "Function does not accept any arguments and can't be used as a member method with named arguments.",
+            )?;
+        let mut values = Vec::new();
+        let mut argument_names = Vec::new();
+        let mut positional = self
+            .parameters
+            .iter()
+            .filter(|parameter| !parameter.eq_ignore_ascii_case(receiver_name));
         for (index, value) in args.into_iter().enumerate() {
             let name = names
                 .as_ref()
                 .and_then(|names| names.get(index))
                 .filter(|name| !name.is_empty());
-            let slot = if let Some(name) = name {
-                let slot = self
-                    .parameters
-                    .iter()
-                    .position(|parameter| parameter.eq_ignore_ascii_case(name))
-                    .with_context(|| format!("Unknown member argument: {name}"))?;
-                // JVM member dispatch always supplies the actual receiver, even if a caller names it.
-                if slot == self.object_index {
-                    continue;
-                }
-                slot
-            } else {
-                while positional == self.object_index {
-                    positional += 1;
-                }
-                let slot = positional;
-                positional += 1;
-                if slot >= values.len() {
-                    bail!("Too many member arguments");
-                }
-                slot
+            let Some(name) = name.or_else(|| positional.next()) else {
+                break;
             };
-            if assigned[slot] {
-                bail!("Duplicate member argument: {}", self.parameters[slot]);
+            if name.eq_ignore_ascii_case(receiver_name) {
+                continue;
             }
-            assigned[slot] = true;
-            values[slot] = value;
+            values.push(value);
+            argument_names.push(name.clone());
         }
-        Ok(values)
+        values.push(receiver);
+        argument_names.push(receiver_name.clone());
+        Ok((values, Some(argument_names)))
     }
 }
 impl VM {
@@ -114,16 +101,7 @@ impl VM {
             Some(GcObject::NativeCallback(function)) => function.parameters.clone(),
             _ => bail!("Module member must refer to a callable with declared arguments"),
         };
-        let object_index = if let Some(name) = &member.object_argument {
-            parameters
-                .iter()
-                .position(|parameter| parameter.eq_ignore_ascii_case(name))
-                .with_context(|| {
-                    format!("BoxMember objectArgument does not name an invoke() parameter: {name}")
-                })?
-        } else {
-            0
-        };
+        let function = self.bif_function(function, &member.name, true);
         let function = self
             .heap
             .retain_value(function)
@@ -136,7 +114,7 @@ impl VM {
                 RegisteredMember {
                     function,
                     parameters,
-                    object_index,
+                    object_argument: member.object_argument.clone(),
                 },
             );
         Ok(())

@@ -75,8 +75,7 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                     members,
                 });
                 rename_class(&mut ast, &class)?;
-                let (params, return_type) = ast
-                    .iter()
+                ast.iter()
                     .find_map(|s| {
                         let StatementKind::ClassDecl { members, .. } = &s.kind else {
                             return None;
@@ -85,63 +84,17 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                             let ClassMember::Statement(s) = m else {
                                 return None;
                             };
-                            let StatementKind::FunctionDecl {
-                                name,
-                                params,
-                                return_type,
-                                ..
-                            } = &s.kind
-                            else {
+                            let StatementKind::FunctionDecl { name, .. } = &s.kind else {
                                 return None;
                             };
-                            name.eq_ignore_ascii_case("invoke")
-                                .then(|| (params.clone(), return_type.clone()))
+                            name.eq_ignore_ascii_case("invoke").then_some(())
                         })
                     })
                     .with_context(|| format!("Module {} BIF {name} needs invoke()", module.name))?;
-                let call = Expression::new(
-                    ExpressionKind::FunctionCall {
-                        base: Box::new(Expression::new(
-                            ExpressionKind::MemberAccess {
-                                base: Box::new(Expression::new(
-                                    ExpressionKind::Identifier(instance.clone()),
-                                    1,
-                                )),
-                                member: "invoke".into(),
-                            },
-                            1,
-                        )),
-                        args: params
-                            .iter()
-                            .map(|p| Argument {
-                                name: None,
-                                value: Expression::new(
-                                    ExpressionKind::Identifier(p.name.clone()),
-                                    1,
-                                ),
-                            })
-                            .collect(),
-                    },
-                    1,
-                );
                 ast.extend(parser::parse(
-                    &format!("{instance} = new {class}();"),
+                    &format!("{instance} = new {class}(); {function} = {instance}.invoke;"),
                     None,
                 )?);
-                ast.push(Statement::new(
-                    StatementKind::FunctionDecl {
-                        name: function,
-                        attributes: vec![],
-                        modifiers: FunctionModifiers::default(),
-                        return_type,
-                        params,
-                        body: FunctionBody::Block(vec![Statement::new(
-                            StatementKind::Return(Some(call)),
-                            1,
-                        )]),
-                    },
-                    1,
-                ));
                 bifs_ast.extend(ast);
             }
             for source in &module.bif_sources {

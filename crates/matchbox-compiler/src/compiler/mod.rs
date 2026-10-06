@@ -287,6 +287,7 @@ impl Compiler {
 
                             let func = BxCompiledFunction {
                                 name: format!("{}.{}", name, getter_name),
+                                bif: None,
                                 kind: FunctionKind::Udf,
                                 arity: 0,
                                 min_arity: 0,
@@ -311,6 +312,7 @@ impl Compiler {
 
                             let func = BxCompiledFunction {
                                 name: format!("{}.{}", name, setter_name),
+                                bif: None,
                                 kind: FunctionKind::Udf,
                                 arity: 1,
                                 min_arity: 1,
@@ -368,6 +370,7 @@ impl Compiler {
 
                 let constructor = BxCompiledFunction {
                     name: format!("{}.constructor", name),
+                    bif: None,
                     kind: FunctionKind::Udf,
                     arity: 0,
                     min_arity: 0,
@@ -2466,30 +2469,19 @@ impl Compiler {
             }
         }
 
-        // BoxLang compatibility: create `arguments` scope struct.
+        // The VM supplies the complete arguments scope; defaults update declared entries.
         sub_compiler.locals.push(Local {
             name: "arguments".to_string(),
             depth: 1,
         });
         let args_local_idx = params.len() as u32;
         for (i, param) in params.iter().enumerate() {
-            let key_idx = sub_compiler
-                .chunk
-                .add_constant(Constant::String(BoxString::new(&param.name)));
-            sub_compiler
-                .chunk
-                .emit1(op::CONSTANT, key_idx, self.current_line);
-            sub_compiler
-                .chunk
-                .emit1(op::GET_LOCAL, i as u32, self.current_line);
+            let key_idx = sub_compiler.chunk.add_constant(Constant::String(BoxString::new(&param.name)));
+            sub_compiler.chunk.emit1(op::GET_LOCAL, args_local_idx, self.current_line);
+            sub_compiler.chunk.emit1(op::GET_LOCAL, i as u32, self.current_line);
+            sub_compiler.chunk.emit1(op::SET_MEMBER, key_idx, self.current_line);
+            sub_compiler.chunk.emit0(op::POP, self.current_line);
         }
-        sub_compiler
-            .chunk
-            .emit1(op::STRUCT, params.len() as u32, self.current_line);
-        sub_compiler
-            .chunk
-            .emit1(op::SET_LOCAL, args_local_idx, self.current_line);
-        sub_compiler.chunk.emit0(op::POP, self.current_line);
 
         match body {
             FunctionBody::Block(stmts) => {
@@ -2517,6 +2509,7 @@ impl Compiler {
 
         Ok(BxCompiledFunction {
             name: name.to_string(),
+            bif: None,
             kind,
             arity: (params.len() + 1) as u32, // +1 for the implicit `arguments` local
             min_arity,

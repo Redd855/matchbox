@@ -835,6 +835,91 @@ println("annotations OK");
 }
 
 #[test]
+fn module_bifs_preserve_arguments_and_execution_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("bifs")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(
+        module.join("bifs/Inspect.bx"),
+        r#"
+@BoxBIF(["inspectCall","inspectAlias"])
+@BoxMember({string:{name:"inspectMember",objectArgument:"target"}})
+class { function invoke(string prefix="default") { return arguments; } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/Bare.bx"),
+        r#"
+@BoxMember({string:{name:"bareArguments"}})
+class { function invoke() { return arguments; } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app.bxs"),
+        r#"
+a = inspectAlias(prefix="named", extra={kept:42});
+assert a.prefix == "named" && a.extra.kept == 42;
+assert a.__functionName == "inspectAlias" && !a.__isMemberExecution;
+a = inspectCall("first", "second");
+assert a.prefix == "first" && a[2] == "second";
+a = "receiver".inspectMember(extra=42,target="ignored");
+assert a.target == "receiver" && a.prefix == "default" && a.extra == 42;
+assert a.__functionName == "inspectMember" && a.__isMemberExecution;
+a = "receiver".inspectMember("prefix");
+assert a.prefix == "prefix" && a.target == "receiver";
+a = "receiver".bareArguments(3,4);
+assert a[1] == "receiver" && a[2] == 3 && a[3] == 4;
+assert a.__isMemberExecution;
+function ordinary(string declared="default") { return arguments; }
+a = ordinary(extra=9);
+assert a.declared == "default" && a.extra == 9;
+a = ordinary("declared", 2, 3);
+assert a.declared == "declared" && a[2] == 2 && a[3] == 3;
+class Extra { function inspect(string value="default") { return arguments; } }
+a = new Extra().inspect(extra=8);
+assert a.value == "default" && a.extra == 8;
+println("BIF invocation parity OK");
+"#,
+    )
+    .unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "BIF invocation parity OK"
+    );
+    success(&cli(
+        dir.path(),
+        &[
+            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
+        ],
+    ));
+    success(&cli(
+        dir.path(),
+        &[
+            "--target",
+            "native",
+            "app.bxs",
+            "--module",
+            "module",
+            "--output",
+            "application",
+        ],
+    ));
+    fs::remove_dir_all(&module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    success(&cli(dir.path(), &["app.bxb"]));
+    let output = Command::new(dir.path().join("application"))
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    success(&output);
+}
+
+#[test]
 fn parameterless_members_match_positional_and_named_jvm_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let module = dir.path().join("module");

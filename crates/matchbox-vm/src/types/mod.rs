@@ -499,8 +499,11 @@ pub struct BxCompiledFunction {
     pub arity: u32,     // Total parameters
     pub min_arity: u32, // Required parameters
     pub params: Vec<String>, // Parameter names
+    /// Runtime registration context, never part of compiled bytecode or the plugin ABI.
+    #[serde(skip)]
+    pub bif: Option<(String, bool)>,
     pub modifiers: FunctionModifiers,
-    /// Captured `this` for closures created inside class contexts.
+    /// Captured `this` for class closures and bound method references.
     #[serde(skip)]
     pub captured_receiver: Option<BxValue>,
     /// The actual bytecode for this function.

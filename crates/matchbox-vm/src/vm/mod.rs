@@ -3,6 +3,7 @@ pub mod gc;
 pub mod intern;
 #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
 mod members;
+mod calls;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod opcode;
@@ -1925,6 +1926,7 @@ impl VM {
             modifiers: crate::types::FunctionModifiers::default(),
             captured_receiver: None,
             chunk: chunk_for_func,
+            bif: None,
         });
 
         let future = self.spawn(
@@ -1944,6 +1946,7 @@ impl VM {
         args: Vec<BxValue>,
         priority: u8,
         receiver: Option<BxValue>,
+        names: Option<Vec<String>>,
     ) -> BxValue {
         let receiver = receiver
             .or(function.captured_receiver)
@@ -1955,6 +1958,7 @@ impl VM {
             success_handler: None,
         }));
 
+        let args = self.function_arguments(args, names.as_deref(), &function);
         let mut stack = Vec::with_capacity(function.arity as usize + 1);
         stack.push(func);
         for arg in args {
@@ -2539,6 +2543,7 @@ impl VM {
 
     pub fn register_global_bif(&mut self, name: String, value: BxValue) {
         self.global_bifs.insert(name.to_lowercase());
+        let value = self.bif_function(value, &name, false);
         self.insert_global(name, value);
     }
 
@@ -3013,6 +3018,7 @@ impl VM {
             params: Vec::new(),
             modifiers: crate::types::FunctionModifiers::default(),
             captured_receiver: None,
+            bif: None,
             chunk: chunk_for_func,
         });
 
@@ -3056,6 +3062,7 @@ impl VM {
         chunk_rc: Rc<RefCell<Chunk>>,
     ) -> Result<BxValue> {
         let function = Rc::new(BxCompiledFunction {
+            bif: None,
             name: "script".to_string(),
             kind: crate::types::FunctionKind::Udf,
             arity: 0,
@@ -3119,15 +3126,10 @@ impl VM {
             match self.heap.get(id) {
                 GcObject::CompiledFunction(f) => {
                     let f = Rc::clone(f);
-                    if args.len() < f.min_arity as usize || args.len() > f.arity as usize {
-                        anyhow::bail!(
-                            "Expected {}-{} arguments but got {}",
-                            f.min_arity,
-                            f.arity,
-                            args.len()
-                        );
+                    if args.len() < f.min_arity as usize {
+                        anyhow::bail!("Expected at least {} arguments but got {}", f.min_arity, args.len());
                     }
-                    Ok(self.enqueue_function_call(func, f, args, 0, receiver))
+                    Ok(self.enqueue_function_call(func, f, args, 0, receiver, None))
                 }
                 GcObject::NativeCallback(_) => {
                     let res = self.call_function_value(func, args, None);
@@ -3209,6 +3211,7 @@ impl VM {
         let chunk_for_func = chunk.clone();
         let chunk_rc = Rc::new(RefCell::new(chunk));
         let function = Rc::new(BxCompiledFunction {
+            bif: None,
             name: "script".to_string(),
             kind: crate::types::FunctionKind::Udf,
             arity: 0,
@@ -3446,6 +3449,7 @@ impl VM {
             success_handler: None,
         }));
 
+        let args = self.function_arguments(args, None, &func);
         let mut stack = Vec::with_capacity(func.arity as usize + 1);
         let func_val = BxValue::new_ptr(
             self.heap
@@ -5591,8 +5595,9 @@ impl VM {
                                     if let Some(method) =
                                         self.resolve_method(Rc::clone(&class), &name)
                                     {
-                                        let m_id =
-                                            self.heap.alloc(GcObject::CompiledFunction(method));
+                                        let mut method = (*method).clone();
+                                        method.captured_receiver = Some(base_val);
+                                        let m_id = self.heap.alloc(GcObject::CompiledFunction(Rc::new(method)));
                                         self.fibers[fiber_idx].stack.push(BxValue::new_ptr(m_id));
                                     } else {
                                         self.fibers[fiber_idx].stack.push(BxValue::new_null());
@@ -7200,19 +7205,15 @@ impl VM {
         args: Vec<BxValue>,
         _chunk: Option<Rc<RefCell<Chunk>>>,
     ) -> Result<BxValue> {
+        self.call_function_value_named(func, args, None)
+    }
+
+    pub fn call_function_value_named(&mut self, func: BxValue, args: Vec<BxValue>, names: Option<Vec<String>>) -> Result<BxValue> {
         if let Some(id) = func.as_gc_id() {
             match self.heap.get(id) {
                 GcObject::CompiledFunction(f) => {
                     let f = Rc::clone(f);
-                    if args.len() < f.min_arity as usize || args.len() > f.arity as usize {
-                        anyhow::bail!(
-                            "Expected {}-{} arguments but got {}",
-                            f.min_arity,
-                            f.arity,
-                            args.len()
-                        );
-                    }
-                    let _future = self.enqueue_function_call(func, f, args, 0, None);
+                    let _future = self.enqueue_function_call(func, f, args, 0, None, names);
                     let fiber_idx = self.fibers.len() - 1;
                     let previous_fiber_idx = self.current_fiber_idx;
                     self.current_fiber_idx = Some(fiber_idx);
@@ -7232,10 +7233,17 @@ impl VM {
                 }
                 GcObject::NativeCallback(callback) => {
                     let callback = callback.clone();
+                    let args = if let Some(names) = names {
+                        Self::reorder_callback_arguments(args, names, &callback.parameters).map_err(anyhow::Error::msg)?
+                    } else { args };
                     self.invoke_callback(&callback, &args).map_err(anyhow::Error::msg)
                 }
                 GcObject::NativeFunction(f) => {
                     let f = *f;
+                    let args = if let Some(names) = names {
+                        let name = self.native_global_name(func);
+                        self.reorder_native_arguments(args, names, name.as_deref())
+                    } else { args };
                     let previous_gc = self.gc_suspended;
                     self.gc_suspended = true;
                     let res = f(self, &args).map_err(|e| anyhow::anyhow!(e));
@@ -7275,8 +7283,8 @@ impl VM {
         #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
         if let Some((member, receiver)) = self.registered_member(receiver, name) {
             let function = self.heap.read_retained_value(&member.function).map_err(anyhow::Error::msg)?;
-            let args = member.arguments(receiver, args, None)?;
-            return self.call_function_by_value(&function, args, Rc::new(RefCell::new(Chunk::default()))).map_err(anyhow::Error::msg);
+            let (args, names) = member.arguments(receiver, args, None)?;
+            return self.call_function_value_named(function, args, names);
         }
         let id = receiver
             .as_gc_id()
@@ -7292,20 +7300,7 @@ impl VM {
             GcObject::Instance(inst) => {
                 let class = Rc::clone(&inst.class);
                 if let Some(func) = self.resolve_method(class, &method_name) {
-                    let mut final_args = args;
-                    for _ in 0..(func.arity as usize).saturating_sub(final_args.len()) {
-                        final_args.push(BxValue::new_null());
-                    }
-                    if final_args.len() < func.min_arity as usize
-                        || final_args.len() > func.arity as usize
-                    {
-                        anyhow::bail!(
-                            "Expected {}-{} arguments but got {}",
-                            func.min_arity,
-                            func.arity,
-                            final_args.len()
-                        );
-                    }
+                    let final_args = self.function_arguments(args, None, &func);
 
                     let sub_chunk = func.chunk.clone();
                     let constant_count = sub_chunk.constants().len();
@@ -7589,41 +7584,6 @@ impl VM {
         Ok(values)
     }
 
-    fn reorder_arguments(
-        &self,
-        args: Vec<BxValue>,
-        names: Vec<String>,
-        params: &[String],
-    ) -> Vec<BxValue> {
-        // Compiled functions reserve one extra local for the implicit `arguments` value.
-        let mut final_args = vec![BxValue::new_null(); params.len() + 1];
-        let mut positional_args = Vec::new();
-        let mut named_args = Vec::new();
-
-        for (i, arg_val) in args.into_iter().enumerate() {
-            if i < names.len() && !names[i].is_empty() {
-                named_args.push((names[i].to_lowercase(), arg_val));
-            } else {
-                positional_args.push(arg_val);
-            }
-        }
-
-        // 1. Fill positional args
-        for (i, arg_val) in positional_args.into_iter().enumerate() {
-            if i < final_args.len() {
-                final_args[i] = arg_val;
-            }
-        }
-
-        // 2. Fill named args
-        for (name, arg_val) in named_args {
-            if let Some(param_idx) = params.iter().position(|p| p.to_lowercase() == name) {
-                final_args[param_idx] = arg_val;
-            }
-        }
-        final_args
-    }
-
     fn native_global_name(&self, value: BxValue) -> Option<String> {
         self.global_names.iter().find_map(|(name_id, idx)| {
             (self.global_values[*idx] == value)
@@ -7837,20 +7797,7 @@ impl VM {
                     args.reverse();
                     // Don't pop function yet, it's used as marker
 
-                    let final_args = if let Some(names_list) = names {
-                        self.reorder_arguments(args, names_list, &func.params)
-                    } else {
-                        let mut a = args;
-                        if (func.arity as usize) > arg_count {
-                            for _ in 0..(func.arity as usize - arg_count) {
-                                a.push(BxValue::new_null());
-                            }
-                        } else if arg_count > (func.arity as usize) {
-                            // Trim extra arguments if function doesn't support varargs (MatchBox doesn't yet)
-                            a.truncate(func.arity as usize);
-                        }
-                        a
-                    };
+                    let final_args = self.function_arguments(args, names.as_deref(), &func);
                     // Stack: ... [func] [arg1] [arg2] ...
                     // Function is already at len() - 1 - arg_count.
                     // We popped args, now we push final_args back.
@@ -7932,7 +7879,7 @@ impl VM {
                         chunk: Rc::new(RefCell::new(sub_chunk)),
                         ip: 0,
                         stack_base: 0,
-                        receiver: self.fibers[fiber_idx].frames.last().unwrap().receiver,
+                        receiver: func.captured_receiver.or(self.fibers[fiber_idx].frames.last().unwrap().receiver),
                         handlers: Vec::new(),
                         pending_completion: None,
                         promoted_constants: vec![None; constant_count],
@@ -8075,7 +8022,7 @@ impl VM {
         #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
         if let Some((member, member_receiver)) = self.registered_member(receiver_val, &name) {
             let args = self.fibers[fiber_idx].stack.drain(receiver_idx + 1..).collect();
-            let args = match member.arguments(member_receiver, args, names) {
+            let (args, names) = match member.arguments(member_receiver, args, names) {
                 Ok(args) => args,
                 Err(error) => return self.throw_error(fiber_idx, &error.to_string()),
             };
@@ -8083,7 +8030,7 @@ impl VM {
             self.fibers[fiber_idx].stack[receiver_idx] = function;
             let count = args.len();
             self.fibers[fiber_idx].stack.extend(args);
-            return self.execute_call(fiber_idx, count, None);
+            return self.execute_call(fiber_idx, count, names);
         }
 
         if let Some(id) = receiver_val.as_gc_id() {
@@ -8171,15 +8118,7 @@ impl VM {
                             args.reverse();
                             // Keep the receiver as the frame marker so returning from a
                             // nested method call does not remove the caller's function.
-                            let final_args = if let Some(names_list) = names {
-                                self.reorder_arguments(args, names_list, &function.params)
-                            } else {
-                                let mut final_args = args;
-                                while final_args.len() < function.arity as usize {
-                                    final_args.push(BxValue::new_null());
-                                }
-                                final_args
-                            };
+                            let final_args = self.function_arguments(args, names.as_deref(), &function);
                             self.fibers[fiber_idx].stack.extend(final_args);
                             let sub_chunk = function.chunk.clone();
                             let constant_count = sub_chunk.constants().len();
@@ -8349,15 +8288,7 @@ impl VM {
                         // Pop receiver, but we'll push it back as the first element of stack for the frame
                         self.fibers[fiber_idx].stack.pop();
 
-                        let final_args = if let Some(names_list) = names {
-                            self.reorder_arguments(args, names_list, &func.params)
-                        } else {
-                            let mut a = args;
-                            for _ in 0..(func.arity as usize - arg_count) {
-                                a.push(BxValue::new_null());
-                            }
-                            a
-                        };
+                        let final_args = self.function_arguments(args, names.as_deref(), &func);
 
                         // Receiver should be available to the frame. In Matchbox, we often put it in CallFrame.receiver.
                         // But local variables slot 0 might also be receiver in some conventions.
@@ -8395,11 +8326,9 @@ impl VM {
                         let args_array_id = self.heap.alloc(GcObject::Array(original_args));
                         let name_id = self.heap.alloc(GcObject::String(BoxString::new(&name)));
 
-                        self.fibers[fiber_idx].stack.push(receiver_val); // receiver at base
-                        self.fibers[fiber_idx].stack.push(BxValue::new_ptr(name_id));
-                        self.fibers[fiber_idx]
-                            .stack
-                            .push(BxValue::new_ptr(args_array_id));
+                        let final_args = self.function_arguments(vec![BxValue::new_ptr(name_id), BxValue::new_ptr(args_array_id)], None, &on_missing);
+                        self.fibers[fiber_idx].stack.push(receiver_val);
+                        self.fibers[fiber_idx].stack.extend(final_args);
 
                         let sub_chunk = on_missing.chunk.clone();
                         let constant_count = sub_chunk.constants().len();
@@ -8414,9 +8343,6 @@ impl VM {
                             promoted_constants: vec![None; constant_count],
                         };
 
-                        for _ in 0..(on_missing.arity - 2) {
-                            self.fibers[fiber_idx].stack.push(BxValue::new_null());
-                        }
                         frame.stack_base =
                             self.fibers[fiber_idx].stack.len() - on_missing.arity as usize;
 

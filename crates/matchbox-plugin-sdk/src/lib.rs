@@ -1,11 +1,4 @@
-//! Stable desktop plugin ABI. No VM implementation or Rust-owned objects cross this boundary.
-//!
-//! All callbacks run synchronously on the VM thread. Value handles are nonzero, opaque,
-//! and valid only for the current invocation. Use matchbox.roots.v1 to retain values;
-//! never retain invocation handles or context pointers. Object payloads belong to the
-//! plugin and are released by its drop callback.
-//! A capability's layout and semantics are immutable; incompatible changes use a new name.
-//! Trusted plugins must supply valid pointers and must never unwind across these functions.
+#![doc = include_str!("../README.md")]
 use std::ffi::c_void;
 
 pub const ABI_MAJOR: u32 = 1;

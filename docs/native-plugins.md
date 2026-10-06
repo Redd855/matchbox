@@ -37,7 +37,7 @@ At execution, load native providers, instantiate descriptors, call `configure()`
 
 ## Native SDK / ABI
 
-Build a Rust `cdylib` using `crates/matchbox-plugin-sdk`. Export `matchbox_plugin_init_v1`. The host supplies a C-layout registration interface and named capability lookup. The first capability is `matchbox.values.v1`: numbers, strings, booleans/null, structs, opaque plugin objects, and error reporting. BIF metadata declares names, aliases, argument names, required arguments, and scalar defaults. Named arguments are case-insensitive; unknown/duplicate arguments fail.
+Build a Rust `cdylib` with the `matchbox-plugin-sdk = "0.1"` Cargo dependency from crates.io (the SDK source lives in `crates/matchbox-plugin-sdk`). The SDK is independently versioned and used only by module authors; ForgeBox distributes the actual module and its prebuilt artifacts. Consumers need neither Cargo nor the SDK. Export `matchbox_plugin_init_v1`. The host supplies a C-layout registration interface and named capability lookup. The first capability is `matchbox.values.v1`: numbers, strings, booleans/null, structs, opaque plugin objects, and error reporting. BIF metadata declares names, aliases, argument names, required arguments, and scalar defaults. Named arguments are case-insensitive; unknown/duplicate arguments fail.
 
 The SDK depends only on Rust's standard library and does not link MatchBox's VM. No `String`, `Vec`, `Rc`, `BxVM`, NaN-box layout, or Rust trait-object vtable crosses the ABI. SDK helpers wrap the C interface for Rust authors.
 

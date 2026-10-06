@@ -133,8 +133,27 @@ unsafe extern "C" fn register(ctx: Context, descriptor: Text, invoke: Invoke) ->
 /// # Safety
 /// The selected library is trusted native code, capable of arbitrary process access.
 pub unsafe fn load(vm: &mut dyn BxVM, path: &Path) -> Result<(), String> {
-    let library =
-        Rc::new(unsafe { Library::new(path) }.map_err(|e| format!("{}: {e}", path.display()))?);
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // ponytail: dependencies use the OS loader namespace; incompatible versions need distinct SONAMEs/install names/DLL names.
+    #[cfg(not(windows))]
+    let library = unsafe { Library::new(&path) };
+    #[cfg(windows)]
+    let library = {
+        use libloading::os::windows::{
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+            Library as WindowsLibrary,
+        };
+        unsafe {
+            WindowsLibrary::load_with_flags(
+                &path,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        }
+        .map(Library::from)
+    };
+    let library = Rc::new(library.map_err(|e| format!("{}: {e}", path.display()))?);
     let init =
         unsafe { library.get::<Init>(b"matchbox_plugin_init_v1\0") }.map_err(|e| e.to_string())?;
     let host = HostV1 {

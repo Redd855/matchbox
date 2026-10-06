@@ -1,6 +1,6 @@
 #![cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
 use matchbox_vm::{
-    bundle::{Artifact, TARGET, hash},
+    bundle::{Artifact, SharedLibrary, TARGET, hash},
     types::{BxVM, BxValue},
     vm::VM,
 };
@@ -43,6 +43,7 @@ fn artifact() -> Artifact {
         filename: path.file_name().unwrap().to_string_lossy().into_owned(),
         sha256: hash(&bytes),
         bytes,
+        libraries: vec![],
     }
 }
 fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -369,10 +370,131 @@ println("application");
     assert_eq!(second.stdout, first.stdout);
 }
 
+#[cfg(target_os = "linux")]
+fn linked_library() -> &'static (PathBuf, PathBuf) {
+    static LIBRARY: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    LIBRARY.get_or_init(|| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let target = root.join("target/plugin-fixture-libraries");
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--features",
+                "bundled-libraries",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(root.join("tests/native_plugins/Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        success(&output);
+        let out = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let message: serde_json::Value = serde_json::from_str(line).ok()?;
+                (message["reason"] == "build-script-executed"
+                    && message["package_id"]
+                        .as_str()?
+                        .contains("matchbox-plugin-fixture"))
+                .then(|| PathBuf::from(message["out_dir"].as_str().unwrap()))
+            })
+            .expect("Fixture build did not report its native library directory");
+        (target.join("debug/libmatchbox_plugin_fixture.so"), out)
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_libraries_resolve_transitive_dependencies_without_the_source_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("backends")).unwrap();
+    fs::create_dir_all(module.join("vendor/deep")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    let (plugin, dependencies) = linked_library();
+    let plugin = fs::read(plugin).unwrap();
+    fs::write(module.join("backends/provider.bin"), &plugin).unwrap();
+    let mut libraries = Vec::new();
+    for name in ["codec", "leaf"] {
+        let filename = format!("libmatchbox_fixture_{name}.so");
+        let bytes = fs::read(dependencies.join(&filename)).unwrap();
+        let path = format!("vendor/deep/{name}.bin");
+        fs::write(module.join(&path), &bytes).unwrap();
+        if name == "leaf" {
+            let alias = format!("vendor/deep/{filename}");
+            std::os::unix::fs::symlink("leaf.bin", module.join(&alias)).unwrap();
+            libraries.push(serde_json::json!({"path":alias,"sha256":hash(&bytes)}));
+        } else {
+            libraries
+                .push(serde_json::json!({"path":path,"filename":filename,"sha256":hash(&bytes)}));
+        }
+    }
+    let metadata = serde_json::json!({"matchbox":{"artifacts":{TARGET:{
+        "path":"backends/provider.bin","filename":"provider.so","sha256":hash(&plugin),"abi":1,"libraries":libraries
+    }}}});
+    fs::write(module.join("box.json"), metadata.to_string()).unwrap();
+    fs::write(
+        dir.path().join("app.bxs"),
+        "assert fixtureLibraryValue() == 42; println('bundled libraries OK');",
+    )
+    .unwrap();
+    let mut missing = metadata.clone();
+    missing["matchbox"]["artifacts"][TARGET]["libraries"] = serde_json::json!([]);
+    fs::write(module.join("box.json"), missing.to_string()).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("libmatchbox_fixture_codec.so"));
+    fs::write(module.join("box.json"), metadata.to_string()).unwrap();
+    let direct = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&direct);
+    assert_eq!(
+        String::from_utf8_lossy(&direct.stdout).trim(),
+        "bundled libraries OK"
+    );
+    success(&cli(
+        dir.path(),
+        &[
+            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
+        ],
+    ));
+    success(&cli(
+        dir.path(),
+        &[
+            "--target",
+            "native",
+            "app.bxs",
+            "--module",
+            "module",
+            "--output",
+            "application",
+        ],
+    ));
+    fs::remove_dir_all(&module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    let bytecode = cli(dir.path(), &["app.bxb"]);
+    success(&bytecode);
+    assert_eq!(bytecode.stdout, direct.stdout);
+    let standalone = Command::new(dir.path().join("application"))
+        .current_dir(dir.path())
+        .env("MATCHBOX_NATIVE_CACHE", dir.path().join("fresh-cache"))
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .output()
+        .unwrap();
+    success(&standalone);
+    assert_eq!(standalone.stdout, direct.stdout);
+}
+
 #[test]
 fn cache_is_atomic_verified_and_rejects_tampering() {
     let dir = tempfile::tempdir().unwrap();
-    let artifact = artifact();
+    let mut artifact = artifact();
+    artifact.libraries.push(SharedLibrary {
+        filename: "codec.so".into(),
+        sha256: hash(b"library"),
+        bytes: b"library".to_vec(),
+    });
     let paths = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..4)
             .map(|_| scope.spawn(|| artifact.extract(dir.path()).unwrap()))
@@ -383,6 +505,10 @@ fn cache_is_atomic_verified_and_rejects_tampering() {
             .collect::<Vec<_>>()
     });
     assert!(paths.iter().all(|p| p == &paths[0]));
+    assert_eq!(
+        fs::read(paths[0].parent().unwrap().join("codec.so")).unwrap(),
+        b"library"
+    );
     let timestamp = fs::metadata(&paths[0]).unwrap().modified().unwrap();
     assert_eq!(artifact.extract(dir.path()).unwrap(), paths[0]);
     assert_eq!(
@@ -400,6 +526,122 @@ fn cache_is_atomic_verified_and_rejects_tampering() {
     let mut wrong = artifact;
     wrong.filename = "../escape.so".into();
     assert!(wrong.extract(dir.path()).is_err());
+}
+
+#[test]
+fn library_groups_verify_cached_dependencies_and_change_identity_with_their_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut artifact = artifact();
+    for filename in ["codec.so", "helper.so"] {
+        artifact.libraries.push(SharedLibrary {
+            filename: filename.into(),
+            sha256: hash(filename.as_bytes()),
+            bytes: filename.as_bytes().to_vec(),
+        });
+    }
+    let original = artifact.extract(dir.path()).unwrap();
+    let mut reordered = artifact.clone();
+    reordered.libraries.reverse();
+    assert_eq!(reordered.extract(dir.path()).unwrap(), original);
+    let mut updated = artifact.clone();
+    updated.libraries[0].bytes = b"new dependency".to_vec();
+    updated.libraries[0].sha256 = hash(&updated.libraries[0].bytes);
+    assert_ne!(
+        updated.extract(dir.path()).unwrap().parent(),
+        original.parent()
+    );
+    let mut renamed = artifact.clone();
+    renamed.libraries[0].filename = "renamed.so".into();
+    assert_ne!(
+        renamed.extract(dir.path()).unwrap().parent(),
+        original.parent()
+    );
+    fs::write(original.parent().unwrap().join("codec.so"), b"tampered").unwrap();
+    assert!(
+        artifact
+            .extract(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("failed verification")
+    );
+    let mut invalid = artifact.clone();
+    invalid.libraries[0].bytes.push(1);
+    assert!(invalid.validate().is_err());
+    invalid = artifact.clone();
+    invalid.libraries[0].filename = artifact.filename.clone();
+    assert!(invalid.validate().is_err());
+    for filename in [
+        "../escape.so",
+        r"..\escape.dll",
+        "C:escape.dll",
+        "bad\0name",
+        ".",
+    ] {
+        invalid.libraries[0].filename = filename.into();
+        assert!(invalid.validate().is_err(), "accepted {filename:?}");
+    }
+    invalid = artifact;
+    invalid.target = "x86_64-pc-windows-msvc".into();
+    invalid.libraries[0].filename = "HELPER.SO".into();
+    assert!(invalid.validate_files().is_err());
+    #[cfg(unix)]
+    {
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), cache.path().join(TARGET)).unwrap();
+        assert!(updated.extract(cache.path()).is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn dependent_library_metadata_rejects_unverified_or_escaping_files_before_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = package(dir.path());
+    fs::write(module.join("codec.so"), b"library").unwrap();
+    fs::write(dir.path().join("outside.so"), b"library").unwrap();
+    fs::write(dir.path().join("app.bxs"), "println('application');").unwrap();
+    let manifest = module.join("box.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    for (library, error) in [
+        (
+            serde_json::json!({"path":"codec.so","sha256":hash(b"wrong")}),
+            "hash does not match",
+        ),
+        (
+            serde_json::json!({"path":"../outside.so","sha256":hash(b"library")}),
+            "escapes module package",
+        ),
+        (
+            serde_json::json!({"path":"codec.so","filename":"../escape.so","sha256":hash(b"library")}),
+            "Invalid artifact filename",
+        ),
+        (
+            serde_json::json!({"path":"codec.so","filename":artifact().filename,"sha256":hash(b"library")}),
+            "Duplicate native artifact filename",
+        ),
+        (
+            serde_json::json!({"path":"codec.so","url":"https://example.invalid/library","sha256":hash(b"library")}),
+            "exactly one of path or url",
+        ),
+        (
+            serde_json::json!({"url":"https://example.invalid/library","sha256":hash(b"library")}),
+            "require a filename",
+        ),
+        (
+            serde_json::json!({"url":"http://example.invalid/library","filename":"codec.so","sha256":hash(b"library")}),
+            "HTTPS",
+        ),
+    ] {
+        metadata["matchbox"]["artifacts"][TARGET]["libraries"] = serde_json::json!([library]);
+        fs::write(&manifest, metadata.to_string()).unwrap();
+        let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(error), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("loaded"));
+    }
 }
 
 #[test]

@@ -212,6 +212,27 @@ unsafe extern "C" fn held(
         })
     }
 }
+#[cfg(feature = "bundled-libraries")]
+unsafe extern "C" {
+    fn matchbox_fixture_codec() -> i32;
+}
+
+#[cfg(feature = "bundled-libraries")]
+unsafe extern "C" fn library_value(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            Call::new(ctx, api, args, len).number_new(matchbox_fixture_codec() as f64)
+        })
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn matchbox_plugin_init_v1(host: *const HostV1, ctx: Context) -> i32 {
     if unsafe { require_values(host, ctx) }.is_err() {
@@ -233,6 +254,17 @@ pub unsafe extern "C" fn matchbox_plugin_init_v1(host: *const HostV1, ctx: Conte
             };
             return 1;
         }
+    }
+    #[cfg(feature = "bundled-libraries")]
+    if unsafe {
+        (host.register)(
+            ctx,
+            Text::new(r#"{"name":"fixtureLibraryValue"}"#),
+            library_value,
+        )
+    } != 0
+    {
+        return 1;
     }
     let functions = [
         (

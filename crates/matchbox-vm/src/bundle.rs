@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -16,8 +16,14 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x02";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x03";
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SharedLibrary {
+    pub filename: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub target: String,
@@ -25,6 +31,7 @@ pub struct Artifact {
     pub filename: String,
     pub sha256: String,
     pub bytes: Vec<u8>,
+    pub libraries: Vec<SharedLibrary>,
 }
 impl Artifact {
     pub fn validate(&self) -> Result<()> {
@@ -37,78 +44,150 @@ impl Artifact {
         if self.abi != matchbox_plugin_sdk::ABI_MAJOR {
             bail!("Unsupported native plugin ABI {}", self.abi);
         }
-        if self.filename.is_empty()
-            || Path::new(&self.filename)
-                .file_name()
-                .and_then(|n| n.to_str())
-                != Some(&self.filename)
-        {
-            bail!("Invalid artifact filename");
-        }
-        if self.sha256 != hash(&self.bytes) {
-            bail!("Native artifact hash mismatch: {}", self.filename);
+        self.validate_files()
+    }
+    fn files(&self) -> impl Iterator<Item = (&str, &str, &[u8])> {
+        std::iter::once((
+            self.filename.as_str(),
+            self.sha256.as_str(),
+            self.bytes.as_slice(),
+        ))
+        .chain(self.libraries.iter().map(|library| {
+            (
+                library.filename.as_str(),
+                library.sha256.as_str(),
+                library.bytes.as_slice(),
+            )
+        }))
+    }
+    /// Packaging validation does not require the output target to match this host.
+    pub fn validate_files(&self) -> Result<()> {
+        let mut names = HashSet::new();
+        for (filename, sha256, bytes) in self.files() {
+            validate_filename(filename)?;
+            let name = if self.target.contains("windows") || self.target.contains("apple") {
+                filename.to_ascii_lowercase()
+            } else {
+                filename.to_owned()
+            };
+            if !names.insert(name) {
+                bail!("Duplicate native artifact filename: {filename}");
+            }
+            if sha256 != hash(bytes) {
+                bail!("Native artifact hash mismatch: {filename}");
+            }
         }
         Ok(())
     }
     pub fn extract(&self, root: &Path) -> Result<PathBuf> {
         self.validate()?;
-        fs::create_dir_all(root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let metadata = fs::symlink_metadata(root)?;
-            if metadata.file_type().is_symlink()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o022 != 0
-            {
-                bail!("Native cache must be a private, user-owned directory");
-            }
-            fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        // A changed dependency or filename must never reuse a previously loaded library path.
+        let mut files: Vec<_> = self.files().collect();
+        files.sort_by_key(|file| file.0);
+        let mut digest = Sha256::new();
+        for (filename, sha256, _) in &files {
+            digest.update(filename.as_bytes());
+            digest.update([0]);
+            digest.update(sha256.as_bytes());
         }
-        let dir = root.join(&self.target).join(&self.sha256);
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(&self.filename);
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if !metadata.file_type().is_file() {
-                bail!("Native cache entry is not a regular file");
-            }
-            if hash(&fs::read(&path)?) == self.sha256 {
-                return Ok(path);
-            }
-            bail!("Native cache entry failed verification: {}", path.display());
+        private_directory(root)?;
+        let target = root.join(&self.target);
+        private_directory(&target)?;
+        let dir = target.join(format!("{:x}", digest.finalize()));
+        private_directory(&dir)?;
+        for (filename, sha256, bytes) in files {
+            extract_file(&dir, filename, sha256, bytes)?;
         }
-        // create_new + hard_link publishes a complete file without replacing another launch's file.
-        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Ok(dir.join(&self.filename).canonicalize()?)
+    }
+}
+
+pub fn validate_filename(filename: &str) -> Result<()> {
+    if filename.is_empty()
+        || filename.contains(['/', '\\', ':', '\0'])
+        || Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(filename)
+    {
+        bail!("Invalid artifact filename: {filename}");
+    }
+    Ok(())
+}
+fn private_directory(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        bail!("Native cache must be a directory, not a symlink");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            bail!("Native cache must be a private, user-owned directory");
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+fn extract_file(dir: &Path, filename: &str, sha256: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let path = dir.join(filename);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if !metadata.file_type().is_file() {
+            bail!("Native cache entry is not a regular file");
+        }
+        if hash(&fs::read(&path)?) == sha256 {
+            return Ok(path);
+        }
+        bail!("Native cache entry failed verification: {}", path.display());
+    }
+    // create_new + hard_link publishes a complete file without replacing another launch's file.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (temp, mut file) = loop {
         let temp = dir.join(format!(
             ".{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let result = (|| {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp)?;
-            file.write_all(&self.bytes)?;
-            file.sync_all()?;
-            match fs::hard_link(&temp, &path) {
-                Ok(()) => (),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-                Err(error) => return Err(error.into()),
-            }
-            let metadata = fs::symlink_metadata(&path)?;
-            if !metadata.file_type().is_file() || hash(&fs::read(&path)?) != self.sha256 {
-                bail!("Native cache verification failed after publication");
-            }
-            Ok(path)
-        })();
-        let _ = fs::remove_file(temp);
-        result
-    }
+        if temp == path {
+            continue;
+        }
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match fs::hard_link(&temp, &path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || hash(&fs::read(&path)?) != sha256 {
+            bail!("Native cache verification failed after publication");
+        }
+        Ok(path)
+    })();
+    let _ = fs::remove_file(temp);
+    result
 }
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -356,6 +435,21 @@ mod tests {
         assert!(Application::from_executable(&bytes).is_err());
     }
     #[test]
+    fn publication_does_not_remove_an_artifact_named_like_a_staging_file() {
+        let root = std::env::temp_dir().join(format!("matchbox-cache-{}", uuid::Uuid::new_v4()));
+        let artifact = Artifact {
+            target: TARGET.into(),
+            abi: 1,
+            filename: format!(".{}-0", std::process::id()),
+            sha256: hash(b"test"),
+            bytes: b"test".to_vec(),
+            libraries: vec![],
+        };
+        let path = artifact.extract(&root).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"test");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn rejects_wrong_targets_and_hashes() {
         let mut a = Artifact {
             target: TARGET.into(),
@@ -363,6 +457,7 @@ mod tests {
             filename: "image.so".into(),
             sha256: hash(b"test"),
             bytes: b"test".to_vec(),
+            libraries: vec![],
         };
         assert!(a.validate().is_ok());
         a.target = "wrong".into();

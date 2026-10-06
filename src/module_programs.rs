@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use matchbox_compiler::{ast::*, parser};
 use matchbox_vm::{
     Chunk,
-    bundle::{Artifact, Bif, BifMember, Module, TARGET},
+    bundle::{Artifact, Bif, BifMember, Module, SharedLibrary, TARGET},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, fs, path::Path};
@@ -24,8 +24,19 @@ struct Native {
 struct ArtifactLocation {
     path: Option<String>,
     url: Option<String>,
+    filename: Option<String>,
     sha256: String,
     abi: u32,
+    #[serde(default)]
+    libraries: Vec<LibraryLocation>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryLocation {
+    path: Option<String>,
+    url: Option<String>,
+    filename: Option<String>,
+    sha256: String,
 }
 
 pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
@@ -341,55 +352,99 @@ fn read_artifact(root: &Path, target: &str) -> Result<Option<Artifact>> {
     if location.abi != 1 {
         bail!("Unsupported native artifact ABI {}", location.abi);
     }
-    if location.sha256.len() != 64
-        || !location
-            .sha256
+    let remote_filename = if target.contains("windows") {
+        "plugin.dll"
+    } else if target.contains("apple") {
+        "plugin.dylib"
+    } else {
+        "plugin.so"
+    };
+    let filename = location
+        .filename
+        .as_deref()
+        .or_else(|| location.url.as_ref().map(|_| remote_filename));
+    let plugin = read_library(
+        root,
+        location.path.as_deref(),
+        location.url.as_deref(),
+        filename,
+        &location.sha256,
+    )?;
+    let libraries = location
+        .libraries
+        .iter()
+        .map(|library| {
+            read_library(
+                root,
+                library.path.as_deref(),
+                library.url.as_deref(),
+                library.filename.as_deref(),
+                &library.sha256,
+            )
+        })
+        .collect::<Result<_>>()?;
+    let artifact = Artifact {
+        target: target.into(),
+        abi: location.abi,
+        filename: plugin.filename,
+        sha256: plugin.sha256,
+        bytes: plugin.bytes,
+        libraries,
+    };
+    artifact.validate_files()?;
+    Ok(Some(artifact))
+}
+fn read_library(
+    root: &Path,
+    path: Option<&str>,
+    url: Option<&str>,
+    filename: Option<&str>,
+    sha256: &str,
+) -> Result<SharedLibrary> {
+    if sha256.len() != 64
+        || !sha256
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
         bail!("Artifact SHA-256 must be 64 lowercase hexadecimal characters");
     }
-    let (filename, bytes) = match (&location.path, &location.url) {
+    if let Some(filename) = filename {
+        matchbox_vm::bundle::validate_filename(filename)?;
+    }
+    let (filename, bytes) = match (path, url) {
         (Some(path), None) => {
-            let path = root.join(path).canonicalize()?;
-            if !path.starts_with(root.canonicalize()?) {
-                bail!("Native artifact path escapes module package");
-            }
-            (
-                path.file_name()
+            let packaged = root.join(path);
+            // Keep a package symlink's name, not the resolved versioned filename.
+            let filename = filename.map(str::to_owned).unwrap_or(
+                packaged
+                    .file_name()
                     .context("Artifact has no filename")?
                     .to_string_lossy()
                     .into_owned(),
-                fs::read(path)?,
-            )
+            );
+            matchbox_vm::bundle::validate_filename(&filename)?;
+            let path = packaged.canonicalize()?;
+            if !path.starts_with(root.canonicalize()?) {
+                bail!("Native artifact path escapes module package");
+            }
+            (filename, fs::read(path)?)
         }
-        (None, Some(url)) => {
-            // The extraction filename need not preserve a remote server's URL/path structure.
-            let suffix = if target.contains("windows") {
-                "dll"
-            } else if target.contains("apple") {
-                "dylib"
-            } else {
-                "so"
-            };
-            (
-                format!("plugin.{suffix}"),
-                matchbox_vm::plugins::download(url).map_err(anyhow::Error::msg)?,
-            )
-        }
+        (None, Some(url)) => (
+            filename
+                .context("Remote dependent libraries require a filename")?
+                .to_owned(),
+            matchbox_vm::plugins::download(url).map_err(anyhow::Error::msg)?,
+        ),
         _ => bail!("Native artifact must specify exactly one of path or url"),
     };
-    let artifact = Artifact {
-        target: target.into(),
-        abi: location.abi,
-        filename,
-        sha256: location.sha256.clone(),
-        bytes,
-    };
-    if artifact.sha256 != matchbox_vm::bundle::hash(&artifact.bytes) {
-        bail!("Published native artifact hash does not match its bytes");
+    if sha256 != matchbox_vm::bundle::hash(&bytes) {
+        bail!("Published native artifact hash does not match its bytes: {filename}");
     }
-    Ok(Some(artifact))
+    Ok(SharedLibrary {
+        filename,
+        sha256: sha256.into(),
+        bytes,
+    })
 }
 pub fn output_target(target: Option<&str>) -> &str {
     match target {

@@ -8,6 +8,9 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+bundled-libraries = []
+
 [dependencies]
 matchbox-plugin-sdk = { path = "../../crates/matchbox-plugin-sdk" }
 

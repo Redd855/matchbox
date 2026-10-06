@@ -16,7 +16,13 @@ Add an optional `matchbox.artifacts` map to `box.json`, keyed by the output targ
       "x86_64-unknown-linux-gnu": {
         "path": "any/package/path/libimage.so",
         "sha256": "<64 lowercase hexadecimal characters>",
-        "abi": 1
+        "abi": 1,
+        "libraries": [
+          {
+            "path": "vendor/codecs/libcodec.so.2",
+            "sha256": "<64 lowercase hexadecimal characters>"
+          }
+        ]
       }
     }
   }
@@ -25,7 +31,21 @@ Add an optional `matchbox.artifacts` map to `box.json`, keyed by the output targ
 
 Specify exactly one `path` (inside the installed package) or `url` (HTTPS). URLs are resolved by the compiler/CLI, require its `bif-http` feature, and are limited to 256 MiB. Verify the hash before execution. Standalone executables and module-bearing `.bxb` artifacts contain the selected native bytes; they never download libraries at startup. Native source layout and artifact filenames are not prescribed. No target match is an error, not a request to compile the module locally.
 
-Publish separate artifacts for OS, architecture, and libc. Authors must choose appropriate CPU and OS/libc baselines: a target triple alone cannot guarantee those. Dependent system libraries must already be available; bundling dependent shared libraries is not implemented yet.
+Publish separate artifacts for OS, architecture, and libc. Authors must choose appropriate CPU and OS/libc baselines: a target triple alone cannot guarantee those. Unbundled dependencies must already be available on the host.
+
+### Bundled shared libraries
+
+Each target artifact may list `libraries`, including transitive dependencies, with exactly one package-contained `path` or HTTPS `url` and a SHA-256. An optional `filename` overrides the extracted basename for both the plugin and its libraries; remote dependent libraries **require** it. Names must be single filenames and unique within the target artifact (case-insensitive on Windows/macOS). Package paths can use any directory layout, including package-contained symlinks; their original basenames are preserved.
+
+All selected files are embedded and verified before loading, then extracted together into one content-addressed directory. The cache identity includes every filename and hash, so changing a dependency creates a new directory even when the plugin bytes are unchanged. Declaration order does not matter. No environment search paths or runtime downloads are needed.
+
+Use the OS loader's normal relative dependency mechanism:
+
+- **Linux:** link the plugin **and each dependent library** with a `$ORIGIN` RUNPATH, e.g. `-Wl,-rpath,$ORIGIN`. Extracted names must match `DT_NEEDED`/SONAME names.
+- **macOS:** use `@loader_path` dependency install names, or `@rpath` with appropriate loader-relative paths in each library.
+- **Windows:** the loader searches the extracted DLL directory and standard safe directories using `LoadLibraryEx` flags, without changing process-wide search settings.
+
+This uses the ordinary process loader namespace, not JVM-style sibling isolation. Incompatible dependencies need distinct SONAMEs/install names/DLL names. Libraries remain loaded with their provider for the process lifetime. Linux direct, bytecode, and standalone execution are tested; macOS/Windows execution validation remains pending.
 
 ## Runtime startup
 
@@ -89,9 +109,9 @@ matchbox --build app.bxs --module /path/to/package --output app.bxb
 matchbox --target native app.bxs --module /path/to/package --output app
 ```
 
-Native libraries are extracted into a private content-addressed cache by target/hash. Publication is atomic across concurrent launches; cached bytes are verified before loading. Tampered entries fail rather than being silently trusted. Set `MATCHBOX_NATIVE_CACHE` to choose the directory. Otherwise use the platform's user cache directory (or a process-specific temporary directory when no home/cache directory is available).
+Native libraries are extracted into a private content-addressed cache by target/library-group hash. Each file is published atomically across concurrent launches; every selected cached file is verified before loading. Tampered entries fail rather than being silently trusted. Set `MATCHBOX_NATIVE_CACHE` to choose the directory. Otherwise use the platform's user cache directory (or a process-specific temporary directory when no home/cache directory is available).
 
-Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 2; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
+Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 3; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
 
 ## Checks
 
@@ -101,4 +121,4 @@ cargo test -p matchbox_vm
 cargo test -p matchbox-plugin-sdk
 ```
 
-The native fixture tests runtime lifecycle, shared class BIFs, named/default arguments, object collection, structured result lifetime, retained values/callbacks, VM/provider isolation, root release during GC and after VM shutdown, caught plugin panics, missing capabilities, envelope packaging, cache reuse, concurrent extraction, and artifact rejection. The separate `bx-image` pilot runs an identical BoxLang contract against its existing JVM JAR and native provider.
+The native fixture tests runtime lifecycle, shared class BIFs, named/default arguments, object collection, structured result lifetime, retained values/callbacks, VM/provider isolation, root release during GC and after VM shutdown, caught plugin panics, missing capabilities, envelope packaging, transitive shared-library packaging without the source package, dependency-aware cache identity, cache reuse, concurrent extraction, staging-name collisions, and artifact rejection. The separate `bx-image` pilot runs an identical BoxLang contract against its existing JVM JAR and native provider.

@@ -25,7 +25,15 @@ pub fn get_file_from_path(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue
     Ok(BxValue::new_ptr(vm.string_new(file.to_string())))
 }
 
-pub fn box_announce(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+pub fn box_announce(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    let state = args.first().filter(|value| !value.is_null()).ok_or("boxAnnounce() requires state")?;
+    if args.len() > 3 { return Err("boxAnnounce() accepts at most three arguments".into()); }
+    if args.get(2).is_some_and(|value| !value.is_null() && !vm.to_string(*value).eq_ignore_ascii_case("global")) {
+        return Err("Only the global interception pool is supported".into());
+    }
+    let state = vm.to_string(*state);
+    let data = args.get(1).copied().filter(|value| !value.is_null()).unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
+    vm.announce(&state, data)?;
     Ok(BxValue::new_bool(true))
 }
 

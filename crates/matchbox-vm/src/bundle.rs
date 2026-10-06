@@ -327,6 +327,19 @@ impl Application {
                 if let Some(overrides) = module.settings.as_object() {
                     merge_settings(vm, id, overrides);
                 }
+                for name in ["customInterceptionPoints", "interceptors"] {
+                    let value = vm.instance_variable(instance, name).unwrap_or_else(|| BxValue::new_ptr(vm.array_new()));
+                    if !vm.value_matches_type_name(value, "array") { bail!("Module {} {name} must be an array", module.name); }
+                    crate::module_services::set_record(vm, record, name, value)?;
+                    if name == "interceptors" && vm.array_len(value.as_gc_id().unwrap()) != 0 {
+                        bail!("Descriptor-declared interceptor classes are not yet supported");
+                    }
+                    if name == "customInterceptionPoints" {
+                        let id = value.as_gc_id().unwrap();
+                        let points = (0..vm.array_len(id)).map(|index| vm.to_string(vm.array_get(id, index))).collect();
+                        vm.append_interception_points(points);
+                    }
+                }
                 vm.struct_set(settings_id, &module.name, settings);
                 crate::module_services::set_record(vm, record, "settings", settings)?;
                 module.bifs.reconstruct_functions();
@@ -360,6 +373,7 @@ impl Application {
                 crate::module_services::set_record(vm, record, "memberMethods", members)?;
             }
             for &(instance, record) in &records {
+                vm.register_interceptor(instance).map_err(anyhow::Error::msg)?;
                 if vm.instance_has_method(instance, "onLoad") {
                     vm.call_method_value(instance, "onLoad", vec![])?;
                 }
@@ -379,6 +393,9 @@ impl Application {
                 if let Err(error) = vm.call_method_value(instance, "onUnload", vec![]) {
                     shutdown_error.get_or_insert(error);
                 }
+            }
+            if let Err(error) = vm.unregister_interceptor(instance) {
+                shutdown_error.get_or_insert(anyhow::Error::msg(error));
             }
             if let Err(error) = crate::module_services::set_record(
                 vm,

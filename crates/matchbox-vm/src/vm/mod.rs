@@ -4,6 +4,7 @@ pub mod intern;
 #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
 mod members;
 mod calls;
+mod interceptors;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod opcode;
@@ -1468,6 +1469,12 @@ impl BxVM for VM {
     fn has_global_function(&self, name: &str) -> bool {
         self.global_bifs.contains(&name.to_lowercase())
     }
+
+    fn append_interception_points(&mut self, names: Vec<String>) -> Result<(), String> { VM::append_interception_points(self, names); Ok(()) }
+    fn interception_points(&self) -> Vec<String> { VM::interception_points(self) }
+    fn register_interceptor(&mut self, target: BxValue) -> Result<(), String> { VM::register_interceptor(self, target) }
+    fn unregister_interceptor(&mut self, target: BxValue) -> Result<(), String> { VM::unregister_interceptor(self, target) }
+    fn announce(&mut self, name: &str, data: BxValue) -> Result<(), String> { VM::announce(self, name, data) }
 
     fn global_function_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.global_bifs.iter().cloned().collect();
@@ -7602,6 +7609,7 @@ impl VM {
         };
 
         let params: Vec<&str> = match function_name.to_ascii_lowercase().as_str() {
+            "boxannounce" => vec!["state", "data", "poolname"],
             "dateformat" | "datetimeformat" => vec!["date", "format", "timezone", "locale"],
             "timeformat" => vec!["date", "format", "timezone"],
             "parsedatetime" => vec!["date", "format", "timezone", "locale"],

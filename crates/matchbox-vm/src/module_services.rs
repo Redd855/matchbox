@@ -100,6 +100,7 @@ enum Kind {
     Runtime,
     Functions,
     Modules,
+    Interceptors,
     Log,
 }
 #[derive(Debug)]
@@ -136,6 +137,60 @@ impl BxNativeObject for Service {
         match (self.kind, name.as_str()) {
             (Kind::Runtime, "getfunctionservice") if args.is_empty() => field("functionservice"),
             (Kind::Runtime, "getmoduleservice") if args.is_empty() => field("moduleservice"),
+            (Kind::Runtime, "getinterceptorservice") if args.is_empty() => {
+                field("interceptorservice")
+            }
+            (Kind::Interceptors, "register" | "unregister") if args.len() == 1 => {
+                if name == "register" {
+                    vm.register_interceptor(args[0])?;
+                } else {
+                    vm.unregister_interceptor(args[0])?;
+                }
+                field("interceptorservice")
+            }
+            (Kind::Interceptors, "announce") if (1..=2).contains(&args.len()) => {
+                let state = vm.to_string(args[0]);
+                let data = args
+                    .get(1)
+                    .copied()
+                    .unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
+                vm.announce(&state, data)?;
+                Ok(BxValue::new_null())
+            }
+            (Kind::Interceptors, "hasinterceptionpoint") if args.len() == 1 => {
+                let state = vm.to_string(args[0]);
+                Ok(BxValue::new_bool(
+                    vm.interception_points()
+                        .iter()
+                        .any(|point| point.eq_ignore_ascii_case(&state)),
+                ))
+            }
+            (Kind::Interceptors, "getinterceptionpoints" | "getinterceptionpointnames")
+                if args.is_empty() =>
+            {
+                let id = vm.array_new();
+                for point in vm.interception_points() {
+                    let point = BxValue::new_ptr(vm.string_new(point));
+                    vm.array_push(id, point);
+                }
+                Ok(BxValue::new_ptr(id))
+            }
+            (Kind::Interceptors, "appendinterceptionpoints") if !args.is_empty() => {
+                let mut points = Vec::new();
+                for value in args {
+                    if vm.value_matches_type_name(*value, "array") {
+                        let id = value.as_gc_id().unwrap();
+                        points.extend(
+                            (0..vm.array_len(id))
+                                .map(|index| vm.to_string(vm.array_get(id, index))),
+                        );
+                    } else {
+                        points.push(vm.to_string(*value));
+                    }
+                }
+                vm.append_interception_points(points)?;
+                field("interceptorservice")
+            }
             (Kind::Functions, "hasglobalfunction") if args.len() == 1 => Ok(BxValue::new_bool(
                 vm.has_global_function(&vm.to_string(args[0])),
             )),
@@ -194,6 +249,7 @@ impl Services {
             ("boxruntime", Kind::Runtime),
             ("functionservice", Kind::Functions),
             ("moduleservice", Kind::Modules),
+            ("interceptorservice", Kind::Interceptors),
             ("log", Kind::Log),
         ] {
             let value = BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(Service {
@@ -211,7 +267,7 @@ impl Services {
     }
     pub fn inject(&self, vm: &mut VM, instance: BxValue, record: BxValue, bif: bool) -> Result<()> {
         vm.set_instance_variable(instance, "moduleRecord", record)?;
-        for name in ["boxruntime", "log"] {
+        for name in ["boxruntime", "log", "interceptorservice"] {
             vm.set_instance_variable(instance, name, self.fields.borrow()[name])?;
         }
         if bif {

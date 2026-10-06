@@ -920,6 +920,122 @@ println("BIF invocation parity OK");
 }
 
 #[test]
+fn interceptor_registration_roots_instances_until_unregister() {
+    let mut vm = VM::new();
+    let ast = matchbox_compiler::parser::parse(
+        r#"
+class Listener { function onGcProbe(data) { data.count += 1; } }
+listener = new Listener();
+"#,
+        None,
+    )
+    .unwrap();
+    let chunk = matchbox_compiler::compiler::Compiler::new("interceptor-gc.bxs")
+        .compile(&ast, "")
+        .unwrap();
+    vm.interpret_sync(chunk).unwrap();
+    let listener = vm.get_global("listener").unwrap();
+    BxVM::append_interception_points(&mut vm, vec!["onGcProbe".into()]).unwrap();
+    BxVM::register_interceptor(&mut vm, listener).unwrap();
+    vm.insert_global("listener".into(), BxValue::new_null());
+    for _ in 0..16 {
+        vm.collect_garbage_now();
+    }
+    let data = BxVM::struct_new(&mut vm);
+    BxVM::struct_set(&mut vm, data, "count", BxValue::new_number(0.0));
+    BxVM::announce(&mut vm, "onGcProbe", BxValue::new_ptr(data)).unwrap();
+    assert_eq!(BxVM::struct_get(&vm, data, "count").as_number(), 1.0);
+    BxVM::unregister_interceptor(&mut vm, listener).unwrap();
+    for _ in 0..16 {
+        vm.collect_garbage_now();
+    }
+    assert!(vm.heap.get_opt(listener.as_gc_id().unwrap()).is_none());
+}
+
+#[test]
+fn module_interceptors_receive_shared_data_and_short_circuit() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("bifs")).unwrap();
+    fs::write(
+        module.join("ModuleConfig.bx"),
+        r#"
+class {
+    function configure() { customInterceptionPoints = ["onModuleProbe"]; settings = {step:2}; }
+    function onModuleProbe(required struct data) { data.count += settings.step; }
+    function onLoad() {
+        assert boxRuntime.getInterceptorService() == interceptorService;
+        assert interceptorService.hasInterceptionPoint("ONMODULEPROBE");
+        data = {count:0};
+        assert boxAnnounce(state="onModuleProbe",data=data);
+        assert data.count == 2;
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/InterceptorBus.bx"),
+        "class { function invoke() { return interceptorService; } }",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app.bxs"),
+        r#"
+class Stop { function onModuleProbe(data) { data.count += 10; return true; } }
+class Never { function onModuleProbe(data) { throw "chain did not stop"; } }
+i = interceptorBus();
+stopTarget = new Stop();
+neverTarget = new Never();
+i.register(stopTarget);
+i.register(neverTarget);
+data = {count:0};
+i.announce("ONMODULEPROBE",data);
+assert data.count == 12;
+data.count = 0;
+assert boxAnnounce("onModuleProbe",data);
+assert data.count == 12;
+function probeCaller() {
+    boxAnnounce("onModuleProbe",{count:0});
+    assert getFunctionCalledName() == "probeCaller";
+}
+probeCaller();
+println("interceptors OK");
+"#,
+    )
+    .unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    success(&cli(
+        dir.path(),
+        &[
+            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
+        ],
+    ));
+    success(&cli(
+        dir.path(),
+        &[
+            "--target",
+            "native",
+            "app.bxs",
+            "--module",
+            "module",
+            "--output",
+            "application",
+        ],
+    ));
+    fs::remove_dir_all(&module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    success(&cli(dir.path(), &["app.bxb"]));
+    success(
+        &Command::new(dir.path().join("application"))
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
 fn parameterless_members_match_positional_and_named_jvm_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let module = dir.path().join("module");

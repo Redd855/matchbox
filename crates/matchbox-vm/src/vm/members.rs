@@ -23,6 +23,18 @@ impl RegisteredMember {
         args: Vec<BxValue>,
         names: Option<Vec<String>>,
     ) -> Result<Vec<BxValue>> {
+        if self.parameters.is_empty() {
+            if names
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|name| !name.is_empty()))
+            {
+                bail!(
+                    "Function does not accept any arguments and can't be used as a member method with named arguments."
+                );
+            }
+            // ponytail: undeclared positional values are not retained in the arguments scope; add alongside general UDF varargs support.
+            return Ok(vec![]);
+        }
         let mut values = vec![BxValue::new_null(); self.parameters.len()];
         let mut assigned = vec![false; values.len()];
         values[self.object_index] = receiver;
@@ -112,9 +124,6 @@ impl VM {
         } else {
             0
         };
-        if parameters.is_empty() {
-            bail!("BoxMember invoke() must accept a receiver argument");
-        }
         let function = self
             .heap
             .retain_value(function)

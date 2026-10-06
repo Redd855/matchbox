@@ -835,6 +835,88 @@ println("annotations OK");
 }
 
 #[test]
+fn parameterless_members_match_positional_and_named_jvm_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("bifs")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(
+        module.join("bifs/NoParameters.bx"),
+        r#"
+@BoxMember({string:{name:"noParameters"}})
+class { function invoke() { return "no parameters"; } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module.join("bifs/DocOnly.bx"),
+        r#"
+/**
+ * @BoxBIF DocAlias
+ * @BoxMember string
+ */
+class { function invoke(required string value) { return "doc:" & value; } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app.bxs"),
+        r#"
+assert noParameters() == "no parameters";
+assert "value".noParameters() == "no parameters";
+assert "value".noParameters(3, 4) == "no parameters";
+assert (3).noParameters() == "no parameters";
+assert docOnly("value") == "doc:value";
+failed = false;
+try { docAlias("value"); } catch (any e) { failed = true; }
+assert failed;
+failed = false;
+try { "value".noParameters(extra=3); } catch (any e) {
+    assert find("does not accept", e.message) > 0;
+    failed = true;
+}
+assert failed;
+noParameters = function() { return "replaced"; };
+assert "value".noParameters() == "no parameters";
+println("parameterless members OK");
+"#,
+    )
+    .unwrap();
+    let direct = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&direct);
+    assert_eq!(
+        String::from_utf8_lossy(&direct.stdout).trim(),
+        "parameterless members OK"
+    );
+    success(&cli(
+        dir.path(),
+        &[
+            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
+        ],
+    ));
+    success(&cli(
+        dir.path(),
+        &[
+            "--target",
+            "native",
+            "app.bxs",
+            "--module",
+            "module",
+            "--output",
+            "application",
+        ],
+    ));
+    fs::remove_dir_all(module).unwrap();
+    success(&cli(dir.path(), &["app.bxb"]));
+    let standalone = Command::new(dir.path().join("application"))
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    success(&standalone);
+    assert_eq!(standalone.stdout, direct.stdout);
+}
+
+#[test]
 fn startup_failures_unwind_partial_modules_and_preserve_the_original_error() {
     for phase in ["configure", "onLoad", "application"] {
         let dir = tempfile::tempdir().unwrap();

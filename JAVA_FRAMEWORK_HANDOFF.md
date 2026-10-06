@@ -130,8 +130,8 @@ cd ../matchbox-native-modules
 export CARGO_TARGET_DIR=/home/jacob/dev/ortus-boxlang/matchbox/target
 cargo test --test native_plugin_tests
 cargo test
-cargo test -p matchbox-compiler -p matchbox-vm -p matchbox-plugin-sdk
-cargo clippy --lib -p matchbox -p matchbox-compiler -p matchbox-vm
+cargo test -p matchbox_compiler -p matchbox_vm -p matchbox-plugin-sdk
+cargo clippy --lib -p matchbox -p matchbox_compiler -p matchbox_vm
 ```
 
 At the handoff checkpoint the targeted interception tests passed; the last full root regression run predates their final GC/nested-caller additions. Re-run the full suite rather than assuming a fresh baseline.

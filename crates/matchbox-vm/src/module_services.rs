@@ -124,6 +124,7 @@ enum Kind {
     Functions,
     Modules,
     Interceptors,
+    Components,
     Log,
 }
 #[derive(Debug)]
@@ -173,6 +174,18 @@ impl BxNativeObject for Service {
             (Kind::Runtime, "getmoduleservice") if args.is_empty() => field("moduleservice"),
             (Kind::Runtime, "getinterceptorservice") if args.is_empty() => {
                 field("interceptorservice")
+            }
+            (Kind::Runtime, "getcomponentservice") if args.is_empty() => field("componentservice"),
+            (Kind::Components, "hascomponent") if args.len() == 1 => {
+                let name = vm.to_string(args[0]);
+                Ok(BxValue::new_bool(vm.component_names().iter().any(|component| component.eq_ignore_ascii_case(&name))))
+            }
+            (Kind::Components, "getcomponentnames") if args.is_empty() => {
+                let id = vm.array_new();
+                for name in vm.component_names() {
+                    let value = BxValue::new_ptr(vm.string_new(name)); vm.array_push(id, value);
+                }
+                Ok(BxValue::new_ptr(id))
             }
             (Kind::Interceptors, "register" | "unregister") if args.len() == 1 => {
                 if name == "register" {
@@ -289,6 +302,7 @@ impl Services {
             ("functionservice", Kind::Functions),
             ("moduleservice", Kind::Modules),
             ("interceptorservice", Kind::Interceptors),
+            ("componentservice", Kind::Components),
             ("log", Kind::Log),
         ] {
             let value = BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(Service {
@@ -298,6 +312,14 @@ impl Services {
             fields.borrow_mut().insert(name.into(), value);
             vm.insert_global(format!("__mb_{name}"), value);
         }
+        vm.register_callback("__mb_component", NativeCallback {
+            parameters: vec!["name".into(), "attributes".into(), "body".into()],
+            callback: Rc::new(|vm, args| {
+                if args.len() != 3 { return Err("Component invocation requires name, attributes and body".into()); }
+                let name = vm.to_string(args[0]);
+                vm.invoke_component(&name, args[1], args[2])
+            }),
+        }).expect("VM callback registration");
         Self { fields }
     }
     pub fn register(&self, vm: &mut VM, name: &str, record: BxValue) {
@@ -306,7 +328,7 @@ impl Services {
     }
     pub fn inject(&self, vm: &mut VM, instance: BxValue, record: BxValue, bif: bool) -> Result<()> {
         vm.set_instance_variable(instance, "moduleRecord", record)?;
-        for name in ["boxruntime", "log", "interceptorservice"] {
+        for name in ["boxruntime", "log", "interceptorservice", "componentservice"] {
             vm.set_instance_variable(instance, name, self.fields.borrow()[name])?;
         }
         if bif {
@@ -339,6 +361,7 @@ mod tests {
             bifs: Chunk::default(),
             bif_registrations: vec![],
             classes: vec![],
+            components: vec![],
             settings: serde_json::json!({}),
             artifact: None,
         };

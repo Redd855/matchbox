@@ -230,6 +230,8 @@ pub trait BxVM {
     fn insert_global(&mut self, name: String, val: BxValue);
     fn append_interception_points(&mut self, _names: Vec<String>) -> Result<(), String> { Err("Interception unavailable".into()) }
     fn interception_points(&self) -> Vec<String> { Vec::new() }
+    fn component_names(&self) -> Vec<String> { Vec::new() }
+    fn invoke_component(&mut self, _name: &str, _attributes: BxValue, _body: BxValue) -> Result<BxValue, String> { Err("Components unavailable".into()) }
     fn register_interceptor(&mut self, _target: BxValue) -> Result<(), String> { Err("Interception unavailable".into()) }
     fn unregister_interceptor(&mut self, _target: BxValue) -> Result<(), String> { Err("Interception unavailable".into()) }
     fn new_interceptor(&mut self, _class: &str, _properties: BxValue, _name: &str, _record: Option<BxValue>) -> Result<BxValue, String> { Err("Interception unavailable".into()) }

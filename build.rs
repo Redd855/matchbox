@@ -80,6 +80,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/members.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/calls.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/interceptors.rs");
+    println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/components.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/intern.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/vm/opcode.rs");
     println!("cargo:rerun-if-changed=crates/matchbox-vm/src/bifs");

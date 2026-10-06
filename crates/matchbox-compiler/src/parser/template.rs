@@ -110,12 +110,15 @@ impl<'a> TemplateParser<'a> {
                 Ok(None)
             }
             Some(TokenKind::ComponentName) => {
+                if self.is_closing_tag() { anyhow::bail!("Unexpected closing component tag: {}", self.peek_lexeme().unwrap_or("")); }
                 let name = self.advance_lexeme().unwrap_or_default();
                 self.parse_component(&name)
             }
             Some(TokenKind::InterpStart) => {
+                let line = self.peek_line();
                 self.pos += 1;
-                Ok(None)
+                let expression = self.parse_interpolation_expression()?;
+                Ok(Some(Statement::new(StatementKind::BufferOutput(expression), line)))
             }
             Some(TokenKind::Less) => {
                 let line = self.peek_line();
@@ -146,7 +149,7 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_component(&mut self, name: &str) -> Result<Option<Statement>> {
-        match name {
+        match name.to_ascii_lowercase().as_str() {
             "set" => self.parse_set_tag(),
             "if" => self.parse_if_tag(),
             "loop" => self.parse_loop_tag(),
@@ -165,70 +168,49 @@ impl<'a> TemplateParser<'a> {
                 self.skip_to_close();
                 Ok(None)
             }
-            _ => {
-                self.skip_to_close();
-                self.skip_body(name);
-                Ok(None)
-            }
+            _ => self.parse_module_component(name),
         }
+    }
+
+    fn parse_module_component(&mut self, name: &str) -> Result<Option<Statement>> {
+        let line = self.peek_line();
+        let mut attributes = Vec::new();
+        while self.peek_kind() == Some(TokenKind::Identifier) {
+            let key = self.advance_lexeme().unwrap();
+            let value = if self.peek_kind() == Some(TokenKind::Equal) {
+                self.pos += 1;
+                let text = self.advance_lexeme().ok_or_else(|| anyhow::anyhow!("Missing component attribute value"))?;
+                let ast = crate::parser::parse(&format!("{text};"), self.filename)?;
+                let Some(Statement {kind: StatementKind::Expression(mut expression), ..}) = ast.into_iter().next() else { anyhow::bail!("Invalid component attribute value"); };
+                if let ExpressionKind::Literal(Literal::String(parts)) = &expression.kind {
+                    if let [StringPart::Expression(value)] = parts.as_slice() { expression = value.clone(); }
+                }
+                expression
+            } else { Expression::new(ExpressionKind::Literal(Literal::Boolean(true)), line) };
+            attributes.push((Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(key)])), line), value));
+        }
+        let body = match self.peek_kind() {
+            Some(TokenKind::ComponentSelfClose) => { self.pos += 1; None }
+            Some(TokenKind::ComponentClose) => {
+                self.pos += 1;
+                let body = self.parse_template_body(&[name])?;
+                if self.peek_kind() != Some(TokenKind::ComponentName) || !self.is_closing_tag() { anyhow::bail!("Missing closing component tag: {name}"); }
+                self.skip_closing(name);
+                Some(body)
+            }
+            _ => anyhow::bail!("Invalid component tag: {name}"),
+        };
+        Ok(Some(component_statement(name, attributes, body, line)?))
     }
 
     fn parse_output_tag(&mut self) -> Result<Option<Statement>> {
-        let line = self.peek_line();
         self.skip_to_close();
-        let expr = self.parse_output_expression()?;
+        let mut body = self.parse_template_body(&["output"])?;
         self.skip_closing("output");
-        Ok(Some(Statement::new(StatementKind::BufferOutput(expr), line)))
-    }
-
-    fn parse_output_expression(&mut self) -> Result<Expression> {
-        let line = self.peek_line();
-        let mut parts = Vec::new();
-        let mut text = String::new();
-
-        while self.pos < self.tokens.len() {
-            match self.peek_kind() {
-                Some(TokenKind::ComponentName) if self.peek_lexeme() == Some("output") => {
-                    break;
-                }
-                Some(TokenKind::ContentText) => {
-                    text.push_str(&decode_template_text(&self.advance_lexeme().unwrap_or_default()));
-                }
-                Some(TokenKind::InterpStart) => {
-                    self.pos += 1;
-                    if !text.is_empty() {
-                        parts.push(StringPart::Text(std::mem::take(&mut text)));
-                    }
-                    let expr = self.parse_interpolation_expression()?;
-                    parts.push(StringPart::Expression(expr));
-                }
-                Some(TokenKind::InterpEnd) => {
-                    self.pos += 1;
-                }
-                Some(TokenKind::Less) => {
-                    self.pos += 1;
-                    text.push('<');
-                }
-                Some(TokenKind::ComponentClose) | Some(TokenKind::ComponentSelfClose) => {
-                    self.pos += 1;
-                }
-                _ => {
-                    self.pos += 1;
-                }
-            }
-        }
-
-        if !text.is_empty() {
-            parts.push(StringPart::Text(text));
-        }
-        if parts.is_empty() {
-            parts.push(StringPart::Text(String::new()));
-        }
-
-        Ok(Expression::new(
-            ExpressionKind::Literal(Literal::String(parts)),
-            line,
-        ))
+        body.reverse();
+        let first = body.pop();
+        self.pending.extend(body);
+        Ok(first)
     }
 
     fn parse_interpolation_expression(&mut self) -> Result<Expression> {
@@ -393,17 +375,11 @@ impl<'a> TemplateParser<'a> {
     fn parse_template_body(&mut self, end_tags: &[&str]) -> Result<Vec<Statement>> {
         let mut stmts = Vec::new();
         loop {
-            // Check if we've hit an end tag
+            if let Some(statement) = self.pending.pop() { stmts.push(statement); continue; }
             if self.peek_kind() == Some(TokenKind::ComponentName) {
                 let name = self.peek_lexeme().unwrap_or("");
-                if end_tags.contains(&name) {
-                    break;
-                }
-                // Skip unknown components
-                self.pos += 1;
-                self.skip_to_close();
-                self.skip_body("unknown");
-                continue;
+                if end_tags.iter().any(|end| end.eq_ignore_ascii_case(name)) && (self.is_closing_tag() || matches!(name, "elseif" | "else" | "catch" | "finally" | "case" | "defaultcase")) { break; }
+                if self.is_closing_tag() { anyhow::bail!("Unexpected closing component tag: {name}"); }
             }
             if self.peek_kind().is_none() { break; }
             if let Some(stmt) = self.parse_template_statement()? {
@@ -599,9 +575,13 @@ impl<'a> TemplateParser<'a> {
         }
     }
 
+    fn is_closing_tag(&self) -> bool {
+        self.tokens.get(self.pos).is_some_and(|token| self.source[..token.span.start].rsplit_once('<').is_some_and(|(_, prefix)| prefix.starts_with('/')))
+    }
+
     fn skip_closing(&mut self, name: &str) {
         if self.peek_kind() == Some(TokenKind::ComponentName)
-            && self.peek_lexeme() == Some(name)
+            && self.peek_lexeme().is_some_and(|tag| tag.eq_ignore_ascii_case(name))
         {
             self.pos += 1;
             self.skip_to_close();
@@ -619,16 +599,35 @@ impl<'a> TemplateParser<'a> {
         }
     }
 
-    fn skip_body(&mut self, _name: &str) {
-        while self.pos < self.tokens.len() {
-            if self.peek_kind() == Some(TokenKind::ComponentName) {
-                self.pos += 1;
-                self.skip_to_close();
-                continue;
+}
+
+pub(super) fn component_statement(name: &str, attributes: Vec<(Expression, Expression)>, body: Option<Vec<Statement>>, line: u32) -> Result<Statement> {
+    fn validate_body(body: &[Statement], loops: usize) -> Result<()> {
+        for statement in body {
+            match &statement.kind {
+                // ponytail: normal body closures only; non-local flow needs compiler/VM completion propagation.
+                StatementKind::Return(_) => anyhow::bail!("Component body non-local return is not yet supported"),
+                StatementKind::Break | StatementKind::Continue if loops == 0 => anyhow::bail!("Component body non-local break/continue is not yet supported"),
+                StatementKind::If {then_branch,else_branch,..} => { validate_body(then_branch,loops)?; if let Some(body) = else_branch { validate_body(body,loops)?; } }
+                StatementKind::ForLoop {body,..} | StatementKind::ForClassic {body,..} | StatementKind::WhileLoop {body,..} | StatementKind::DoWhile {body,..} => validate_body(body,loops + 1)?,
+                StatementKind::TryCatch {try_branch,catches,finally_branch} => { validate_body(try_branch,loops)?; for catch in catches { validate_body(&catch.body,loops)?; } if let Some(body) = finally_branch { validate_body(body,loops)?; } }
+                StatementKind::Switch {cases,default_case,..} => { for case in cases { validate_body(&case.body,loops + 1)?; } if let Some(body) = default_case { validate_body(body,loops + 1)?; } }
+                _ => (),
             }
-            self.pos += 1;
         }
+        Ok(())
     }
+    let body = if let Some(body) = body {
+        validate_body(&body,0)?;
+        Expression::new(ExpressionKind::Literal(Literal::Function {params:vec![], body:FunctionBody::Block(body), is_lambda:false}),line)
+    } else { Expression::new(ExpressionKind::Literal(Literal::Null),line) };
+    let args = vec![
+        Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(name.into())])), line),
+        Expression::new(ExpressionKind::Literal(Literal::Struct(attributes)), line), body,
+    ].into_iter().map(|value| Argument { name: None, value }).collect();
+    Ok(Statement::new(StatementKind::Expression(Expression::new(ExpressionKind::FunctionCall {
+        base: Box::new(Expression::new(ExpressionKind::Identifier("__mb_component".into()),line)), args,
+    },line)),line))
 }
 
 fn decode_template_text(text: &str) -> String {

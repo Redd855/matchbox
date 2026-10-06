@@ -5,6 +5,8 @@ pub mod intern;
 mod members;
 mod calls;
 mod interceptors;
+#[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+pub(crate) mod components;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod opcode;
@@ -25,7 +27,7 @@ use crate::types::{
 };
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use crate::types::{register_wasm_future_thunk, take_wasm_future_thunk};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -509,6 +511,7 @@ pub struct VM {
     #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
     members: HashMap<String, HashMap<String, members::RegisteredMember>>,
     pub output_buffer: Option<String>,
+    output_capture_stack: Vec<Option<String>>,
     pub gc_suspended: bool,
     thread_futures: HashSet<usize>,
     datetime_timezones: HashMap<usize, String>,
@@ -1472,6 +1475,10 @@ impl BxVM for VM {
 
     fn append_interception_points(&mut self, names: Vec<String>) -> Result<(), String> { VM::append_interception_points(self, names); Ok(()) }
     fn interception_points(&self) -> Vec<String> { VM::interception_points(self) }
+    #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+    fn component_names(&self) -> Vec<String> { VM::component_names(self) }
+    #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+    fn invoke_component(&mut self, name: &str, attributes: BxValue, body: BxValue) -> Result<BxValue, String> { VM::invoke_component(self, name, attributes, body).map_err(|error| error.to_string()) }
     fn register_interceptor(&mut self, target: BxValue) -> Result<(), String> { VM::register_interceptor(self, target) }
     fn unregister_interceptor(&mut self, target: BxValue) -> Result<(), String> { VM::unregister_interceptor(self, target) }
     #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
@@ -1765,11 +1772,14 @@ impl BxVM for VM {
     }
 
     fn begin_output_capture(&mut self) {
+        self.output_capture_stack.push(self.output_buffer.take());
         self.output_buffer = Some(String::new());
     }
 
     fn end_output_capture(&mut self) -> Option<String> {
-        self.output_buffer.take()
+        let output = self.output_buffer.take();
+        self.output_buffer = self.output_capture_stack.pop().flatten();
+        output
     }
 
     fn suspend_gc(&mut self) {
@@ -2282,6 +2292,7 @@ impl VM {
             #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
             members: HashMap::new(),
             output_buffer: None,
+            output_capture_stack: Vec::new(),
             gc_suspended: false,
             thread_futures: HashSet::new(),
             datetime_timezones: HashMap::new(),
@@ -7362,6 +7373,16 @@ impl VM {
             }
             _ => anyhow::bail!("Value is not an object instance"),
         }
+    }
+
+    pub fn call_method_value_named(&mut self, receiver: BxValue, name: &str, args: Vec<BxValue>, names: Vec<String>) -> Result<BxValue> {
+        let id = receiver.as_gc_id().context("Value is not an object instance")?;
+        let GcObject::Instance(instance) = self.heap.get(id) else { bail!("Value is not an object instance"); };
+        let method = self.resolve_method(instance.class.clone(), name).with_context(|| format!("Method {name} not found on instance"))?;
+        let mut method = (*method).clone();
+        method.captured_receiver = Some(receiver);
+        let value = BxValue::new_ptr(self.heap.alloc(GcObject::CompiledFunction(Rc::new(method))));
+        self.call_function_value_named(value, args, Some(names))
     }
 
     pub fn instance_class_name(&self, receiver: BxValue) -> Result<String> {

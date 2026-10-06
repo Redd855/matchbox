@@ -1196,7 +1196,7 @@ config = new Config();
 "#));
         let module = matchbox_vm::bundle::Module {
             name:"module".into(), path:"/module".into(), mapping:"module".into(), dependencies:vec![],
-            instance:"config".into(), descriptor, bifs:compile(""), bif_registrations:vec![], classes:vec![],
+            instance:"config".into(), descriptor, bifs:compile(""), bif_registrations:vec![], classes:vec![], components:vec![],
             settings:serde_json::json!({}), artifact:None,
         };
         let app = matchbox_vm::bundle::Application { chunk:compile("throw \"original application error\";"), modules:vec![module] };
@@ -1208,6 +1208,141 @@ config = new Config();
         BxVM::announce(&mut vm,"cleanupProbe",BxValue::new_ptr(data)).unwrap();
         assert_eq!(vm.struct_get(data,"count").as_number(),0.0);
     }
+}
+
+#[test]
+fn module_components_dispatch_template_aliases_with_live_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class { function configure() { settings = {suffix:\"!\"}; } }").unwrap();
+    fs::write(module.join("components/Echo.bx"), r#"
+@BoxComponent(["Speak", "Say"])
+class {
+    function invoke(required struct attributes, required any context, any body, struct executionState) {
+        assert moduleRecord.name == "module";
+        assert componentService.hasComponent("SPEAK");
+        assert boxRuntime.getComponentService() == componentService;
+        assert arrayFindNoCase(moduleRecord.components,"Echo") > 0;
+        assert findNoCase("Echo",getName()) > 0;
+        assert !isNull(body);
+        writeOutput(attributes.message & moduleRecord.settings.suffix);
+    }
+}
+"#).unwrap();
+    fs::write(dir.path().join("app.bxm"), "<bx:speak message=\"Hello\" /><bx:Say message=\"World\" /><bx:Echo message=\"Again\" />").unwrap();
+    let output = cli(dir.path(), &["app.bxm", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout),"Hello!World!Again!");
+    success(&cli(dir.path(), &["--build", "app.bxm", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxm", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxm")).unwrap();
+    let output = cli(dir.path(), &["app.bxb"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout),"Hello!World!Again!");
+    let output = Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap(); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout),"Hello!World!Again!");
+}
+
+#[test]
+fn component_bodies_capture_nested_output_and_can_be_processed_repeatedly() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/Wrap.bx"), r#"
+@AllowsBody(true)
+@RequiresBody(true)
+class {
+    function invoke(context, attributes, body, executionState) {
+        var buffer = newBuffer();
+        buffer.append("pre:");
+        var result = processBody(context,body,buffer);
+        assert !result.isEarlyExit();
+        writeOutput("[" & buffer.toString() & "]");
+        return result;
+    }
+}
+"#).unwrap();
+    fs::write(module.join("components/Twice.bx"), r#"
+@AllowsBody(true)
+class {
+    function invoke(context,attributes,body,executionState) {
+        var buffer = newBuffer();
+        processBody(context,body,buffer);
+        var result = processBody(context,body,buffer);
+        writeOutput(buffer.toString());
+        return result;
+    }
+}
+"#).unwrap();
+    fs::write(dir.path().join("app.bxm"), "<bx:script>word = \"outer\";</bx:script><bx:wrap><bx:output>#word#</bx:output><bx:Wrap>inner</bx:Wrap>tail</bx:wrap><bx:twice>!</bx:twice>").unwrap();
+    let expected = "[pre:outer[pre:inner]tail]!!";
+    let output = cli(dir.path(), &["app.bxm", "--module", "module"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout),expected);
+    success(&cli(dir.path(), &["--build", "app.bxm", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxm", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxm")).unwrap();
+    let output = cli(dir.path(), &["app.bxb"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout),expected);
+    let output = Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap(); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout),expected);
+}
+
+#[test]
+fn script_components_use_builder_fallback_and_validate_body_requirements() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/Frame.bx"), r#"
+@RequiresBody(true)
+class {
+    function invoke(context,attributes,body,executionState) {
+        var builder = newBuilder();
+        builder.append("suffix");
+        var result = processBody(context,body,builder);
+        writeOutput(builder.toString());
+        return result;
+    }
+}
+"#).unwrap();
+    fs::write(module.join("components/Leaf.bx"), "@BoxComponent(\"leafAlias\") class { function invoke(attributes) { writeOutput(attributes.value); } }").unwrap();
+    fs::write(dir.path().join("app.bxs"), "bx:frame { writeOutput(\"body\"); } bx:leafAlias value=\"!\";").unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "bodysuffix!");
+    fs::write(dir.path().join("missing.bxm"), "<bx:frame />").unwrap();
+    let output = cli(dir.path(), &["missing.bxm", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a body"));
+    fs::write(dir.path().join("unexpected.bxm"), "<bx:leafAlias>not allowed</bx:leafAlias>").unwrap();
+    let output = cli(dir.path(), &["unexpected.bxm", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not allow a body"));
+    fs::write(dir.path().join("unknown.bxm"), "<bx:unknown />").unwrap();
+    let output = cli(dir.path(), &["unknown.bxm", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Component not registered"));
+}
+
+#[test]
+fn component_body_errors_restore_output_and_unsupported_flow_fails_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/Capture.bx"), "@RequiresBody(true) class { function invoke(context,attributes,body) { var buffer = newBuffer(); return processBody(context,body,buffer); } }").unwrap();
+    fs::write(dir.path().join("app.bxm"), "<bx:capture><bx:script>writeOutput(\"partial\"); throw \"body failure\";</bx:script></bx:capture>").unwrap();
+    let output = cli(dir.path(), &["app.bxm", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("body failure"));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "partial");
+    fs::write(dir.path().join("early.bxs"), "bx:capture { return; }").unwrap();
+    let output = cli(dir.path(), &["early.bxs", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-local return is not yet supported"));
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

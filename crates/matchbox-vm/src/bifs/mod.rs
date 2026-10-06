@@ -998,9 +998,13 @@ fn preserve_single_quotes_bif(
 #[derive(Debug)]
 struct StringBuilderObject {
     value: String,
+    is_buffer: bool,
 }
 
 impl BxNativeObject for StringBuilderObject {
+    fn native_data(&self, kind: &str) -> Option<*mut std::ffi::c_void> {
+        (self.is_buffer && kind == "matchbox.component.buffer").then_some(self as *const Self as *mut std::ffi::c_void)
+    }
     fn get_property(&self, _name: &str) -> BxValue {
         BxValue::new_null()
     }
@@ -1017,7 +1021,7 @@ impl BxNativeObject for StringBuilderObject {
         let name = name.to_ascii_lowercase();
         let self_value = || BxValue::new_ptr(id);
         match name.as_str() {
-            "__is_string_builder" => Ok(BxValue::new_bool(true)),
+            "__is_string_builder" => Ok(BxValue::new_bool(!self.is_buffer)),
             "tostring" => Ok(BxValue::new_ptr(vm.string_new(self.value.clone()))),
             "append" => {
                 self.value.push_str(&builder_arg_string(vm, args, 0)?);
@@ -1155,13 +1159,17 @@ fn builder_mid(value: &str, start: isize, count: Option<usize>) -> String {
     value[start_offset..end_offset].to_string()
 }
 
-fn string_builder_new_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn string_buffer_new(vm: &mut dyn BxVM) -> BxValue {
+    BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(StringBuilderObject { value: String::new(), is_buffer: true }))))
+}
+
+pub(crate) fn string_builder_new_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let value = args
         .first()
         .filter(|value| !value.is_null())
         .map(|value| vm.to_string(*value))
         .unwrap_or_default();
-    let id = vm.native_object_new(Rc::new(RefCell::new(StringBuilderObject { value })));
+    let id = vm.native_object_new(Rc::new(RefCell::new(StringBuilderObject { value, is_buffer: false })));
     Ok(BxValue::new_ptr(id))
 }
 

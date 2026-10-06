@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use matchbox_compiler::{ast::*, parser};
 use matchbox_vm::{
     Chunk,
-    bundle::{Artifact, Bif, BifMember, Module, SharedLibrary, TARGET},
+    bundle::{Artifact, Bif, BifMember, Component, Module, SharedLibrary, TARGET},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, fs, path::Path};
@@ -107,12 +107,24 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 modules,
             )?;
             let mut classes = Vec::new();
+            let mut components = Vec::new();
             for file in class_files(&module.path)? {
                 let relative = file.strip_prefix(&module.path)?.with_extension("");
                 let name = relative.to_string_lossy().replace(['/', '\\'], ".");
                 let source = fs::read_to_string(&file)?;
                 let mut ast = parser::parse(&source, file.to_str())?;
                 if !ast.iter().any(|s| matches!(s.kind, StatementKind::ClassDecl { .. })) { continue; }
+                if let Some(component) = name.strip_prefix("components.").filter(|name| !name.contains('.')) {
+                    for feature in ["ignoreEnableOutputOnly", "autoEvaluateBodyExpressions"] {
+                        if annotation_bool(&ast, feature)? { bail!("Module component {feature} is not yet supported"); }
+                    }
+                    components.push(Component {
+                        class: format!("bxModules.{}.{}", module.mapping, name),
+                        aliases: annotation_aliases(&ast, component, "BoxComponent")?,
+                        allows_body: annotation_bool(&ast, "AllowsBody")?,
+                        requires_body: annotation_bool(&ast, "RequiresBody")?,
+                    });
+                }
                 rename_class(&mut ast, &format!("bxModules.{}.{}", module.mapping, name))?;
                 classes.push((name, compile(&ast, &source, &file.to_string_lossy(), modules)?));
             }
@@ -127,6 +139,7 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 bifs,
                 bif_registrations,
                 classes,
+                components,
                 settings: module.settings.clone(),
                 artifact,
             })
@@ -189,38 +202,27 @@ fn annotation_value(expression: &Expression) -> Result<serde_json::Value> {
         _ => bail!("BIF annotations must be literals"),
     })
 }
-fn bif_annotations(ast: &[Statement], name: &str) -> Result<(Vec<String>, Vec<BifMember>)> {
-    let attributes = ast
-        .iter()
-        .find_map(|statement| match &statement.kind {
-            StatementKind::ClassDecl { attributes, .. } => Some(attributes),
-            _ => None,
-        })
-        .context("BIF needs a class")?;
-    let annotation = |key: &str| -> Result<serde_json::Value> {
-        let Some(attribute) = attributes
-            .iter()
-            .rev()
-            .find(|a| a.name.eq_ignore_ascii_case(key))
-        else {
-            return Ok(serde_json::Value::Null);
-        };
-        if attribute.args.len() > 1 {
-            return Ok(serde_json::Value::Array(
-                attribute
-                    .args
-                    .iter()
-                    .map(|arg| annotation_value(&arg.value))
-                    .collect::<Result<_>>()?,
-            ));
-        }
-        attribute
-            .args
-            .first()
-            .map(|arg| annotation_value(&arg.value))
-            .unwrap_or_else(|| Ok(serde_json::Value::String(String::new())))
-    };
-    let mut aliases = match annotation("boxBif")? {
+fn class_annotation(ast: &[Statement], key: &str) -> Result<serde_json::Value> {
+    let attributes = ast.iter().find_map(|statement| match &statement.kind {
+        StatementKind::ClassDecl { attributes, .. } => Some(attributes), _ => None,
+    }).context("Module registration needs a class")?;
+    let Some(attribute) = attributes.iter().rev().find(|a| a.name.eq_ignore_ascii_case(key)) else { return Ok(serde_json::Value::Null); };
+    if attribute.args.len() > 1 {
+        return Ok(serde_json::Value::Array(attribute.args.iter().map(|arg| annotation_value(&arg.value)).collect::<Result<_>>()?));
+    }
+    attribute.args.first().map(|arg| annotation_value(&arg.value)).unwrap_or_else(|| Ok(serde_json::Value::String(String::new())))
+}
+fn annotation_bool(ast: &[Statement], key: &str) -> Result<bool> {
+    match class_annotation(ast, key)? {
+        serde_json::Value::Null => Ok(false),
+        serde_json::Value::Bool(value) => Ok(value),
+        serde_json::Value::String(value) if value.is_empty() => Ok(false),
+        serde_json::Value::String(value) if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") => Ok(value.eq_ignore_ascii_case("true")),
+        _ => bail!("{key} must be a boolean"),
+    }
+}
+fn annotation_aliases(ast: &[Statement], name: &str, key: &str) -> Result<Vec<String>> {
+    let mut aliases = match class_annotation(ast, key)? {
         serde_json::Value::String(alias) if !alias.trim().is_empty() => vec![alias],
         serde_json::Value::Array(aliases) => {
             let mut result = aliases
@@ -229,7 +231,7 @@ fn bif_annotations(ast: &[Statement], name: &str) -> Result<(Vec<String>, Vec<Bi
                     alias
                         .as_str()
                         .map(str::to_owned)
-                        .context("BoxBIF aliases must be strings")
+                        .with_context(|| format!("{key} aliases must be strings"))
                 })
                 .collect::<Result<Vec<_>>>()?;
             result.push(name.into());
@@ -238,10 +240,14 @@ fn bif_annotations(ast: &[Statement], name: &str) -> Result<(Vec<String>, Vec<Bi
         _ => vec![name.into()],
     };
     if aliases.iter().any(|name| name.trim().is_empty()) {
-        bail!("BoxBIF aliases cannot be empty");
+        bail!("{key} aliases cannot be empty");
     }
     let mut seen = std::collections::HashSet::new();
     aliases.retain(|name| seen.insert(name.to_lowercase()));
+    Ok(aliases)
+}
+fn bif_annotations(ast: &[Statement], name: &str) -> Result<(Vec<String>, Vec<BifMember>)> {
+    let aliases = annotation_aliases(ast, name, "BoxBIF")?;
     let mut members = Vec::new();
     let mut add_member = |type_name: &str, record: &serde_json::Value| -> Result<()> {
         let type_name = type_name.to_lowercase();
@@ -269,7 +275,7 @@ fn bif_annotations(ast: &[Statement], name: &str) -> Result<(Vec<String>, Vec<Bi
         });
         Ok(())
     };
-    match annotation("boxMember")? {
+    match class_annotation(ast, "boxMember")? {
         serde_json::Value::String(type_name) if type_name.trim().is_empty() => {
             bail!("BoxMember requires a type")
         }

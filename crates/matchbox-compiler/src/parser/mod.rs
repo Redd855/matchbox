@@ -349,6 +349,9 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> Result<Statement> {
         let line = self.peek_line();
 
+        if self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon) {
+            return self.parse_component_statement(line);
+        }
         match self.peek_kind() {
             Some(TokenKind::Import) => self.parse_import(line),
             Some(TokenKind::Class) | Some(TokenKind::Abstract) | Some(TokenKind::Final) | Some(TokenKind::At)
@@ -484,6 +487,19 @@ impl<'a> Parser<'a> {
     }
 
     // ---- Statement parsers ----
+
+    fn parse_component_statement(&mut self, line: u32) -> Result<Statement> {
+        self.pos += 2; // bx:
+        let name = self.expect_get(TokenKind::Identifier)?;
+        let mut attributes = Vec::new();
+        while self.peek_is(TokenKind::Identifier) {
+            let key = self.advance_lexeme().unwrap();
+            let value = if self.peek_is(TokenKind::Equal) { self.pos += 1; self.parse_expression()? } else { Expression::new(ExpressionKind::Literal(Literal::Boolean(true)),line) };
+            attributes.push((Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(key)])),line),value));
+        }
+        let body = if self.peek_is(TokenKind::LeftBrace) { self.pos += 1; Some(self.parse_block()?) } else { self.expect(TokenKind::Semicolon)?; None };
+        template::component_statement(&name, attributes, body, line)
+    }
 
     fn parse_import(&mut self, line: u32) -> Result<Statement> {
         self.pos += 1; // import

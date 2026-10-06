@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x04";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x05";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedLibrary {
@@ -227,6 +227,13 @@ pub struct Bif {
     pub members: Vec<BifMember>,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct Component {
+    pub class: String,
+    pub aliases: Vec<String>,
+    pub allows_body: bool,
+    pub requires_body: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Module {
     pub name: String,
     pub path: String,
@@ -237,6 +244,7 @@ pub struct Module {
     pub bifs: Chunk,
     pub bif_registrations: Vec<Bif>,
     pub classes: Vec<(String, Chunk)>,
+    pub components: Vec<Component>,
     #[serde(with = "json_string")]
     pub settings: serde_json::Value,
     pub artifact: Option<Artifact>,
@@ -361,6 +369,17 @@ impl Application {
                         vm.register_member_method(function, member)?;
                     }
                 }
+                for component in &module.components {
+                    let target = vm.construct_global_class(&component.class, vec![])?;
+                    let _root = vm.heap.retain_value(target).map_err(anyhow::Error::msg)?;
+                    if vm.instance_has_method(target, "init") { vm.call_method_value(target, "init", vec![])?; }
+                    services.inject(vm, target, record, true)?;
+                    crate::vm::components::inject_helpers(vm, target, &component.class)?;
+                    vm.register_component(target, component)?;
+                }
+                let components: Vec<_> = module.components.iter().flat_map(|component| &component.aliases).collect();
+                let components = vm.json_to_bx(serde_json::json!(components));
+                crate::module_services::set_record(vm, record, "components", components)?;
                 let aliases: Vec<_> = module
                     .bif_registrations
                     .iter()

@@ -106,6 +106,16 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 &module.path.join("bifs/module-bifs.bx").to_string_lossy(),
                 modules,
             )?;
+            let mut classes = Vec::new();
+            for file in class_files(&module.path)? {
+                let relative = file.strip_prefix(&module.path)?.with_extension("");
+                let name = relative.to_string_lossy().replace(['/', '\\'], ".");
+                let source = fs::read_to_string(&file)?;
+                let mut ast = parser::parse(&source, file.to_str())?;
+                if !ast.iter().any(|s| matches!(s.kind, StatementKind::ClassDecl { .. })) { continue; }
+                rename_class(&mut ast, &format!("bxModules.{}.{}", module.mapping, name))?;
+                classes.push((name, compile(&ast, &source, &file.to_string_lossy(), modules)?));
+            }
             let artifact = read_artifact(&module.path, target)?;
             Ok(Module {
                 name: module.name.clone(),
@@ -116,11 +126,32 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 descriptor,
                 bifs,
                 bif_registrations,
+                classes,
                 settings: module.settings.clone(),
                 artifact,
             })
         })
         .collect()
+}
+fn class_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == root.join("bifs") || entry.file_name() == ".git" { continue; }
+            let kind = entry.file_type()?;
+            if kind.is_dir() { visit(root, &path, files)?; }
+            else if path.extension().is_some_and(|extension| extension == "bx") && path != root.join("ModuleConfig.bx") {
+                if !path.canonicalize()?.starts_with(root) { bail!("Module class path escapes module package: {}", path.display()); }
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
 }
 fn annotation_value(expression: &Expression) -> Result<serde_json::Value> {
     use serde_json::Value;

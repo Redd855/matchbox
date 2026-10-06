@@ -57,7 +57,8 @@ fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
 fn success(output: &std::process::Output) {
     assert!(
         output.status.success(),
-        "stdout={}\nstderr={}",
+        "status={}\nstdout={}\nstderr={}",
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1033,6 +1034,180 @@ println("interceptors OK");
             .output()
             .unwrap(),
     );
+}
+
+#[test]
+fn annotated_interceptors_discover_points_without_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("bifs")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"
+class {
+    @interceptionPoint(false)
+    function onAnnotatedProbe(data) { data.count += 2; }
+    function onLoad() {
+        assert interceptorService.hasInterceptionPoint("ONANNOTATEDPROBE");
+        data = {count:0};
+        boxAnnounce("onAnnotatedProbe",data);
+        assert data.count == 2;
+    }
+}
+"#).unwrap();
+    fs::write(module.join("bifs/InterceptorBus.bx"), "class { function invoke() { return interceptorService; } }").unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+class ParentListener {
+    @interceptionPoint
+    function onInheritedProbe(data) { data.count += 3; }
+}
+class Listener extends="ParentListener" {
+    @interceptionPoint
+    function onAnnotatedProbe(data) { data.count += 5; }
+    /** @interceptionPoint */
+    function documentationOnly(data) { throw "Documentation registered a point"; }
+}
+bus = interceptorBus();
+target = new Listener();
+bus.register(target);
+assert !bus.hasInterceptionPoint("documentationOnly");
+data = {count:0};
+bus.announce("ONANNOTATEDPROBE",data);
+assert data.count == 7;
+assert !bus.hasInterceptionPoint("onInheritedProbe");
+bus.announce("onInheritedProbe",data);
+assert data.count == 7;
+parentTarget = new ParentListener();
+bus.register(parentTarget);
+bus.announce("onInheritedProbe",data);
+assert data.count == 10;
+println("annotated interceptors OK");
+"#).unwrap();
+    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    success(&cli(dir.path(), &["app.bxb"]));
+    success(&Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap());
+}
+
+#[test]
+fn declared_interceptors_are_configured_injected_and_embedded() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("interceptors")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"
+class {
+    function configure() {
+        interceptors = [
+            {class:"interceptors.Probe", properties:{step:3}},
+            {class:"bxModules.module.interceptors.Probe", name:"second", properties:{step:4}}
+        ];
+    }
+    function onLoad() {
+        assert arrayLen(moduleRecord.interceptors) == 2;
+        assert moduleRecord.interceptors[1].name == "bxModules.module.interceptors.Probe@module";
+        data = {count:0};
+        boxAnnounce("onDeclaredProbe",data);
+        assert data.count == 9;
+        assert moduleRecord.interceptors[1].properties.step == 4;
+    }
+    function onUnload() {
+        data = {count:0};
+        boxAnnounce("onDeclaredProbe",data);
+        assert data.count == 9;
+        println("declared interceptors unloaded");
+    }
+}
+"#).unwrap();
+    fs::write(module.join("interceptors/Probe.bx"), r#"
+class {
+    function init() { variables.constructed = true; return this; }
+    function configure() {
+        assert variables.constructed;
+        assert moduleRecord.name == "module";
+        assert boxRuntime.getInterceptorService() == interceptorService;
+        assert len(name) > 0;
+        properties.step += 1;
+    }
+    @interceptionPoint
+    function onDeclaredProbe(data) {
+        assert interceptorService.hasInterceptionPoint("onDeclaredProbe");
+        data.count += properties.step;
+    }
+}
+"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), "data = {count:0}; boxAnnounce(\"onDeclaredProbe\",data); assert data.count == 9; println(\"declared interceptors OK\");").unwrap();
+    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    success(&cli(dir.path(), &["app.bxb"]));
+    success(&Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap());
+}
+
+#[test]
+fn interceptor_service_constructs_classes_and_allows_reentrant_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("bifs")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("bifs/InterceptorBus.bx"), "class { function invoke() { return interceptorService; } }").unwrap();
+    fs::write(module.join("Probe.bx"), r#"
+class {
+    function configure() { assert interceptorService.getInterceptionPoints().len() >= 0; }
+    @interceptionPoint
+    function outerProbe(data) { interceptorService.announce("innerProbe",data); }
+    @interceptionPoint
+    function innerProbe(data) { data.count += properties.step; }
+}
+"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+bus = interceptorBus();
+target = bus.newAndRegister("bxModules.module.Probe",{step:3},"dynamic",null);
+data = {count:0};
+bus.announce("outerProbe",data);
+assert data.count == 3;
+bus.unregister(target);
+boxAnnounce("outerProbe",data);
+assert data.count == 3;
+println("reentrant interceptor service OK");
+"#).unwrap();
+    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+}
+
+#[test]
+fn declared_interceptors_unregister_after_partial_startup_and_application_errors() {
+    for startup_failure in [false, true] {
+        let mut vm = VM::new();
+        let compile = |source: &str| {
+            let ast = matchbox_compiler::parser::parse(source, None).unwrap();
+            matchbox_compiler::compiler::Compiler::new("cleanup.bxs").compile(&ast, source).unwrap()
+        };
+        vm.interpret(compile("class Probe { @interceptionPoint function cleanupProbe(data) { data.count += 1; } } ")).unwrap();
+        vm.insert_global("bxModules.module.Probe".into(), vm.get_global("Probe").unwrap());
+        let additional = if startup_failure { ", {class:\"Missing\"}" } else { "" };
+        let descriptor = compile(&format!(r#"
+class Config {{
+    function configure() {{ interceptors = [{{class:"Probe"}}{additional}]; }}
+    function onUnload() {{ throw "secondary unload error"; }}
+}}
+config = new Config();
+"#));
+        let module = matchbox_vm::bundle::Module {
+            name:"module".into(), path:"/module".into(), mapping:"module".into(), dependencies:vec![],
+            instance:"config".into(), descriptor, bifs:compile(""), bif_registrations:vec![], classes:vec![],
+            settings:serde_json::json!({}), artifact:None,
+        };
+        let app = matchbox_vm::bundle::Application { chunk:compile("throw \"original application error\";"), modules:vec![module] };
+        let cache = tempfile::tempdir().unwrap();
+        let error = app.run(&mut vm,cache.path()).unwrap_err().to_string();
+        assert!(error.contains(if startup_failure { "Missing" } else { "original application error" }), "{error}");
+        let data = vm.struct_new();
+        vm.struct_set(data,"count",BxValue::new_number(0.0));
+        BxVM::announce(&mut vm,"cleanupProbe",BxValue::new_ptr(data)).unwrap();
+        assert_eq!(vm.struct_get(data,"count").as_number(),0.0);
+    }
 }
 
 #[test]

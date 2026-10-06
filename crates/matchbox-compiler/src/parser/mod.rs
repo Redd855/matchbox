@@ -1769,7 +1769,12 @@ impl<'a> Parser<'a> {
                     Expression::new(ExpressionKind::Literal(Literal::Null), line),
                 ));
             } else {
-                let key = self.parse_expression()?;
+                let key = if self.tokens.get(self.pos + 1).is_some_and(|token| matches!(token.kind, TokenKind::Colon | TokenKind::Equal))
+                    && self.peek_lexeme().is_some_and(|key| key.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')) {
+                    let key = self.peek_lexeme().unwrap().to_owned();
+                    self.pos += 1;
+                    Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(key)])), line)
+                } else { self.parse_expression()? };
                 if !matches!(self.peek_kind(), Some(TokenKind::Colon) | Some(TokenKind::Equal)) {
                     return Err(self
                         .error_current("expected ':' or '=' in struct literal")

@@ -1474,6 +1474,8 @@ impl BxVM for VM {
     fn interception_points(&self) -> Vec<String> { VM::interception_points(self) }
     fn register_interceptor(&mut self, target: BxValue) -> Result<(), String> { VM::register_interceptor(self, target) }
     fn unregister_interceptor(&mut self, target: BxValue) -> Result<(), String> { VM::unregister_interceptor(self, target) }
+    #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+    fn new_interceptor(&mut self, class: &str, properties: BxValue, name: &str, record: Option<BxValue>) -> Result<BxValue, String> { crate::module_services::new_interceptor(self, class, properties, name, record).map_err(|error| error.to_string()) }
     fn announce(&mut self, name: &str, data: BxValue) -> Result<(), String> { VM::announce(self, name, data) }
 
     fn global_function_names(&self) -> Vec<String> {
@@ -7429,6 +7431,7 @@ impl VM {
         };
         self.fibers.push(fiber);
         let fiber_idx = self.fibers.len() - 1;
+        let previous_fiber_idx = self.current_fiber_idx;
         self.current_fiber_idx = Some(fiber_idx);
         let result = loop {
             match self.run_fiber(fiber_idx, Some(Instant::now() + Duration::from_millis(2))) {
@@ -7437,8 +7440,8 @@ impl VM {
                 Err(e) => break Err(e),
             }
         };
-        self.current_fiber_idx = None;
-        let _ = self.fibers.pop();
+        self.current_fiber_idx = previous_fiber_idx;
+        self.fibers.swap_remove(fiber_idx);
         result
     }
 

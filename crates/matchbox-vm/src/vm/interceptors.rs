@@ -1,5 +1,5 @@
 //! Synchronous, VM-local interceptor chains. Registries are ordinary traced VM values.
-use super::{VM, chunk::Chunk};
+use super::{VM, chunk::Chunk, gc::GcObject};
 use crate::types::{BxVM, BxValue};
 use std::{cell::RefCell, rc::Rc};
 
@@ -32,8 +32,15 @@ impl VM {
         if !self.value_matches_type_name(target, "class") {
             return Err("Interceptor must be a BoxLang class instance".into());
         }
+        let points = self.interception_points();
+        let GcObject::Instance(instance) = self.heap.get(target.as_gc_id().unwrap()) else { unreachable!() };
+        // JVM class metadata discovers declared functions, not inherited handlers.
+        let names: Vec<_> = instance.class.borrow().methods.iter()
+            .filter(|(name, method)| method.modifiers.interception_point || points.iter().any(|point| point.eq_ignore_ascii_case(name)))
+            .map(|(name, _)| name.clone()).collect();
+        self.append_interception_points(names.clone());
         let states = self.interception_registry(STATES);
-        for name in self.interception_points() {
+        for name in names {
             if !self.instance_has_method(target, &name) {
                 continue;
             }

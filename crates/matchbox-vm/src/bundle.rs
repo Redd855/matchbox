@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x03";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x04";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedLibrary {
@@ -236,6 +236,7 @@ pub struct Module {
     pub descriptor: Chunk,
     pub bifs: Chunk,
     pub bif_registrations: Vec<Bif>,
+    pub classes: Vec<(String, Chunk)>,
     #[serde(with = "json_string")]
     pub settings: serde_json::Value,
     pub artifact: Option<Artifact>,
@@ -300,6 +301,10 @@ impl Application {
                         .map_err(anyhow::Error::msg)
                         .with_context(|| format!("Module {}", module.name))?;
                 }
+                for (_, class) in &mut module.classes {
+                    class.reconstruct_functions();
+                    vm.interpret(class.clone())?;
+                }
                 module.descriptor.reconstruct_functions();
                 vm.interpret(module.descriptor.clone())?;
                 let instance = vm
@@ -313,7 +318,7 @@ impl Application {
                 services.register(vm, &module.name, record);
                 services.inject(vm, instance, record, false)?;
                 // Include partially initialized descriptors in reverse-order error cleanup.
-                records.push((instance, record));
+                records.push((instance, record, Vec::new()));
                 if vm.instance_has_method(instance, "configure") {
                     vm.call_method_value(instance, "configure", vec![])?;
                 }
@@ -331,9 +336,6 @@ impl Application {
                     let value = vm.instance_variable(instance, name).unwrap_or_else(|| BxValue::new_ptr(vm.array_new()));
                     if !vm.value_matches_type_name(value, "array") { bail!("Module {} {name} must be an array", module.name); }
                     crate::module_services::set_record(vm, record, name, value)?;
-                    if name == "interceptors" && vm.array_len(value.as_gc_id().unwrap()) != 0 {
-                        bail!("Descriptor-declared interceptor classes are not yet supported");
-                    }
                     if name == "customInterceptionPoints" {
                         let id = value.as_gc_id().unwrap();
                         let points = (0..vm.array_len(id)).map(|index| vm.to_string(vm.array_get(id, index))).collect();
@@ -372,8 +374,29 @@ impl Application {
                 let members = vm.json_to_bx(serde_json::json!(members));
                 crate::module_services::set_record(vm, record, "memberMethods", members)?;
             }
-            for &(instance, record) in &records {
+            for (instance, record, targets) in &mut records {
+                let (instance, record) = (*instance, *record);
                 vm.register_interceptor(instance).map_err(anyhow::Error::msg)?;
+                let entries = vm.instance_variable(instance, "interceptors").unwrap_or_else(|| BxValue::new_ptr(vm.array_new())).as_gc_id().unwrap();
+                for index in 0..vm.array_len(entries) {
+                    let entry = vm.array_get(entries, index);
+                    if !vm.is_struct_value(entry) { bail!("Interceptor record must be a struct"); }
+                    let entry = entry.as_gc_id().unwrap();
+                    if !vm.struct_key_exists(entry, "class") { bail!("Interceptor record is missing the [class] key which is mandatory"); }
+                    let class_name = vm.to_string(vm.struct_get(entry, "class"));
+                    let invocation = vm.to_string(crate::module_services::record_field(vm, record, "invocationPath"));
+                    let class_name = if class_name.starts_with(&format!("{invocation}.")) { class_name } else { format!("{invocation}.{class_name}") };
+                    let properties = if vm.struct_key_exists(entry, "properties") { vm.struct_get(entry, "properties") } else {
+                        let value = BxValue::new_ptr(vm.struct_new()); vm.struct_set(entry, "properties", value); value
+                    };
+                    let name = if vm.struct_key_exists(entry, "name") { vm.to_string(vm.struct_get(entry, "name")) } else {
+                        let name = format!("{class_name}@{}", vm.to_string(crate::module_services::record_field(vm, record, "name")));
+                        let value = BxValue::new_ptr(vm.string_new(name.clone())); vm.struct_set(entry, "name", value); name
+                    };
+                    let target = crate::module_services::new_interceptor(vm, &class_name, properties, &name, Some(record))?;
+                    targets.push(vm.heap.retain_value(target).map_err(anyhow::Error::msg)?);
+                    vm.struct_set(entry, "interceptor", target);
+                }
                 if vm.instance_has_method(instance, "onLoad") {
                     vm.call_method_value(instance, "onLoad", vec![])?;
                 }
@@ -388,7 +411,7 @@ impl Application {
             vm.interpret(self.chunk)
         })();
         let mut shutdown_error = None;
-        for (instance, record) in records.into_iter().rev() {
+        for (instance, record, targets) in records.into_iter().rev() {
             if vm.instance_has_method(instance, "onUnload") {
                 if let Err(error) = vm.call_method_value(instance, "onUnload", vec![]) {
                     shutdown_error.get_or_insert(error);
@@ -396,6 +419,11 @@ impl Application {
             }
             if let Err(error) = vm.unregister_interceptor(instance) {
                 shutdown_error.get_or_insert(anyhow::Error::msg(error));
+            }
+            for target in targets {
+                if let Err(error) = vm.heap.read_retained_value(&target).and_then(|target| vm.unregister_interceptor(target)) {
+                    shutdown_error.get_or_insert(anyhow::Error::msg(error));
+                }
             }
             if let Err(error) = crate::module_services::set_record(
                 vm,

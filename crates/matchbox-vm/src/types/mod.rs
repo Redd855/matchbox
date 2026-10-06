@@ -232,6 +232,7 @@ pub trait BxVM {
     fn interception_points(&self) -> Vec<String> { Vec::new() }
     fn register_interceptor(&mut self, _target: BxValue) -> Result<(), String> { Err("Interception unavailable".into()) }
     fn unregister_interceptor(&mut self, _target: BxValue) -> Result<(), String> { Err("Interception unavailable".into()) }
+    fn new_interceptor(&mut self, _class: &str, _properties: BxValue, _name: &str, _record: Option<BxValue>) -> Result<BxValue, String> { Err("Interception unavailable".into()) }
     fn announce(&mut self, _name: &str, _data: BxValue) -> Result<(), String> { Err("Interception unavailable".into()) }
 
     fn get_global_value(&self, _name: &str) -> Option<BxValue> {
@@ -478,6 +479,7 @@ pub enum Constant {
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FunctionModifiers {
+    pub interception_point: bool,
     pub access: Option<String>,
     pub is_static: bool,
     pub is_abstract: bool,

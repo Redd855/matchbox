@@ -213,7 +213,7 @@ impl Compiler {
                         ClassMember::Statement(inner_stmt) => match &inner_stmt.kind {
                             StatementKind::FunctionDecl {
                                 name: func_name,
-                                attributes: _,
+                                attributes,
                                 modifiers,
                                 return_type: _,
                                 params,
@@ -252,13 +252,14 @@ impl Compiler {
                                 method_compiler.class_methods = class_method_names.clone();
                                 method_compiler.class_has_init_map =
                                     self.class_has_init_map.clone();
-                                let func = method_compiler.compile_function(
+                                let mut func = method_compiler.compile_function(
                                     &func_name,
                                     &params,
                                     &body,
                                     modifiers.clone(),
                                     FunctionKind::Udf,
                                 )?;
+                                func.modifiers.interception_point = attributes.iter().any(|attribute| attribute.name.eq_ignore_ascii_case("interceptionPoint"));
                                 methods.insert(func_name.to_lowercase(), func);
                             }
                             _ => {
@@ -2515,6 +2516,7 @@ impl Compiler {
             min_arity,
             params: params.iter().map(|p| p.name.to_lowercase()).collect(),
             modifiers: VmFunctionModifiers {
+                interception_point: false,
                 access: modifiers.access,
                 is_static: modifiers.is_static,
                 is_abstract: modifiers.is_abstract,

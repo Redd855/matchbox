@@ -1,10 +1,10 @@
 //! Live module records and adapters to the services implemented by this VM.
 use crate::{
     bundle::Module,
-    types::{BxNativeObject, BxVM, BxValue, Tracer},
+    types::{BxNativeObject, BxVM, BxValue, NativeCallback, Tracer},
     vm::{VM, gc::GcObject},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 type Fields = Rc<RefCell<HashMap<String, BxValue>>>;
@@ -86,6 +86,29 @@ pub(crate) fn record(
     BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(ModuleRecord { fields }))))
 }
 
+pub(crate) fn record_field(vm: &VM, record: BxValue, name: &str) -> BxValue {
+    let GcObject::NativeObject(object) = vm.heap.get(record.as_gc_id().unwrap()) else { unreachable!() };
+    object.borrow().get_property(name)
+}
+
+pub(crate) fn new_interceptor(vm: &mut VM, class: &str, properties: BxValue, name: &str, record: Option<BxValue>) -> Result<BxValue> {
+    if !vm.is_struct_value(properties) { bail!("Interceptor properties must be a struct"); }
+    let target = vm.construct_global_class(class, vec![])?;
+    let _root = vm.heap.retain_value(target).map_err(anyhow::Error::msg)?;
+    if vm.instance_has_method(target, "init") { vm.call_method_value(target, "init", vec![])?; }
+    for field in ["boxruntime", "interceptorservice", "log"] {
+        let value = vm.get_global(&format!("__mb_{field}")).context("Module services unavailable")?;
+        vm.set_instance_variable(target, field, value)?;
+    }
+    if let Some(record) = record { vm.set_instance_variable(target, "moduleRecord", record)?; }
+    let name = BxValue::new_ptr(vm.string_new(name.into()));
+    vm.set_instance_variable(target, "name", name)?;
+    vm.set_instance_variable(target, "properties", properties)?;
+    if vm.instance_has_method(target, "configure") { vm.call_method_value(target, "configure", vec![])?; }
+    vm.register_interceptor(target).map_err(anyhow::Error::msg)?;
+    Ok(target)
+}
+
 pub(crate) fn set_record(vm: &mut VM, record: BxValue, name: &str, value: BxValue) -> Result<()> {
     // get_mut also records old-to-young writes for generational GC.
     let GcObject::NativeObject(object) = vm.heap.get_mut(record.as_gc_id().unwrap()) else {
@@ -109,6 +132,17 @@ struct Service {
     fields: Fields,
 }
 impl BxNativeObject for Service {
+    fn delegated_callback(&self, name: &str) -> Option<NativeCallback> {
+        let name = name.to_ascii_lowercase();
+        if !matches!(self.kind, Kind::Interceptors) || !matches!(name.as_str(), "announce" | "newandregister") { return None; }
+        let fields = self.fields.clone();
+        let kind = self.kind;
+        let parameters = if name == "announce" { vec!["receiver", "state", "data"] } else { vec!["receiver", "clazz", "properties", "name", "moduleRecord"] };
+        Some(NativeCallback {
+            parameters: parameters.into_iter().map(str::to_owned).collect(),
+            callback: Rc::new(move |vm, args| Service { kind, fields: fields.clone() }.call_method(vm, 0, &name, &args[1..])),
+        })
+    }
     fn get_property(&self, name: &str) -> BxValue {
         self.fields
             .borrow()
@@ -147,6 +181,11 @@ impl BxNativeObject for Service {
                     vm.unregister_interceptor(args[0])?;
                 }
                 field("interceptorservice")
+            }
+            (Kind::Interceptors, "newandregister") if args.len() == 4 => {
+                let class = vm.to_string(args[0]);
+                let name = vm.to_string(args[2]);
+                vm.new_interceptor(&class, args[1], &name, (!args[3].is_null()).then_some(args[3]))
             }
             (Kind::Interceptors, "announce") if (1..=2).contains(&args.len()) => {
                 let state = vm.to_string(args[0]);
@@ -299,6 +338,7 @@ mod tests {
             descriptor: Chunk::default(),
             bifs: Chunk::default(),
             bif_registrations: vec![],
+            classes: vec![],
             settings: serde_json::json!({}),
             artifact: None,
         };

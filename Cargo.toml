@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/matchbox-plugin-sdk",
     "crates/matchbox-embedded",
     "crates/matchbox-vm",
     "crates/matchbox-compiler",

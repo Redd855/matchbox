@@ -34,6 +34,8 @@ static FUSION_BUILD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 mod browser;
 mod embedded;
 mod modules;
+#[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+mod module_programs;
 mod stubs;
 
 use postcard;
@@ -756,6 +758,16 @@ pub fn run() -> Result<()> {
     }
 
     // 2. Check for embedded bytecode at end of binary (Native)
+    #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+    {
+        let bytes = fs::read(std_env::current_exe()?)?;
+        if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
+            let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+            let mut vm = vm::VM::new_with_args(std_env::args().collect());
+            application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+            return Ok(());
+        }
+    }
     if let Ok(embedded_chunk) = load_embedded_bytecode() {
         return run_chunk(embedded_chunk, &[]);
     }
@@ -1579,6 +1591,13 @@ fn process_file_with_args(
 ) -> Result<()> {
     if source_path.extension().and_then(|s| s.to_str()) == Some("bxb") {
         let bytes = fs::read(source_path)?;
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+        if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
+            let app = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+            let mut vm = vm::VM::new_with_args(cli_args);
+            app.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+            return Ok(());
+        }
         let mut chunk: Chunk = postcard::from_bytes(&bytes)?;
         chunk.reconstruct_functions();
         run_chunk_with_args(chunk, &[], cli_args)?;
@@ -1609,20 +1628,9 @@ fn process_file_with_args(
             None
         };
 
-        let module_mappings: Vec<(String, PathBuf)> = modules_info
-            .iter()
-            .map(|m| (m.name.clone(), m.path.clone()))
-            .collect();
-        let mut extra_preludes: Vec<String> = modules_info
-            .iter()
-            .flat_map(|m| m.bif_sources.iter().cloned())
-            .collect();
-        // Inject a getModuleSettings(name) function whose body is baked from the
-        // settings collected by each module's configure() lifecycle call.
-        if !modules_info.is_empty() {
-            let settings_bxs = modules::generate_get_module_settings_bxs(&modules_info);
-            extra_preludes.push(settings_bxs);
-        }
+        let module_mappings = modules::mappings(&modules_info);
+        // Module BIFs and settings are installed at runtime, never baked by executing hooks.
+        let extra_preludes: Vec<String> = Vec::new();
         let mut chunk = matchbox_compiler::compile_with_treeshaking(
             source_path.to_str().unwrap_or("unknown"),
             &ast,
@@ -1642,7 +1650,17 @@ fn process_file_with_args(
         }
 
         if is_build {
-            let bytes = postcard::to_stdvec(&chunk)?;
+            if modules_info.iter().any(|module| module.has_native) {
+                bail!("Source-only native modules require --target native; publish prebuilt artifacts to create a module bytecode bundle");
+            }
+            let bytes = if modules_info.is_empty() { postcard::to_stdvec(&chunk)? } else {
+                #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+                { matchbox_vm::bundle::Application {
+                    chunk: chunk.clone(), modules: module_programs::prepare(&modules_info, matchbox_vm::bundle::TARGET)?,
+                }.append_to(&[])? }
+                #[cfg(any(target_family = "wasm", target_os = "espidf"))]
+                { bail!("Module application envelopes currently require a desktop host"); }
+            };
             let out_path = output
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| source_path.with_extension("bxb"));
@@ -1652,6 +1670,9 @@ fn process_file_with_args(
             let project_root = source_path.parent().unwrap_or(Path::new("."));
             let native_dir = project_root.join("native");
 
+            if !modules_info.is_empty() && matches!(t, "wasm" | "wasi" | "js" | "esp32") {
+                bail!("Module lifecycle/native artifact bundles currently support desktop targets only");
+            }
             let has_native_modules = modules_info.iter().any(|m| m.has_native);
             let should_use_fusion = ((native_dir.exists() && native_dir.is_dir())
                 || has_native_modules)
@@ -1698,7 +1719,7 @@ fn process_file_with_args(
                         esp32_config.as_ref(),
                     )?;
                 }
-                target_val => produce_native_binary(&chunk, source_path, target_val, output)?,
+                target_val => produce_native_binary(&chunk, source_path, target_val, output, &modules_info)?,
             }
         } else {
             // Register datasources from matchbox.toml only when actually running.
@@ -1855,32 +1876,24 @@ fn run_chunk_with_args(
         native_classes.extend(matchbox_tui::register_classes());
     }
 
-    // In a real implementation with dynamic loading, we would load .so/.dll here.
-    for m in modules {
-        if m.name == "native-math" {
-            // HACK for tests: since we can't easily dynamic-load from the same binary's crate
-            // we just manually register what we know is in there.
-            fn cube(
-                _vm: &mut dyn types::BxVM,
-                args: &[types::BxValue],
-            ) -> std::result::Result<types::BxValue, String> {
-                if args.len() != 1 {
-                    return Err("cube requires 1 argument".to_string());
-                }
-                let n = args[0].as_number();
-                Ok(types::BxValue::new_number(n * n * n))
-            }
-            external_bifs.insert("cube".to_string(), cube as types::BxNativeFunction);
-        }
-    }
-
     let mut vm = vm::VM::new_with_bifs(external_bifs, native_classes);
     vm.cli_args = args;
 
     #[cfg(feature = "jit")]
     vm.enable_jit();
 
-    vm.interpret(chunk)?;
+    if modules.is_empty() { vm.interpret(chunk)?; } else {
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+        {
+            let prepared = module_programs::prepare(modules, matchbox_vm::bundle::TARGET)?;
+            if modules.iter().zip(&prepared).any(|(source, compiled)| source.has_native && compiled.artifact.is_none()) {
+                bail!("Source-only native modules require --target native; publish a prebuilt artifact for runtime loading");
+            }
+            matchbox_vm::bundle::Application { chunk, modules: prepared }.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+        }
+        #[cfg(any(target_family = "wasm", target_os = "espidf"))]
+        { bail!("Runtime module initialization currently requires a desktop host"); }
+    }
     Ok(())
 }
 
@@ -1960,7 +1973,7 @@ fn load_embedded_bytecode() -> Result<Chunk> {
     let mut len_bytes = [0u8; 8];
     len_bytes.copy_from_slice(&bytes[len_start..footer_start]);
     let len = u64::from_le_bytes(len_bytes) as usize;
-    let chunk_start = len_start - len;
+    let chunk_start = len_start.checked_sub(len).context("Invalid embedded bytecode length")?;
     let chunk_bytes = &bytes[chunk_start..len_start];
     let mut chunk: Chunk = postcard::from_bytes(chunk_bytes)?;
     chunk.reconstruct_functions();
@@ -1977,15 +1990,25 @@ fn produce_native_binary(
     source_path: &Path,
     target: &str,
     output: Option<&Path>,
+    modules: &[modules::ModuleInfo],
 ) -> Result<()> {
     let stub_key = if target == "native" { "host" } else { target };
     let native_bytes = stubs::get_stub(stub_key)?;
     let mut binary_bytes = native_bytes.to_vec();
     let chunk_bytes = postcard::to_stdvec(chunk)?;
     let chunk_len = chunk_bytes.len() as u64;
-    binary_bytes.extend_from_slice(&chunk_bytes);
-    binary_bytes.extend_from_slice(&chunk_len.to_le_bytes());
-    binary_bytes.extend_from_slice(MAGIC_FOOTER);
+    if modules.is_empty() {
+        binary_bytes.extend_from_slice(&chunk_bytes);
+        binary_bytes.extend_from_slice(&chunk_len.to_le_bytes());
+        binary_bytes.extend_from_slice(MAGIC_FOOTER);
+    } else {
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+        { binary_bytes = matchbox_vm::bundle::Application {
+            chunk: chunk.clone(), modules: module_programs::prepare(modules, module_programs::output_target(Some(target)))?,
+        }.append_to(native_bytes)?; }
+        #[cfg(any(target_family = "wasm", target_os = "espidf"))]
+        { bail!("Native module packaging currently requires a desktop host"); }
+    }
     let out_path = output.map(|p| p.to_path_buf()).unwrap_or_else(|| {
         if cfg!(windows) {
             source_path.with_extension("exe")
@@ -2322,6 +2345,27 @@ use std::collections::HashMap;
             &registration_calls,
             &bytecode,
         ));
+    } else if target == "native" && !modules.is_empty() {
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+        {
+            let application = matchbox_vm::bundle::Application {
+                chunk: chunk.clone(), modules: module_programs::prepare(modules, matchbox_vm::bundle::TARGET)?,
+            };
+            let bytes = application.append_to(&[])?;
+            code.push_str(&format!(r#"
+fn run_interpreted() -> anyhow::Result<()> {{
+    let mut bifs = HashMap::new();
+    let mut classes = HashMap::new();
+{registration_calls}
+    let bytes = vec!{bytes:?};
+    let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+    let mut vm = VM::new_with_bifs(bifs, classes);
+    vm.cli_args = std::env::args().collect();
+    application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+    Ok(())
+}}
+"#));
+        }
     } else {
         code.push_str(&format!(
             r#"

@@ -1,0 +1,306 @@
+//! Native module application envelope and verified, content-addressed extraction.
+use crate::{
+    Chunk,
+    types::{BxVM, BxValue, NativeCallback},
+    vm::VM,
+};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
+
+pub const TARGET: &str = env!("MATCHBOX_TARGET");
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x01";
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    pub target: String,
+    pub abi: u32,
+    pub filename: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+impl Artifact {
+    pub fn validate(&self) -> Result<()> {
+        if self.target != TARGET {
+            bail!(
+                "Native artifact target {} does not match host {TARGET}",
+                self.target
+            );
+        }
+        if self.abi != matchbox_plugin_sdk::ABI_MAJOR {
+            bail!("Unsupported native plugin ABI {}", self.abi);
+        }
+        if self.filename.is_empty()
+            || Path::new(&self.filename)
+                .file_name()
+                .and_then(|n| n.to_str())
+                != Some(&self.filename)
+        {
+            bail!("Invalid artifact filename");
+        }
+        if self.sha256 != hash(&self.bytes) {
+            bail!("Native artifact hash mismatch: {}", self.filename);
+        }
+        Ok(())
+    }
+    pub fn extract(&self, root: &Path) -> Result<PathBuf> {
+        self.validate()?;
+        fs::create_dir_all(root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = fs::symlink_metadata(root)?;
+            if metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o022 != 0
+            {
+                bail!("Native cache must be a private, user-owned directory");
+            }
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        }
+        let dir = root.join(&self.target).join(&self.sha256);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(&self.filename);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_file() {
+                bail!("Native cache entry is not a regular file");
+            }
+            if hash(&fs::read(&path)?) == self.sha256 {
+                return Ok(path);
+            }
+            bail!("Native cache entry failed verification: {}", path.display());
+        }
+        // create_new + hard_link publishes a complete file without replacing another launch's file.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = dir.join(format!(
+            ".{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let result = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(&self.bytes)?;
+            file.sync_all()?;
+            match fs::hard_link(&temp, &path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_file() || hash(&fs::read(&path)?) != self.sha256 {
+                bail!("Native cache verification failed after publication");
+            }
+            Ok(path)
+        })();
+        let _ = fs::remove_file(temp);
+        result
+    }
+}
+pub fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+pub fn cache_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("MATCHBOX_NATIVE_CACHE") {
+        return PathBuf::from(path);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(path).join("MatchBox/native");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path).join("Library/Caches/MatchBox/native");
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("matchbox/native");
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path).join(".cache/matchbox/native");
+    }
+    std::env::temp_dir().join(format!("matchbox-native-{}", std::process::id()))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Module {
+    pub name: String,
+    pub instance: String,
+    pub descriptor: Chunk,
+    pub bifs: Chunk,
+    #[serde(with = "json_string")]
+    pub settings: serde_json::Value,
+    pub artifact: Option<Artifact>,
+}
+#[derive(Serialize, Deserialize)]
+pub struct Application {
+    pub chunk: Chunk,
+    pub modules: Vec<Module>,
+}
+impl Application {
+    pub fn from_executable(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 || !bytes.ends_with(MAGIC) {
+            bail!("No native module application footer");
+        }
+        let length = u64::from_le_bytes(bytes[bytes.len() - 16..bytes.len() - 8].try_into()?);
+        let length = usize::try_from(length)?;
+        let end = bytes.len() - 16;
+        let start = end
+            .checked_sub(length)
+            .context("Invalid native application length")?;
+        Ok(postcard::from_bytes(&bytes[start..end])?)
+    }
+    pub fn append_to(&self, runner: &[u8]) -> Result<Vec<u8>> {
+        let payload = postcard::to_stdvec(self)?;
+        let mut bytes = runner.to_vec();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(MAGIC);
+        Ok(bytes)
+    }
+    /// Trusted native modules execute arbitrary machine code in the host process.
+    pub fn run(mut self, vm: &mut VM, cache: &Path) -> Result<BxValue> {
+        let mut records = Vec::new();
+        let result = (|| {
+            let settings_id = vm.struct_new();
+            vm.insert_global(
+                "__matchbox_module_settings".into(),
+                BxValue::new_ptr(settings_id),
+            );
+            vm.register_callback(
+                "getModuleSettings",
+                NativeCallback {
+                    parameters: vec!["module".into()],
+                    callback: Rc::new(move |vm, args| {
+                        if args.len() != 1 {
+                            return Err("getModuleSettings requires a module name".into());
+                        }
+                        let name = vm.to_string(args[0]);
+                        if !vm.struct_key_exists(settings_id, &name) {
+                            return Err(format!("Module not loaded: {name}"));
+                        }
+                        Ok(vm.struct_get(settings_id, &name))
+                    }),
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+            for module in &mut self.modules {
+                if let Some(artifact) = &module.artifact {
+                    let path = artifact.extract(cache)?;
+                    unsafe { crate::plugins::load(vm, &path) }
+                        .map_err(anyhow::Error::msg)
+                        .with_context(|| format!("Module {}", module.name))?;
+                }
+                module.descriptor.reconstruct_functions();
+                vm.interpret(module.descriptor.clone())?;
+                let instance = vm
+                    .get_global(&module.instance)
+                    .context("Module descriptor did not create an instance")?;
+                if vm.instance_has_method(instance, "configure") {
+                    vm.call_method_value(instance, "configure", vec![])?;
+                }
+                let settings = vm
+                    .instance_variable(instance, "settings")
+                    .unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
+                if !vm.is_struct_value(settings) {
+                    bail!("Module {} settings must be a struct", module.name);
+                }
+                let id = settings.as_gc_id().unwrap();
+                if let Some(overrides) = module.settings.as_object() {
+                    merge_settings(vm, id, overrides);
+                }
+                vm.struct_set(settings_id, &module.name, settings);
+                module.bifs.reconstruct_functions();
+                vm.interpret(module.bifs.clone())?;
+                records.push(instance);
+            }
+            for &instance in &records {
+                if vm.instance_has_method(instance, "onLoad") {
+                    vm.call_method_value(instance, "onLoad", vec![])?;
+                }
+            }
+            self.chunk.reconstruct_functions();
+            vm.interpret(self.chunk)
+        })();
+        let mut shutdown_error = None;
+        for instance in records.into_iter().rev() {
+            if vm.instance_has_method(instance, "onUnload") {
+                if let Err(error) = vm.call_method_value(instance, "onUnload", vec![]) {
+                    shutdown_error.get_or_insert(error);
+                }
+            }
+        }
+        match (result, shutdown_error) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Some(error)) => Err(error),
+            (Ok(value), None) => Ok(value),
+        }
+    }
+}
+
+fn merge_settings(vm: &mut VM, id: usize, overrides: &serde_json::Map<String, serde_json::Value>) {
+    for (key, value) in overrides {
+        let existing = vm.struct_get(id, key);
+        if let Some(nested) = value.as_object().filter(|_| vm.is_struct_value(existing)) {
+            merge_settings(vm, existing.as_gc_id().unwrap(), nested);
+        } else {
+            let value = vm.json_to_bx(value.clone());
+            vm.struct_set(id, key, value);
+        }
+    }
+}
+
+mod json_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &serde_json::Value,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<serde_json::Value, D::Error> {
+        serde_json::from_str(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_envelope_lengths() {
+        let mut bytes = vec![0; 16];
+        bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[8..].copy_from_slice(MAGIC);
+        assert!(Application::from_executable(&bytes).is_err());
+    }
+    #[test]
+    fn rejects_wrong_targets_and_hashes() {
+        let mut a = Artifact {
+            target: TARGET.into(),
+            abi: 1,
+            filename: "image.so".into(),
+            sha256: hash(b"test"),
+            bytes: b"test".to_vec(),
+        };
+        assert!(a.validate().is_ok());
+        a.target = "wrong".into();
+        assert!(a.validate().is_err());
+        a.target = TARGET.into();
+        a.bytes.push(1);
+        assert!(a.validate().is_err());
+    }
+}

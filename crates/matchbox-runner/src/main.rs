@@ -157,7 +157,7 @@ fn load_embedded_bytecode() -> Result<Chunk> {
     let len_bytes = &bytes[len_start..footer_start];
     let len = u64::from_le_bytes(len_bytes.try_into()?) as usize;
 
-    let chunk_start = len_start - len;
+    let chunk_start = len_start.checked_sub(len).ok_or_else(|| anyhow::anyhow!("Invalid embedded bytecode length"))?;
     let chunk_bytes = &bytes[chunk_start..len_start];
     
     let mut chunk: Chunk = postcard::from_bytes(chunk_bytes)?;
@@ -178,6 +178,17 @@ fn main() -> Result<()> {
         }).expect("Error setting Ctrl-C handler");
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let bytes = fs::read(std_env::current_exe()?)?;
+        if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
+            let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+            let mut vm = VM::new_with_args(std_env::args().collect());
+            application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+            return Ok(());
+        }
+    }
+
     // 1. Try to load embedded bytecode from the executable itself
     let chunk = match load_embedded_bytecode() {
         Ok(c) => c,
@@ -185,6 +196,13 @@ fn main() -> Result<()> {
             // 2. Fallback: Check for an external 'app.bxb' in the same directory
             let bytes = fs::read("app.bxb")
                 .map_err(|_| anyhow::anyhow!("No embedded bytecode or app.bxb found"))?;
+            #[cfg(not(target_family = "wasm"))]
+            if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
+                let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+                let mut vm = VM::new_with_args(std_env::args().collect());
+                application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+                return Ok(());
+            }
             let mut chunk: Chunk = match postcard::from_bytes(&bytes) {
                 Ok(c) => c,
                 Err(e) => return Err(anyhow::anyhow!("Failed to deserialize app.bxb: {}", e)),

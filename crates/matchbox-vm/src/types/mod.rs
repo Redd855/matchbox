@@ -203,6 +203,10 @@ pub trait BxVM {
         false
     }
     fn native_object_new(&mut self, obj: Rc<RefCell<dyn BxNativeObject>>) -> usize;
+    fn native_object_data(&self, _value: BxValue, _kind: &str) -> Option<*mut std::ffi::c_void> { None }
+    fn register_callback(&mut self, _name: &str, _callback: NativeCallback) -> Result<(), String> {
+        Err("Native callbacks are not supported by this host".into())
+    }
     fn native_object_call_method(&mut self, id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String>;
     fn construct_native_class(&mut self, class_name: &str, args: &[BxValue]) -> Result<BxValue, String>;
     fn instance_class_name(&self, receiver: BxValue) -> Result<String, String>;
@@ -253,6 +257,17 @@ pub trait BxVM {
 }
 
 pub type BxNativeFunction = fn(&mut dyn BxVM, &[BxValue]) -> Result<BxValue, String>;
+
+/// A native callable with owned context (for independently loaded plugins).
+#[derive(Clone)]
+pub struct NativeCallback {
+    pub parameters: Vec<String>,
+    pub callback: Rc<dyn Fn(&mut dyn BxVM, &[BxValue]) -> Result<BxValue, String>>,
+}
+impl fmt::Debug for NativeCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_tuple("NativeCallback").field(&self.parameters).finish() }
+}
+
 
 #[derive(Debug, Clone)]
 pub enum NativeFutureValue {
@@ -371,6 +386,8 @@ pub(crate) fn take_wasm_future_thunk(id: u64) -> Option<WasmFutureThunk> {
 }
 
 pub trait BxNativeObject: fmt::Debug {
+    fn delegated_callback(&self, _name: &str) -> Option<NativeCallback> { None }
+    fn native_data(&self, _kind: &str) -> Option<*mut std::ffi::c_void> { None }
     fn get_property(&self, name: &str) -> BxValue;
     fn set_property(&mut self, name: &str, value: BxValue);
     fn call_method(&mut self, vm: &mut dyn BxVM, id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String>;

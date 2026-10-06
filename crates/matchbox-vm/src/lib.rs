@@ -5,6 +5,10 @@ pub mod bifs;
 pub mod qoq;
 pub mod types;
 pub mod vm;
+#[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+pub mod plugins;
+#[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+pub mod bundle;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod datasource;

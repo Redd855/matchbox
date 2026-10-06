@@ -79,6 +79,7 @@ pub enum GcObject {
     Future(BxFuture),
     CompiledFunction(Rc<BxCompiledFunction>),
     NativeFunction(BxNativeFunction),
+    NativeCallback(crate::types::NativeCallback),
     Class(Rc<RefCell<BxClass>>),
     Interface(Rc<RefCell<BxInterface>>),
     NativeObject(Rc<RefCell<dyn BxNativeObject>>),
@@ -310,6 +311,7 @@ impl Heap {
         match self.objects[id].as_ref().unwrap() {
             GcObject::String(_)
             | GcObject::Bytes(_)
+            | GcObject::NativeCallback(_)
             | GcObject::NativeFunction(_)
             | GcObject::Class(_)
             | GcObject::Interface(_)
@@ -365,6 +367,7 @@ impl Heap {
         match self.objects[id].as_ref().unwrap() {
             GcObject::String(_)
             | GcObject::Bytes(_)
+            | GcObject::NativeCallback(_)
             | GcObject::NativeFunction(_)
             | GcObject::Class(_)
             | GcObject::Interface(_)

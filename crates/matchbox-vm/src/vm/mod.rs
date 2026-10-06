@@ -833,7 +833,7 @@ impl BxVM for VM {
                 .map(|id| {
                     matches!(
                         self.heap.get(id),
-                        GcObject::CompiledFunction(_) | GcObject::NativeFunction(_)
+                        GcObject::CompiledFunction(_) | GcObject::NativeFunction(_) | GcObject::NativeCallback(_)
                     )
                 })
                 .unwrap_or(false),
@@ -1003,7 +1003,7 @@ impl BxVM for VM {
                 if let Some(id) = val.as_gc_id() {
                     if matches!(
                         self.heap.get(id),
-                        GcObject::CompiledFunction(_) | GcObject::NativeFunction(_)
+                        GcObject::CompiledFunction(_) | GcObject::NativeFunction(_) | GcObject::NativeCallback(_)
                     ) {
                         Ok(val)
                     } else {
@@ -1459,6 +1459,19 @@ impl BxVM for VM {
             .is_some_and(|fiber| self.thread_futures.contains(&fiber.future_id))
     }
 
+    fn register_callback(&mut self, name: &str, callback: crate::types::NativeCallback) -> Result<(), String> {
+        let id = self.heap.alloc(GcObject::NativeCallback(callback));
+        self.insert_global(name.to_string(), BxValue::new_ptr(id));
+        Ok(())
+    }
+
+    fn native_object_data(&self, value: BxValue, kind: &str) -> Option<*mut std::ffi::c_void> {
+        match self.heap.get_opt(value.as_gc_id()?)? {
+            GcObject::NativeObject(object) => object.try_borrow().ok()?.native_data(kind),
+            _ => None,
+        }
+    }
+
     fn native_object_new(&mut self, obj: Rc<RefCell<dyn BxNativeObject>>) -> usize {
         self.heap.alloc(GcObject::NativeObject(obj))
     }
@@ -1469,17 +1482,25 @@ impl BxVM for VM {
         name: &str,
         args: &[BxValue],
     ) -> Result<BxValue, String> {
+        let previous_gc = self.gc_suspended;
         self.gc_suspended = true;
         // Clone the Rc to release the heap borrow immediately
         let obj_rc = if let GcObject::NativeObject(obj) = self.heap.get_mut(id) {
             Rc::clone(obj)
         } else {
-            self.gc_suspended = false;
+            self.gc_suspended = previous_gc;
             return Err(format!("Value at id {} is not a native object", id));
         };
 
-        let res = obj_rc.borrow_mut().call_method(self, id, name, args);
-        self.gc_suspended = false;
+        let delegated = obj_rc.borrow().delegated_callback(name);
+        let res = if let Some(callback) = delegated {
+            let mut values = vec![BxValue::new_ptr(id)];
+            values.extend_from_slice(args);
+            self.invoke_callback(&callback, &values)
+        } else {
+            obj_rc.borrow_mut().call_method(self, id, name, args)
+        };
+        self.gc_suspended = previous_gc;
         res
     }
 
@@ -2053,7 +2074,7 @@ impl VM {
                 GcObject::Instance(inst) => format!("<instance of {}>", inst.class.borrow().name),
                 GcObject::Future(_) => format!("<future id:{}>", id),
                 GcObject::CompiledFunction(f) => format!("<function {}>", f.name),
-                GcObject::NativeFunction(_) => "<native function>".to_string(),
+                GcObject::NativeFunction(_) | GcObject::NativeCallback(_) => "<native function>".to_string(),
                 GcObject::Class(c) => format!("<class {}>", c.borrow().name),
                 GcObject::Interface(i) => format!("<interface {}>", i.borrow().name),
                 GcObject::NativeObject(o) => format!("<native object {:?}>", o.borrow()),
@@ -2172,6 +2193,14 @@ impl VM {
             }
         }
         a == b
+    }
+
+    fn invoke_callback(&mut self, callback: &crate::types::NativeCallback, args: &[BxValue]) -> Result<BxValue, String> {
+        let previous = self.gc_suspended;
+        self.gc_suspended = true;
+        let result = (callback.callback)(self, args);
+        self.gc_suspended = previous;
+        result
     }
 
     pub fn new() -> Self {
@@ -3069,11 +3098,24 @@ impl VM {
                     }
                     Ok(self.enqueue_function_call(func, f, args, 0, receiver))
                 }
+                GcObject::NativeCallback(_) => {
+                    let res = self.call_function_value(func, args, None);
+                    let future = self.future_new();
+                    match res {
+                        Ok(value) => self.future_resolve(future, value).map_err(anyhow::Error::msg)?,
+                        Err(error) => {
+                            let id = self.string_new(error.to_string());
+                            self.future_reject(future, BxValue::new_ptr(id)).map_err(anyhow::Error::msg)?;
+                        }
+                    }
+                    Ok(future)
+                }
                 GcObject::NativeFunction(f) => {
                     let f = *f;
+                    let previous_gc = self.gc_suspended;
                     self.gc_suspended = true;
                     let res = f(self, &args).map_err(|e| anyhow::anyhow!(e));
-                    self.gc_suspended = false;
+                    self.gc_suspended = previous_gc;
                     let future = self.future_new();
                     match res {
                         Ok(value) => {
@@ -7157,11 +7199,16 @@ impl VM {
                     let _ = self.fibers.swap_remove(fiber_idx);
                     result
                 }
+                GcObject::NativeCallback(callback) => {
+                    let callback = callback.clone();
+                    self.invoke_callback(&callback, &args).map_err(anyhow::Error::msg)
+                }
                 GcObject::NativeFunction(f) => {
                     let f = *f;
+                    let previous_gc = self.gc_suspended;
                     self.gc_suspended = true;
                     let res = f(self, &args).map_err(|e| anyhow::anyhow!(e));
-                    self.gc_suspended = false;
+                    self.gc_suspended = previous_gc;
                     res
                 }
                 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -7382,6 +7429,20 @@ impl VM {
         Ok(BxValue::new_ptr(inst_id))
     }
 
+    pub fn instance_variable(&self, receiver: BxValue, name: &str) -> Option<BxValue> {
+        match self.heap.get_opt(receiver.as_gc_id()?)? {
+            GcObject::Instance(instance) => instance.variables.borrow().get(&name.to_lowercase()).copied(),
+            _ => None,
+        }
+    }
+
+    pub fn instance_has_method(&self, receiver: BxValue, name: &str) -> bool {
+        match receiver.as_gc_id().and_then(|id| self.heap.get_opt(id)) {
+            Some(GcObject::Instance(instance)) => self.resolve_method(instance.class.clone(), name).is_some(),
+            _ => false,
+        }
+    }
+
     pub fn instance_variables_json(&self, receiver: BxValue) -> Result<serde_json::Value> {
         let id = receiver
             .as_gc_id()
@@ -7459,6 +7520,22 @@ impl VM {
         } else {
             false
         }
+    }
+
+    fn reorder_callback_arguments(args: Vec<BxValue>, names: Vec<String>, params: &[String]) -> Result<Vec<BxValue>, String> {
+        if args.len() > params.len() { return Err("Too many native arguments".into()); }
+        let mut values = vec![BxValue::new_null(); params.len()];
+        let mut assigned = vec![false; params.len()];
+        let mut position = 0;
+        for (index, value) in args.into_iter().enumerate() {
+            let name = names.get(index).map(String::as_str).unwrap_or("");
+            let slot = if name.is_empty() { let slot = position; position += 1; slot } else {
+                params.iter().position(|p| p.eq_ignore_ascii_case(name)).ok_or_else(|| format!("Unknown native argument: {name}"))?
+            };
+            if slot >= params.len() || assigned[slot] { return Err("Duplicate or excessive native argument".into()); }
+            assigned[slot] = true; values[slot] = value;
+        }
+        Ok(values)
     }
 
     fn reorder_arguments(
@@ -7814,6 +7891,22 @@ impl VM {
                     self.fibers[fiber_idx].frames.push(frame);
                     Ok(())
                 }
+                GcObject::NativeCallback(callback) => {
+                    let callback = callback.clone();
+                    let start = self.fibers[fiber_idx].stack.len() - arg_count;
+                    let mut args: Vec<_> = self.fibers[fiber_idx].stack.drain(start..).collect();
+                    if let Some(names) = names {
+                        args = match Self::reorder_callback_arguments(args, names, &callback.parameters) {
+                            Ok(args) => args,
+                            Err(error) => return self.throw_error(fiber_idx, &error),
+                        };
+                    }
+                    self.fibers[fiber_idx].stack.pop();
+                    match self.invoke_callback(&callback, &args) {
+                        Ok(value) => { self.fibers[fiber_idx].stack.push(value); Ok(()) }
+                        Err(error) => self.throw_error(fiber_idx, &error),
+                    }
+                }
                 GcObject::NativeFunction(func) => {
                     let func = *func;
                     let mut args = Vec::with_capacity(arg_count);
@@ -8083,14 +8176,13 @@ impl VM {
                     args.reverse();
                     self.fibers[fiber_idx].stack.pop(); // receiver
 
-                    let mut obj_borrow = obj.borrow_mut();
-                    match obj_borrow.call_method(self, id, &name, &args) {
+                    drop(obj);
+                    match self.native_object_call_method(id, &name, &args) {
                         Ok(res) => {
                             self.fibers[fiber_idx].stack.push(res);
                             return Ok(());
                         }
                         Err(e) => {
-                            drop(obj_borrow);
                             return self.throw_error(fiber_idx, &e);
                         }
                     }
@@ -8339,6 +8431,18 @@ impl VM {
         if let Some(bif_val) = self.get_global(&bif_name) {
             if let Some(bif_id) = bif_val.as_gc_id() {
                 match self.heap.get(bif_id) {
+                    GcObject::NativeCallback(callback) => {
+                        let callback = callback.clone();
+                        let start = self.fibers[fiber_idx].stack.len() - arg_count;
+                        let args: Vec<_> = self.fibers[fiber_idx].stack.drain(start..).collect();
+                        self.fibers[fiber_idx].stack.pop();
+                        let mut final_args = vec![receiver];
+                        final_args.extend(args);
+                        match self.invoke_callback(&callback, &final_args) {
+                            Ok(value) => { self.fibers[fiber_idx].stack.push(value); return Ok(()); }
+                            Err(error) => return self.throw_error(fiber_idx, &error),
+                        }
+                    }
                     GcObject::NativeFunction(bif) => {
                         let bif = *bif;
                         let mut args = Vec::with_capacity(arg_count + 1);
@@ -8604,7 +8708,7 @@ impl VM {
                     })
                     .into()
                 }
-                GcObject::CompiledFunction(_) | GcObject::NativeFunction(_) => {
+                GcObject::CompiledFunction(_) | GcObject::NativeFunction(_) | GcObject::NativeCallback(_) => {
                     #[cfg(all(target_arch = "wasm32", feature = "js"))]
                     {
                         let id = *self.next_callback_id.borrow();

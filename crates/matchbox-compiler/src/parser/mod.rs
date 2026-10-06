@@ -525,7 +525,13 @@ impl<'a> Parser<'a> {
         while !self.peek_is(TokenKind::RightBrace) {
             if self.peek_is(TokenKind::Property) {
                 self.pos += 1; // property
-                let prop_name = self.expect_get(TokenKind::Identifier)?;
+                let mut prop_name = self.expect_get(TokenKind::Identifier)?;
+                if prop_name.eq_ignore_ascii_case("name") && self.peek_is(TokenKind::Equal) {
+                    self.pos += 1;
+                    let name = self.expect_get(TokenKind::String)?;
+                    prop_name = name[1..name.len() - 1].to_string();
+                    if prop_name.is_empty() { return Err(self.error_current("property name cannot be empty").into()); }
+                }
                 members.push(ClassMember::Property(prop_name));
                 if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
             } else {

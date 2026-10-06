@@ -27,7 +27,7 @@ zip = { version = "2.2", optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1.0", optional = true }
 bzip2 = { version = "0.5", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 sha1 = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
@@ -41,6 +41,9 @@ filetime = { version = "0.2", optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "espidf")))'.dependencies]
 ctrlc = "3.4"
+libloading = "0.8"
+libc = "0.2"
+matchbox-plugin-sdk = { path = "../matchbox-plugin-sdk" }
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 crossterm = { version = "0.28", optional = true }
@@ -68,7 +71,7 @@ jit = ["cranelift-jit", "cranelift-frontend", "cranelift-codegen", "cranelift-mo
 bif-io = ["walkdir", "fs_extra", "filetime"]
 bif-http = ["reqwest"]
 bif-zip = ["zip", "tar", "flate2", "bzip2"]
-bif-crypto = ["sha2", "sha1", "md-5", "hmac", "digest", "aes", "cipher", "des", "blowfish"]
+bif-crypto = ["sha1", "md-5", "hmac", "digest", "aes", "cipher", "des", "blowfish"]
 bif-cli = ["crossterm"]
 bif-jni = ["jni"]
 bif-datasource = ["postgres", "r2d2", "r2d2_postgres"]

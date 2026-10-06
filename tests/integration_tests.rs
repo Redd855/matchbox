@@ -1152,22 +1152,9 @@ fn test_native_math_module() {
         .join("modules")
         .join("native-math");
 
-    if let Err(e) = process_file(
-        &script_path,
-        false,
-        None,
-        Vec::new(),
-        false,
-        false,
-        false,
-        None,
-        &[module_path],
-        false,
-        None,
-        false,
-        false,
-        false,
-    ) {
-        panic!("Native math module test failed: {}", e);
-    }
+    let error = process_file(
+        &script_path, false, None, Vec::new(), false, false, false, None,
+        &[module_path], false, None, false, false, false,
+    ).unwrap_err();
+    assert!(error.to_string().contains("Source-only native modules require --target native"));
 }

@@ -9,6 +9,8 @@ use serde::Deserialize;
 pub struct ModuleInfo {
     /// The module name (e.g. `"bx-strings"`). Becomes the `bxModules.{name}` namespace.
     pub name: String,
+    pub mapping: String,
+    pub dependencies: Vec<String>,
     /// Absolute physical path to the module root directory.
     pub path: PathBuf,
     /// Contents of each `bifs/*.bxs` (or `.bx`) file in this module, injected as extra
@@ -16,8 +18,9 @@ pub struct ModuleInfo {
     pub bif_sources: Vec<String>,
     /// Whether this module contains a `matchbox/Cargo.toml` for native Rust compilation.
     pub has_native: bool,
-    /// Settings collected by executing `ModuleConfig.bx configure()` at compile time.
-    /// An empty JSON object if the module has no settings or lifecycle execution failed.
+    /// BoxLang class BIFs, registered using their invoke() method at runtime.
+    pub bif_classes: Vec<(String, String)>,
+    /// Application settings overrides; configure() runs only in the application VM.
     pub settings: serde_json::Value,
 }
 
@@ -196,7 +199,7 @@ pub fn discover_modules(
 
     // 3. Validate and resolve each entry.
     let mut modules = Vec::new();
-    for (name, path) in entries {
+    for (mut name, path) in entries {
         let path = path.canonicalize().with_context(|| {
             format!("Module '{}': path does not exist: {}", name, path.display())
         })?;
@@ -210,9 +213,26 @@ pub fn discover_modules(
             );
         }
 
+        let package_path = path.join("box.json");
+        let package: serde_json::Value = if package_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(package_path)?)?
+        } else {
+            serde_json::json!({})
+        };
+        if let Some(declared) = package["boxlang"]["moduleName"].as_str() {
+            name = declared.to_owned();
+        }
+        let source = std::fs::read_to_string(&descriptor)?;
+        let metadata = descriptor_metadata(&source)?;
+        if !metadata.enabled {
+            continue;
+        }
+        let mapping = metadata.mapping.unwrap_or_else(|| name.clone());
+
         // Collect bifs/*.bxs sources (sorted for determinism).
         let bifs_dir = path.join("bifs");
         let mut bif_sources = Vec::new();
+        let mut bif_classes = Vec::new();
         if bifs_dir.is_dir() {
             let mut bif_files: Vec<_> = std::fs::read_dir(&bifs_dir)?
                 .filter_map(|e| e.ok())
@@ -231,25 +251,57 @@ pub fn discover_modules(
                         entry.path().display()
                     )
                 })?;
-                bif_sources.push(src);
+                let file = entry.path();
+                let ast = matchbox_compiler::parser::parse(&src, file.to_str())?;
+                if ast.iter().any(|s| {
+                    matches!(
+                        s.kind,
+                        matchbox_compiler::ast::StatementKind::ClassDecl { .. }
+                    )
+                }) {
+                    bif_classes.push((
+                        file.file_stem().unwrap().to_string_lossy().into_owned(),
+                        src,
+                    ));
+                } else {
+                    bif_sources.push(src);
+                }
             }
         }
 
-        let has_native = path.join("matchbox").join("Cargo.toml").exists();
+        // Published artifacts take precedence; never silently compile a mismatched target.
+        let has_artifacts = package["matchbox"]["artifacts"]
+            .as_object()
+            .is_some_and(|a| !a.is_empty());
+        let has_native = !has_artifacts && path.join("matchbox").join("Cargo.toml").exists();
 
-        // Execute configure() + onLoad() in an isolated VM to collect module settings.
-        let settings = execute_module_lifecycle(&name, &path);
+        let config_path = project_dir.join("boxlang.json");
+        let config: serde_json::Value = if config_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(config_path)?)?
+        } else {
+            serde_json::json!({})
+        };
+        if config["modules"][&name]["enabled"] == false {
+            continue;
+        }
+        let settings = config["modules"][&name]["settings"]
+            .as_object()
+            .map(|m| serde_json::Value::Object(m.clone()))
+            .unwrap_or_else(|| serde_json::json!({}));
 
         modules.push(ModuleInfo {
             name,
+            mapping,
+            dependencies: metadata.dependencies,
             path,
             bif_sources,
+            bif_classes,
             has_native,
             settings,
         });
     }
 
-    Ok(modules)
+    order_modules(modules)
 }
 
 /// Read `[datasources.<name>]` sections from `matchbox.toml` in `project_dir`.
@@ -270,152 +322,144 @@ pub fn read_datasource_configs(project_dir: &Path) -> Result<HashMap<String, Dat
     Ok(manifest.datasources)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Phase 2 — Module lifecycle execution
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Execute a module's `ModuleConfig.bx` lifecycle in an isolated VM.
-///
-/// The file must define a class named `ModuleConfig` with a `configure()` method
-/// that sets `this.settings` to a struct, and an optional `onLoad()` method.
-/// Errors are emitted as warnings; an empty JSON object is returned on failure.
-pub fn execute_module_lifecycle(name: &str, path: &Path) -> serde_json::Value {
-    let empty = serde_json::Value::Object(serde_json::Map::new());
-    let descriptor = path.join("ModuleConfig.bx");
-
-    let source = match std::fs::read_to_string(&descriptor) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "Warning: Module '{}': could not read ModuleConfig.bx: {}",
-                name, e
-            );
-            return empty;
-        }
-    };
-
-    // Build a wrapper that instantiates ModuleConfig, runs onLoad(), then calls
-    // configure() and returns its result (the settings struct).
-    let wrapper =
-        format!("{source}\nmc = new ModuleConfig()\nmc.onLoad()\nreturn mc.configure()\n");
-
-    let ast = match matchbox_compiler::parser::parse(&wrapper, Some(&descriptor.to_string_lossy()))
-    {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!(
-                "Warning: Module '{}': failed to parse ModuleConfig.bx: {}",
-                name, e
-            );
-            return empty;
-        }
-    };
-
-    let mut chunk = match matchbox_compiler::compile_with_treeshaking(
-        &descriptor.to_string_lossy(),
-        &ast,
-        &wrapper,
-        vec![],
-        false,
-        false,
-        &[],
-        &[],
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "Warning: Module '{}': failed to compile ModuleConfig.bx: {}",
-                name, e
-            );
-            return empty;
-        }
-    };
-
-    chunk.reconstruct_functions();
-
-    let mut vm = matchbox_vm::vm::VM::new();
-    let result = match vm.interpret(chunk) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "Warning: Module '{}': ModuleConfig.bx lifecycle error: {}",
-                name, e
-            );
-            return empty;
-        }
-    };
-
-    let json = vm.bx_to_json(&result);
-    if matches!(json, serde_json::Value::Object(_)) {
-        json
-    } else {
-        empty
-    }
+struct DescriptorMetadata {
+    enabled: bool,
+    mapping: Option<String>,
+    dependencies: Vec<String>,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// getModuleSettings BIF code generation
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Generate a BoxLang source snippet defining `getModuleSettings(name)` that returns
-/// the compile-time-baked settings struct for the requested module name.
-///
-/// Injected as an extra prelude so the function is tree-shaken like any built-in.
-pub fn generate_get_module_settings_bxs(modules: &[ModuleInfo]) -> String {
-    // Strategy: per-module helper functions (struct built at top-level of each),
-    // plus a default helper returning {}, dispatched via chained ternary ?:
-    // to avoid if-block scoping issues (assignments inside Matchbox if-blocks
-    // do not persist to outer scope).
-    //
-    // IMPORTANT: parameter names must be ALL LOWERCASE. The compiler stores
-    // locals via `param.name.clone()` but resolve_local() lowercases the lookup
-    // name, causing a case-mismatch that makes mixed-case params invisible.
-    let mut bxs = String::new();
-    let mut helpers: Vec<(String, String)> = Vec::new(); // (module_name, helper_fn_name)
-
-    for m in modules {
-        if let serde_json::Value::Object(ref map) = m.settings {
-            if !map.is_empty() {
-                let safe = m.name.replace('-', "_");
-                let helper = format!("getModuleSettings_{safe}");
-                bxs.push_str(&format!("function {}() {{\n", helper));
-                bxs.push_str("    s = {}\n");
-                for (k, v) in map {
-                    bxs.push_str(&format!("    s.{} = {}\n", k, json_value_to_bxs(v)));
+fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
+    use matchbox_compiler::ast::*;
+    fn string(expression: &Expression) -> Option<String> {
+        match &expression.kind {
+            ExpressionKind::Literal(Literal::String(parts))
+                if parts.iter().all(|p| matches!(p, StringPart::Text(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let StringPart::Text(s) = p {
+                                Some(s.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+    let mut result = DescriptorMetadata {
+        enabled: true,
+        mapping: None,
+        dependencies: vec![],
+    };
+    for statement in matchbox_compiler::parser::parse(source, Some("ModuleConfig.bx"))? {
+        let StatementKind::ClassDecl { members, .. } = statement.kind else {
+            continue;
+        };
+        for member in members {
+            let ClassMember::Statement(Statement {
+                kind: StatementKind::Expression(expression),
+                ..
+            }) = member
+            else {
+                continue;
+            };
+            let ExpressionKind::Assignment {
+                target: AssignmentTarget::Member { base, member },
+                value,
+            } = expression.kind
+            else {
+                continue;
+            };
+            if !matches!(base.kind, ExpressionKind::Identifier(ref name) if name.eq_ignore_ascii_case("this"))
+            {
+                continue;
+            }
+            match member.to_lowercase().as_str() {
+                "enabled" => {
+                    let ExpressionKind::Literal(Literal::Boolean(enabled)) = value.kind else {
+                        bail!("Module enabled metadata must be a boolean literal");
+                    };
+                    result.enabled = enabled;
                 }
-                bxs.push_str("    return s\n");
-                bxs.push_str("}\n");
-                helpers.push((m.name.clone(), helper));
+                "mapping" => {
+                    result.mapping =
+                        Some(string(&value).context("Module mapping must be a string literal")?)
+                }
+                "dependencies" => {
+                    let ExpressionKind::Literal(Literal::Array(values)) = value.kind else {
+                        bail!("Module dependencies must be an array literal");
+                    };
+                    result.dependencies = values
+                        .iter()
+                        .map(|v| string(v).context("Module dependencies must contain names"))
+                        .collect::<Result<_>>()?;
+                }
+                _ => (),
             }
         }
     }
-
-    // Default (no-match) helper — avoids bare `{}` in ternary else position
-    bxs.push_str("function getModuleSettings_default() {\n");
-    bxs.push_str("    d = {}\n");
-    bxs.push_str("    return d\n");
-    bxs.push_str("}\n");
-
-    // Build a chained ternary dispatched on "mn" (lowercase param — see note above).
-    bxs.push_str("function getModuleSettings(mn) {\n");
-    let mut expr = String::from("getModuleSettings_default()");
-    for (mod_name, helper) in helpers.iter().rev() {
-        expr = format!("(mn == \"{}\") ? {}() : {}", mod_name, helper, expr);
+    Ok(result)
+}
+fn order_modules(modules: Vec<ModuleInfo>) -> Result<Vec<ModuleInfo>> {
+    let mut names = HashMap::new();
+    for (index, module) in modules.iter().enumerate() {
+        if names.insert(module.name.to_lowercase(), index).is_some() {
+            bail!("Duplicate module name: {}", module.name);
+        }
     }
-    bxs.push_str(&format!("    result = {}\n", expr));
-    bxs.push_str("    return result\n");
-    bxs.push_str("}\n");
-    bxs
+    fn visit(
+        index: usize,
+        modules: &[ModuleInfo],
+        names: &HashMap<String, usize>,
+        states: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        if states[index] == 2 {
+            return Ok(());
+        }
+        if states[index] == 1 {
+            bail!(
+                "Circular module dependency involving {}",
+                modules[index].name
+            );
+        }
+        states[index] = 1;
+        for dependency in &modules[index].dependencies {
+            let next = *names.get(&dependency.to_lowercase()).with_context(|| {
+                format!(
+                    "Module {} requires missing module {dependency}",
+                    modules[index].name
+                )
+            })?;
+            visit(next, modules, names, states, order)?;
+        }
+        states[index] = 2;
+        order.push(index);
+        Ok(())
+    }
+    let mut states = vec![0; modules.len()];
+    let mut order = Vec::new();
+    for index in 0..modules.len() {
+        visit(index, &modules, &names, &mut states, &mut order)?;
+    }
+    Ok(order
+        .into_iter()
+        .map(|index| modules[index].clone())
+        .collect())
 }
 
-fn json_value_to_bxs(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => {
-            format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-        }
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "null".to_string(),
-        _ => "{}".to_string(), // nested objects/arrays: simplified placeholder
-    }
+pub fn mappings(modules: &[ModuleInfo]) -> Vec<(String, PathBuf)> {
+    modules
+        .iter()
+        .flat_map(|module| {
+            [
+                (module.name.clone(), module.path.clone()),
+                (module.mapping.clone(), module.path.clone()),
+            ]
+        })
+        .collect()
 }

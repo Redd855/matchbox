@@ -4,9 +4,15 @@ use crate::types::{
 };
 use chrono::{DateTime, Utc};
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub type GcId = usize;
+
+/// VM-internal root; no Rust layout crosses the plugin ABI.
+pub struct RootedValue {
+    value: BxValue,
+    heap: Weak<()>,
+}
 
 /// Configuration for the garbage collector, with preset defaults
 /// tuned for different target platforms.
@@ -101,6 +107,8 @@ pub struct Heap {
     young_objects: Vec<GcId>,
     minor_gc_count: usize,
     config: GCConfig,
+    identity: Rc<()>,
+    retained_values: Vec<Weak<RootedValue>>,
 }
 
 impl Heap {
@@ -122,7 +130,32 @@ impl Heap {
             young_objects: Vec::new(),
             minor_gc_count: 0,
             config,
+            identity: Rc::new(()),
+            retained_values: Vec::new(),
         }
+    }
+
+    pub fn retain_value(&mut self, value: BxValue) -> Result<Rc<RootedValue>, String> {
+        if value
+            .as_gc_id()
+            .is_some_and(|id| self.get_opt(id).is_none())
+        {
+            return Err("Cannot retain a collected value".into());
+        }
+        let root = Rc::new(RootedValue {
+            value,
+            heap: Rc::downgrade(&self.identity),
+        });
+        self.retained_values.push(Rc::downgrade(&root));
+        self.alloc_count += 1;
+        Ok(root)
+    }
+
+    pub fn read_retained_value(&self, root: &RootedValue) -> Result<BxValue, String> {
+        if !root.heap.ptr_eq(&Rc::downgrade(&self.identity)) {
+            return Err("Retained value belongs to another VM".into());
+        }
+        Ok(root.value)
     }
 
     pub fn alloc(&mut self, obj: GcObject) -> GcId {
@@ -210,6 +243,7 @@ impl Heap {
     }
 
     pub fn collect(&mut self, roots: &[BxValue]) {
+        self.retained_values.retain(|root| root.strong_count() > 0);
         self.alloc_count = 0;
         self.minor_gc_count += 1;
 
@@ -238,6 +272,10 @@ impl Heap {
         // Add young roots from stack/globals
         for root in roots {
             self.add_to_worklist_young(root, &mut worklist);
+        }
+
+        for root in self.retained_values.iter().filter_map(Weak::upgrade) {
+            self.add_to_worklist_young(&root.value, &mut worklist);
         }
 
         // Scan remembered set: old objects that were mutated may point to young objects
@@ -281,6 +319,9 @@ impl Heap {
         for root in roots {
             self.add_to_worklist(root, &mut worklist);
         }
+        for root in self.retained_values.iter().filter_map(Weak::upgrade) {
+            self.add_to_worklist(&root.value, &mut worklist);
+        }
 
         while let Some(id) = worklist.pop() {
             if self.marks[id] {
@@ -315,9 +356,13 @@ impl Heap {
             | GcObject::NativeFunction(_)
             | GcObject::Class(_)
             | GcObject::Interface(_)
-            | GcObject::CompiledFunction(_)
             | GcObject::Range(_)
             | GcObject::DateTime(_) => {}
+            GcObject::CompiledFunction(function) => {
+                if let Some(receiver) = &function.captured_receiver {
+                    self.add_to_worklist(receiver, worklist);
+                }
+            }
             GcObject::NativeObject(obj) => {
                 let mut tracer = WorklistTracer {
                     worklist,
@@ -371,9 +416,13 @@ impl Heap {
             | GcObject::NativeFunction(_)
             | GcObject::Class(_)
             | GcObject::Interface(_)
-            | GcObject::CompiledFunction(_)
             | GcObject::Range(_)
             | GcObject::DateTime(_) => {}
+            GcObject::CompiledFunction(function) => {
+                if let Some(receiver) = &function.captured_receiver {
+                    self.add_to_worklist_young(receiver, worklist);
+                }
+            }
             GcObject::NativeObject(obj) => {
                 let mut tracer = YoungWorklistTracer {
                     worklist,

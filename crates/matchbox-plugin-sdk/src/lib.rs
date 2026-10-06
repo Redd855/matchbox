@@ -1,15 +1,19 @@
 //! Stable desktop plugin ABI. No VM implementation or Rust-owned objects cross this boundary.
 //!
 //! All callbacks run synchronously on the VM thread. Value handles are nonzero, opaque,
-//! and valid only for the current invocation. Plugins must not retain handles or context
-//! pointers. Object payloads belong to the plugin and are released by its drop callback.
+//! and valid only for the current invocation. Use matchbox.roots.v1 to retain values;
+//! never retain invocation handles or context pointers. Object payloads belong to the
+//! plugin and are released by its drop callback.
 //! A capability's layout and semantics are immutable; incompatible changes use a new name.
 //! Trusted plugins must supply valid pointers and must never unwind across these functions.
 use std::ffi::c_void;
 
 pub const ABI_MAJOR: u32 = 1;
 pub const VALUES_V1: &str = "matchbox.values.v1";
+pub const ROOTS_V1: &str = "matchbox.roots.v1";
 pub type Value = u64;
+/// Host-owned opaque allocation, valid until released exactly once on the VM thread.
+pub type RootHandle = *mut c_void;
 pub type Context = *mut c_void;
 pub type Invoke = unsafe extern "C" fn(
     Context,
@@ -67,6 +71,40 @@ pub struct ValuesV1 {
     pub error: unsafe extern "C" fn(Context, Text),
 }
 
+/// Additive capability: persistent GC roots, separate from invocation-local Value handles.
+/// All operations, including release, run on the VM thread. Handles belong to one VM
+/// and provider instance. Release remains valid after that VM has been destroyed.
+#[repr(C)]
+pub struct RootsV1 {
+    pub retain: unsafe extern "C" fn(Context, Value, *mut RootHandle) -> i32,
+    pub get: unsafe extern "C" fn(Context, RootHandle, *mut Value) -> i32,
+    /// Null is a no-op; every nonnull handle must be live and host-issued.
+    pub release: unsafe extern "C" fn(RootHandle),
+}
+
+/// An owned GC root. Dropping it releases the host allocation, even without a live call.
+/// Strong roots can form cycles; release any root that refers back to its owning payload.
+///
+/// ```compile_fail
+/// fn move_to_worker(root: matchbox_plugin_sdk::RetainedValue) {
+///     std::thread::spawn(move || drop(root));
+/// }
+/// ```
+pub struct RetainedValue {
+    handle: RootHandle,
+    api: &'static RootsV1,
+}
+impl RetainedValue {
+    pub fn value(&self, call: &Call<'_>) -> Result<Value, String> {
+        call.value(|out| unsafe { (self.api.get)(call.context, self.handle, out) })
+    }
+}
+impl Drop for RetainedValue {
+    fn drop(&mut self) {
+        unsafe { (self.api.release)(self.handle) };
+    }
+}
+
 /// Ergonomic, call-scoped wrapper. Construct only from the host's invocation callback.
 pub struct Call<'a> {
     context: Context,
@@ -105,6 +143,13 @@ impl<'a> Call<'a> {
         } else {
             Err("Host value operation failed".into())
         }
+    }
+    pub fn retain(&self, api: &'static RootsV1, value: Value) -> Result<RetainedValue, String> {
+        let mut handle = std::ptr::null_mut();
+        if unsafe { (api.retain)(self.context, value, &mut handle) } != 0 {
+            return Err("Host value retention failed".into());
+        }
+        Ok(RetainedValue { handle, api })
     }
     pub fn number(&self, value: Value) -> Result<f64, String> {
         let mut out = 0.0;
@@ -204,6 +249,24 @@ pub unsafe fn require_values(
     host: *const HostV1,
     context: Context,
 ) -> Result<*const ValuesV1, i32> {
+    unsafe { require_capability(host, context, VALUES_V1).map(|api| api.cast()) }
+}
+
+/// # Safety
+/// Must be called with the pointers supplied to matchbox_plugin_init_v1.
+/// The returned table is immutable and valid for the host process lifetime.
+pub unsafe fn require_roots(
+    host: *const HostV1,
+    context: Context,
+) -> Result<&'static RootsV1, i32> {
+    unsafe { require_capability(host, context, ROOTS_V1).map(|api| &*api.cast()) }
+}
+
+unsafe fn require_capability(
+    host: *const HostV1,
+    context: Context,
+    name: &str,
+) -> Result<*const c_void, i32> {
     if host.is_null() {
         return Err(1);
     }
@@ -211,16 +274,31 @@ pub unsafe fn require_values(
     if host.abi_major != ABI_MAJOR {
         return Err(1);
     }
-    let api = unsafe { (host.capability)(Text::new(VALUES_V1)) };
+    let api = unsafe { (host.capability)(Text::new(name)) };
     if api.is_null() {
         unsafe {
             (host.error)(
                 context,
-                Text::new("Missing required capability: matchbox.values.v1"),
+                Text::new(&format!("Missing required capability: {name}")),
             )
         };
         Err(1)
     } else {
-        Ok(api.cast())
+        Ok(api)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_capability_layouts_remain_fixed() {
+        let pointer = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<HostV1>(), 4 * pointer);
+        assert_eq!(std::mem::offset_of!(HostV1, capability), pointer);
+        assert_eq!(std::mem::size_of::<ValuesV1>(), 11 * pointer);
+        assert_eq!(std::mem::offset_of!(ValuesV1, error), 10 * pointer);
+        assert_eq!(std::mem::size_of::<RootsV1>(), 3 * pointer);
     }
 }

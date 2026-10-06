@@ -1,8 +1,14 @@
 use matchbox_plugin_sdk::*;
 use std::{
+    cell::RefCell,
     ffi::c_void,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+static ROOT_API: OnceLock<&'static RootsV1> = OnceLock::new();
+thread_local! { static RETAINED: RefCell<Option<RetainedValue>> = const { RefCell::new(None) }; }
 static DROPS: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "C" fn drop_object(data: *mut c_void) {
     drop(unsafe { Box::from_raw(data.cast::<f64>()) });
@@ -96,11 +102,126 @@ unsafe extern "C" fn bad_handle(
         })
     }
 }
+unsafe extern "C" fn store(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            let root = call.retain(
+                ROOT_API.get().copied().ok_or("Missing root capability")?,
+                call.argument(0)?,
+            )?;
+            RETAINED.with(|value| *value.borrow_mut() = Some(root));
+            call.number_new(0.0)
+        })
+    }
+}
+unsafe extern "C" fn recall(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            RETAINED.with(|value| {
+                value
+                    .borrow()
+                    .as_ref()
+                    .ok_or("No retained value")?
+                    .value(&call)
+            })
+        })
+    }
+}
+unsafe extern "C" fn clear(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            RETAINED.with(|value| {
+                value.borrow_mut().take();
+            });
+            Call::new(ctx, api, args, len).number_new(0.0)
+        })
+    }
+}
+unsafe extern "C" fn drop_root(data: *mut c_void) {
+    drop(unsafe { Box::from_raw(data.cast::<RetainedValue>()) });
+}
+unsafe extern "C" fn hold(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            let root = call.retain(
+                ROOT_API.get().copied().ok_or("Missing root capability")?,
+                call.argument(0)?,
+            )?;
+            let data = Box::into_raw(Box::new(root)).cast();
+            match call.object_new(
+                "fixture.root.v1",
+                data,
+                drop_root,
+                r#"{"get":"fixtureHeld"}"#,
+            ) {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    drop_root(data);
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+unsafe extern "C" fn held(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            let root = &*call
+                .object_data(call.argument(0)?, "fixture.root.v1")?
+                .cast::<RetainedValue>();
+            root.value(&call)
+        })
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn matchbox_plugin_init_v1(host: *const HostV1, ctx: Context) -> i32 {
     if unsafe { require_values(host, ctx) }.is_err() {
         return 1;
     }
+    let roots = match unsafe { require_roots(host, ctx) } {
+        Ok(roots) => roots,
+        Err(status) => return status,
+    };
+    let _ = ROOT_API.set(roots);
     let host = unsafe { &*host };
     if std::env::var_os("MATCHBOX_FIXTURE_MISSING_CAPABILITY").is_some() {
         if unsafe { (host.capability)(Text::new("missing.capability.v1")) }.is_null() {
@@ -125,6 +246,20 @@ pub unsafe extern "C" fn matchbox_plugin_init_v1(host: *const HostV1, ctx: Conte
         (r#"{"name":"fixtureDrops"}"#, drops as Invoke),
         (r#"{"name":"fixturePanic"}"#, panic_callback as Invoke),
         (r#"{"name":"fixtureBadHandle"}"#, bad_handle as Invoke),
+        (
+            r#"{"name":"fixtureStore","arguments":[{"name":"value"}]}"#,
+            store as Invoke,
+        ),
+        (r#"{"name":"fixtureRecall"}"#, recall as Invoke),
+        (r#"{"name":"fixtureClear"}"#, clear as Invoke),
+        (
+            r#"{"name":"fixtureHold","arguments":[{"name":"value"}]}"#,
+            hold as Invoke,
+        ),
+        (
+            r#"{"name":"fixtureHeld","arguments":[{"name":"holder","required":true}]}"#,
+            held as Invoke,
+        ),
     ];
     for (metadata, invoke) in functions {
         if unsafe { (host.register)(ctx, Text::new(metadata), invoke) } != 0 {

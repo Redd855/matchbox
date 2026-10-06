@@ -33,7 +33,7 @@ Discovery reads metadata and compiles descriptors without executing lifecycle ho
 
 At execution, load native providers, instantiate descriptors, call `configure()`, read the descriptor's **variables-scope `settings`**, deep-merge application settings, and register BoxLang class BIFs using their `invoke()` method. After initialization, call `onLoad()` in dependency order. Call `onUnload()` in reverse order at normal shutdown, including application errors. This does not provide cleanup after process abort/crash.
 
-`configure()` populates `settings`; its return value is ignored. Old build-time lifecycle execution and baked settings are removed. Class BIF names currently come from filenames; class annotation aliases/member declarations, tags, interceptors, dynamic/struct-valued mappings, moduleRecord/service injection, and retained/rooted VM handles are not yet implemented. Native objects can declare member-to-BIF mappings. A module relying on unsupported JVM APIs must provide an alternative backend.
+`configure()` populates `settings`; its return value is ignored. Old build-time lifecycle execution and baked settings are removed. Class BIF names currently come from filenames; class annotation aliases/member declarations, tags, interceptors, dynamic/struct-valued mappings, and moduleRecord/service injection are not yet implemented. Native objects can declare member-to-BIF mappings. A module relying on unsupported JVM APIs must provide an alternative backend.
 
 ## Native SDK / ABI
 
@@ -46,13 +46,32 @@ Compatibility rules:
 - ABI major and each named capability's layout/signature/semantics are immutable.
 - Add new operations through new capabilities; retain old capabilities for existing binaries.
 - Unknown/missing required capabilities cause explicit initialization failures.
-- Handles and borrowed strings/context pointers last **one invocation**. Retaining VM values is not supported in v1.
+- Value handles and borrowed strings/context pointers last **one invocation**. The optional `matchbox.roots.v1` capability provides separate persistent roots; it does not extend the lifetime of invocation handles.
 - Plugin payloads are opaque, plugin-owned pointers, scoped to the provider instance and type name. Ownership transfers to the host only when object creation succeeds. The host invokes the plugin's destructor when the object is collected.
-- Host and plugin each free their own allocations. Callbacks and objects retain their library so their executable code remains available through destruction.
+- Host and plugin each free their own allocations. Initialized libraries remain loaded for the process lifetime, including when plugin state/destructors outlive a VM.
 - All operations are synchronous on the VM thread. No async, unload, or hot reload.
 - Catch panics inside Rust callbacks using `guarded`; never unwind across C ABI callbacks. Recovery needs `panic = "unwind"`; aborting panics terminate the process.
 
 Plugins are trusted arbitrary native code, not sandboxed. SHA-256 pins content; it does not establish publisher trust. Cache permissions prevent other users from substituting code; same-user compromise is outside this trust model.
+
+## Retained VM values
+
+`matchbox.roots.v1` is an additive capability; `HostV1`, `ValuesV1`, and the ABI major are unchanged, so existing prebuilt plugins need no rebuild. Plugins requiring roots request `require_roots(host, context)` during initialization; older hosts report the missing capability explicitly.
+
+The capability has three operations: retain an invocation value as an opaque host-owned root, resolve a root into a new invocation value, and release the root. The SDK wraps them with RAII:
+
+```rust
+// roots: &'static RootsV1, obtained during plugin initialization
+let saved = call.retain(roots, call.argument(0)?)?;
+// Move saved into plugin-owned state. During a later invocation:
+let value = saved.value(&later_call)?;
+// Explicit release, or let the owning Rust payload's destructor do it:
+drop(saved);
+```
+
+Roots keep the value and its ordinary GC-reachable children alive through minor and major collection, including a callback's captured receiver. Root reads validate both VM and provider identity. A root does **not** keep its VM alive: reads using another VM fail, but release needs no invocation context and remains safe after VM shutdown.
+
+All root operations, including destruction, must remain on the VM thread. The Rust wrapper is neither `Send` nor `Sync` and cannot be cloned; retaining the same value again creates an independent root. Raw C root pointers must be live, host-issued allocations and released exactly once. Strong roots cannot break cycles: do not retain a value that refers back to its own native holder unless the plugin provides an explicit release path.
 
 ## Packaging / cache
 
@@ -70,7 +89,8 @@ Source-based Native Fusion remains available with `--target native`. A source-on
 
 ```bash
 cargo test --test native_plugin_tests
-cargo test -p matchbox_vm bundle::tests
+cargo test -p matchbox_vm
+cargo test -p matchbox-plugin-sdk
 ```
 
-The native fixture tests runtime lifecycle, shared class BIFs, named/default arguments, object collection, structured result lifetime, caught plugin panics, missing capabilities, envelope packaging, cache reuse, concurrent extraction, and artifact rejection. The separate `bx-image` pilot runs an identical BoxLang contract against its existing JVM JAR and native provider.
+The native fixture tests runtime lifecycle, shared class BIFs, named/default arguments, object collection, structured result lifetime, retained values/callbacks, VM/provider isolation, root release during GC and after VM shutdown, caught plugin panics, missing capabilities, envelope packaging, cache reuse, concurrent extraction, and artifact rejection. The separate `bx-image` pilot runs an identical BoxLang contract against its existing JVM JAR and native provider.

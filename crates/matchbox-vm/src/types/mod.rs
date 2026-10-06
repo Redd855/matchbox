@@ -202,6 +202,12 @@ pub trait BxVM {
     fn is_in_thread(&self) -> bool {
         false
     }
+    fn retain_value(&mut self, _value: BxValue) -> Result<Rc<crate::vm::gc::RootedValue>, String> {
+        Err("Value retention is not supported by this host".into())
+    }
+    fn read_retained_value(&self, _root: &crate::vm::gc::RootedValue) -> Result<BxValue, String> {
+        Err("Value retention is not supported by this host".into())
+    }
     fn native_object_new(&mut self, obj: Rc<RefCell<dyn BxNativeObject>>) -> usize;
     fn native_object_data(&self, _value: BxValue, _kind: &str) -> Option<*mut std::ffi::c_void> { None }
     fn register_callback(&mut self, _name: &str, _callback: NativeCallback) -> Result<(), String> {

@@ -1472,6 +1472,14 @@ impl BxVM for VM {
         }
     }
 
+    fn retain_value(&mut self, value: BxValue) -> Result<Rc<crate::vm::gc::RootedValue>, String> {
+        self.heap.retain_value(value)
+    }
+
+    fn read_retained_value(&self, root: &crate::vm::gc::RootedValue) -> Result<BxValue, String> {
+        self.heap.read_retained_value(root)
+    }
+
     fn native_object_new(&mut self, obj: Rc<RefCell<dyn BxNativeObject>>) -> usize {
         self.heap.alloc(GcObject::NativeObject(obj))
     }

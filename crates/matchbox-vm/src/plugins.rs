@@ -3,7 +3,13 @@ use crate::types::{BxNativeObject, BxVM, BxValue, NativeCallback};
 use libloading::Library;
 use matchbox_plugin_sdk::*;
 use serde::Deserialize;
-use std::{cell::RefCell, collections::HashMap, ffi::c_void, path::Path, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ffi::c_void,
+    path::Path,
+    rc::{Rc, Weak},
+};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,10 +71,10 @@ unsafe fn context<'a>(ctx: Context) -> &'a mut CallContext<'a> {
     unsafe { &mut *ctx.cast::<CallContext<'a>>() }
 }
 unsafe extern "C" fn capability(name: Text) -> *const c_void {
-    if unsafe { text(name) }.ok() == Some(VALUES_V1) {
-        (&VALUES as *const ValuesV1).cast()
-    } else {
-        std::ptr::null()
+    match unsafe { text(name) }.ok() {
+        Some(VALUES_V1) => (&VALUES as *const ValuesV1).cast(),
+        Some(ROOTS_V1) => (&ROOTS as *const RootsV1).cast(),
+        _ => std::ptr::null(),
     }
 }
 unsafe extern "C" fn registration_error(ctx: Context, message: Text) {
@@ -147,6 +153,8 @@ pub unsafe fn load(vm: &mut dyn BxVM, path: &Path) -> Result<(), String> {
             .error
             .unwrap_or_else(|| "Native plugin initialization failed".into()));
     }
+    // No unload: plugin state/destructors can outlive an individual VM.
+    std::mem::forget(library.clone());
     let functions = Rc::new(
         registration
             .functions
@@ -244,17 +252,18 @@ fn operation(ctx: &mut CallContext<'_>, result: Result<(), String>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => {
-            ctx.error = Some(error);
+            ctx.error.get_or_insert(error);
             1
         }
     }
 }
 unsafe extern "C" fn error(ctx: Context, message: Text) {
-    unsafe { context(ctx) }.error = Some(
+    // Host failures are sticky; the SDK's generic error must not replace the cause.
+    unsafe { context(ctx) }.error.get_or_insert_with(|| {
         unsafe { text(message) }
             .map(str::to_owned)
-            .unwrap_or_else(|e| e),
-    );
+            .unwrap_or_else(|e| e)
+    });
 }
 unsafe extern "C" fn string_get(ctx: Context, value: Value, out: *mut Text) -> i32 {
     let ctx = unsafe { context(ctx) };
@@ -475,6 +484,56 @@ pub fn download(url: &str) -> Result<Vec<u8>, String> {
         Err("Remote native artifacts require the bif-http build feature".into())
     }
 }
+
+struct HostRoot {
+    value: Rc<crate::vm::gc::RootedValue>,
+    library: Weak<Library>,
+}
+unsafe extern "C" fn root_retain(ctx: Context, value: Value, out: *mut RootHandle) -> i32 {
+    let ctx = unsafe { context(ctx) };
+    let result = (|| {
+        if out.is_null() {
+            return Err("Null output pointer".into());
+        }
+        let value = ctx.value(value)?;
+        let value = ctx.vm.retain_value(value)?;
+        let root = Box::new(HostRoot {
+            value,
+            library: Rc::downgrade(&ctx.library),
+        });
+        unsafe {
+            *out = Box::into_raw(root).cast();
+        }
+        Ok(())
+    })();
+    operation(ctx, result)
+}
+unsafe extern "C" fn root_get(ctx: Context, root: RootHandle, out: *mut Value) -> i32 {
+    let ctx = unsafe { context(ctx) };
+    let result = (|| {
+        if root.is_null() || out.is_null() {
+            return Err("Null retained value pointer".into());
+        }
+        let root = unsafe { &*root.cast::<HostRoot>() };
+        let value = ctx.vm.read_retained_value(&root.value)?;
+        if !root.library.ptr_eq(&Rc::downgrade(&ctx.library)) {
+            return Err("Retained value belongs to another plugin provider".into());
+        }
+        output(ctx, value, out);
+        Ok(())
+    })();
+    operation(ctx, result)
+}
+unsafe extern "C" fn root_release(root: RootHandle) {
+    if !root.is_null() {
+        drop(unsafe { Box::from_raw(root.cast::<HostRoot>()) });
+    }
+}
+static ROOTS: RootsV1 = RootsV1 {
+    retain: root_retain,
+    get: root_get,
+    release: root_release,
+};
 
 static VALUES: ValuesV1 = ValuesV1 {
     string_get,

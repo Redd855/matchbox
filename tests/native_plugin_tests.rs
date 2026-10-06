@@ -138,6 +138,137 @@ fn plugin_values_errors_and_object_lifetime() {
 }
 
 #[test]
+fn retained_values_survive_gc_and_release_without_a_live_vm() {
+    let mut vm = VM::new();
+    unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
+    let payload = vm.struct_new();
+    let text = vm.string_new("retained text".into());
+    vm.struct_set(payload, "text", BxValue::new_ptr(text));
+    vm.call_function("fixtureStore", vec![BxValue::new_ptr(payload)], None)
+        .unwrap();
+    for _ in 0..16 {
+        vm.collect_garbage_now();
+    }
+    assert_eq!(
+        vm.call_function("fixtureRecall", vec![], None).unwrap(),
+        BxValue::new_ptr(payload)
+    );
+    assert_eq!(
+        vm.to_string(vm.struct_get(payload, "text")),
+        "retained text"
+    );
+    let changed = vm.string_new("changed".into());
+    vm.struct_set(payload, "text", BxValue::new_ptr(changed));
+    for _ in 0..8 {
+        vm.collect_garbage_now();
+    }
+    assert_eq!(vm.to_string(vm.struct_get(payload, "text")), "changed");
+    vm.call_function("fixtureStore", vec![BxValue::new_number(42.0)], None)
+        .unwrap();
+    for _ in 0..8 {
+        vm.collect_garbage_now();
+    }
+    assert!(vm.heap.get_opt(payload).is_none());
+    assert!(vm.heap.get_opt(changed).is_none());
+    assert_eq!(
+        vm.call_function("fixtureRecall", vec![], None)
+            .unwrap()
+            .as_number(),
+        42.0
+    );
+    unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
+    assert!(
+        vm.call_function("fixtureRecall", vec![], None)
+            .unwrap_err()
+            .to_string()
+            .contains("another plugin provider")
+    );
+    vm.call_function("fixtureClear", vec![], None).unwrap();
+    assert!(vm.call_function("fixtureRecall", vec![], None).is_err());
+
+    // The containing native object owns the root and releases it without a call context.
+    let payload = vm.struct_new();
+    let holder = vm
+        .call_function("fixtureHold", vec![BxValue::new_ptr(payload)], None)
+        .unwrap();
+    vm.insert_global("heldValue".into(), holder);
+    for _ in 0..16 {
+        vm.collect_garbage_now();
+    }
+    assert_eq!(
+        vm.call_method_value(holder, "get", vec![]).unwrap(),
+        BxValue::new_ptr(payload)
+    );
+    vm.insert_global("heldValue".into(), BxValue::new_null());
+    for _ in 0..16 {
+        vm.collect_garbage_now();
+    }
+    assert!(vm.heap.get_opt(payload).is_none());
+
+    let payload = vm.struct_new();
+    vm.call_function("fixtureStore", vec![BxValue::new_ptr(payload)], None)
+        .unwrap();
+    drop(vm);
+    let mut other_vm = VM::new();
+    unsafe { matchbox_vm::plugins::load(&mut other_vm, library()) }.unwrap();
+    assert!(
+        other_vm
+            .call_function("fixtureRecall", vec![], None)
+            .unwrap_err()
+            .to_string()
+            .contains("another VM")
+    );
+    other_vm
+        .call_function("fixtureClear", vec![], None)
+        .unwrap();
+    other_vm
+        .call_function("fixtureStore", vec![BxValue::new_null()], None)
+        .unwrap();
+    assert!(
+        other_vm
+            .call_function("fixtureRecall", vec![], None)
+            .unwrap()
+            .is_null()
+    );
+    other_vm
+        .call_function("fixtureClear", vec![], None)
+        .unwrap();
+}
+
+#[test]
+fn retained_callback_keeps_its_captured_receiver_alive() {
+    let mut vm = VM::new();
+    unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
+    let source = r#"
+class Receiver {
+    this.label = "captured receiver";
+    function callback() { return () => this.label; }
+}
+receiver = new Receiver();
+fixtureStore(receiver.callback());
+receiver = null;
+"#;
+    let ast = matchbox_compiler::parser::parse(source, Some("retained-callback.bxs")).unwrap();
+    let chunk = matchbox_compiler::compiler::Compiler::new("retained-callback.bxs")
+        .compile(&ast, source)
+        .unwrap();
+    vm.interpret_sync(chunk).unwrap();
+    for _ in 0..16 {
+        vm.collect_garbage_now();
+    }
+    let callback = vm.call_function("fixtureRecall", vec![], None).unwrap();
+    let result = vm
+        .call_function_by_value(
+            &callback,
+            vec![],
+            std::rc::Rc::new(std::cell::RefCell::new(matchbox_vm::Chunk::default())),
+        )
+        .unwrap();
+    assert_eq!(vm.to_string(result), "captured receiver");
+    vm.call_function("fixtureClear", vec![], None).unwrap();
+}
+
+#[test]
 fn module_contract_direct_bytecode_and_standalone() {
     let dir = tempfile::tempdir().unwrap();
     package(dir.path());

@@ -80,7 +80,7 @@ pub fn run_thread_in_context(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxVa
 }
 
 pub fn box_module_reload(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_null())
+    Err("Module hot reload is not supported; rebuild and restart the application".into())
 }
 
 pub fn lock(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
@@ -95,12 +95,16 @@ pub fn write_log(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, Strin
     Ok(BxValue::new_null())
 }
 
-pub fn get_base_tag_data(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_null())
+pub fn get_base_tag_data(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    let tag = args.first().filter(|value| vm.is_string_value(**value)).ok_or("getBaseTagData() requires a tag name")?;
+    Err(format!("{} not found; source-backed custom tags are not supported", vm.to_string(*tag)))
 }
 
 pub fn get_base_tag_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.string_new(String::new())))
+    let names = vm.execution_components()?.into_iter().map(|state| {
+        vm.to_string(vm.struct_get(state.as_gc_id().unwrap(), "name"))
+    }).collect::<Vec<_>>().join(",");
+    Ok(BxValue::new_ptr(vm.string_new(names)))
 }
 
 pub fn get_base_template_path(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
@@ -125,20 +129,42 @@ pub fn get_box_version_info(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxVa
     Ok(BxValue::new_ptr(id))
 }
 
-pub fn get_component_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.struct_new()))
+pub fn get_component_list(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+    Err("Component descriptor reflection is not supported; use componentService.getComponentNames()".into())
 }
 
-pub fn get_function_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.struct_new()))
+pub fn get_function_list(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+    Err("BIF descriptor reflection is not supported; use functionService.getGlobalFunctionNames()".into())
 }
 
-pub fn get_module_info(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+fn module_registry(vm: &mut dyn BxVM) -> Result<Option<usize>, String> {
+    let Some(service) = vm.get_global_value("__mb_moduleservice") else { return Ok(None); };
+    vm.native_object_call_method(service.as_gc_id().ok_or("Invalid module service")?, "getRegistry", &[])?
+        .as_gc_id().map(Some).ok_or("Invalid module registry".into())
+}
+
+pub fn get_module_info(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    if args.len() != 1 || !vm.is_string_value(args[0]) { return Err("getModuleInfo() requires a module name".into()); }
+    if let Some(registry) = module_registry(vm)? {
+        let name = vm.to_string(args[0]);
+        if vm.struct_key_exists(registry, &name) {
+            let record = vm.struct_get(registry, &name);
+            return vm.native_object_call_method(record.as_gc_id().ok_or("Invalid module record")?, "asStruct", &[]);
+        }
+    }
     Ok(BxValue::new_ptr(vm.struct_new()))
 }
 
 pub fn get_module_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.struct_new()))
+    let result = vm.struct_new();
+    if let Some(registry) = module_registry(vm)? {
+        for name in vm.struct_key_array(registry) {
+            let record = vm.struct_get(registry, &name);
+            let value = vm.native_object_call_method(record.as_gc_id().ok_or("Invalid module record")?, "asStruct", &[])?;
+            vm.struct_set(result, &name, value);
+        }
+    }
+    Ok(BxValue::new_ptr(result))
 }
 
 pub fn invoke(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {

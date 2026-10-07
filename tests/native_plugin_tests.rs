@@ -1990,6 +1990,7 @@ fn component_and_interceptor_contexts_expose_live_caller_scopes_and_active_state
     fs::write(module.join("components/ContextFrame.bx"), r#"@RequiresBody(true) class {
         function invoke(context, attributes, body, executionState) {
             var states = context.getComponents();
+            if (listLen(getBaseTagList()) != attributes.depth) { throw "Component ancestry BIF returned an empty inventory"; }
             if (context.findClosestComponent("ContextFrame") != executionState || (attributes.depth == 2 && context.findClosestComponent("ContextFrame", 1) != states[2])) { throw "Closest component did not find ancestors"; }
             if (arrayLen(states) != attributes.depth || states[1] != executionState || states[1].name != "ContextFrame") { throw "Component states are not live or ordered"; }
             context.writeToBuffer("<");
@@ -2039,6 +2040,84 @@ fn retained_execution_contexts_keep_live_scopes_and_callbacks_across_gc() {
     for _ in 0..16 { vm.collect_garbage_now(); }
     assert!(vm.heap.get_opt(context.as_gc_id().unwrap()).is_none());
     assert!(vm.heap.get_opt(scope).is_none());
+}
+
+#[test]
+fn function_event_listener_errors_unwind_into_callers_without_poisoning_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(&module).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"class {
+        function preFunctionInvoke(data) { if (data.name == "preBroken") { throw "pre listener failure"; } }
+        function postFunctionInvoke(data) { if (data.name == "postBroken") { throw "post listener failure"; } }
+        function onFunctionException(data) { if (data.name == "errorBroken") { throw "exception listener failure"; } }
+    }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+        function preBroken() { throw "Unreachable pre body"; }
+        function postBroken() { return 1; }
+        function errorBroken() { throw "original function failure"; }
+        function stillWorks() { return 42; }
+        function caller(callable) {
+            try { callable(); } catch(any error) { return error.message; }
+            return "Not caught";
+        }
+        for (callable in [preBroken, postBroken, errorBroken]) {
+            if (!find("listener failure", caller(callable))) { throw "Function event error bypassed its caller"; }
+        }
+        if (stillWorks() != 42) { throw "Function event state remained poisoned"; }
+        println("event failures OK");"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "event failures OK\n");
+}
+
+#[test]
+fn component_output_policy_flags_fail_explicitly_without_running_descriptors() {
+    for flag in ["ignoreEnableOutputOnly", "autoEvaluateBodyExpressions"] {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module");
+        fs::create_dir_all(module.join("components")).unwrap();
+        fs::write(module.join("ModuleConfig.bx"), "class { println(\"Descriptor must not run\"); }").unwrap();
+        fs::write(module.join("components/Policy.bx"), format!("@BoxComponent class {flag}=true {{ function invoke(context, attributes, body, executionState) {{ return processBody(context, body, newBuffer()); }} }}")).unwrap();
+        fs::write(dir.path().join("app.bxs"), "bx:policy;").unwrap();
+        let output = cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("Module component {flag} is not yet supported")), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+#[test]
+fn unsupported_module_reflection_and_hot_reload_fail_instead_of_returning_placeholders() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+        for (operation in [() => getFunctionList(), () => getComponentList(), () => boxModuleReload()]) {
+            rejected = false;
+            try { operation(); } catch(any error) { rejected = find("not supported", error.message) > 0; }
+            if (!rejected) { throw "Unsupported module operation returned a placeholder"; }
+        }
+        println("module boundaries OK");"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "module boundaries OK\n");
+}
+
+#[test]
+fn module_inventory_bifs_expose_loaded_records_and_live_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(&module).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"class { function configure() { settings.value = 7; } }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+        modules = getModuleList();
+        record = getModuleInfo(module="MoDuLe");
+        if (!structKeyExists(modules, "module") || modules.module.name != "module" || !record.activated || record.settings.value != 7) { throw "Loaded module inventory is missing"; }
+        record.settings.value = 42;
+        if (getModuleInfo("module").settings.value != 42 || !structIsEmpty(getModuleInfo("absent"))) { throw "Module inventory did not preserve live settings or absent records"; }
+        println("module inventory OK");"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "module inventory OK\n");
 }
 
 #[test]

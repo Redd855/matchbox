@@ -7310,8 +7310,11 @@ impl VM {
                 continue;
             }
 
-            self.fail_function_events(fiber_idx, val).map_err(anyhow::Error::msg)?;
+            let event_error = self.fail_function_events(fiber_idx, val).err();
             self.fibers[fiber_idx].frames.pop();
+            if let Some(error) = event_error {
+                return self.throw_error(fiber_idx, &error);
+            }
         }
         let val_str = self.exception_summary(val);
         bail!(

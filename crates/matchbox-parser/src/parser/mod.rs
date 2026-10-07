@@ -407,7 +407,10 @@ impl<'a> Parser<'a> {
         let mut statement = self.parse_statement_inner()?;
         let mut span = self.span_since(start);
         statement.incomplete = self.unclosed_blocks > unclosed;
-        if statement.incomplete { span.end = self.source.len(); }
+        if statement.incomplete {
+            span.end = self.source.len();
+            if let Some(body) = statement.body_span.as_mut() { body.end = self.source.len(); }
+        }
         Ok(statement.with_span(span))
     }
 
@@ -643,6 +646,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let body_start = self.pos;
         self.expect(TokenKind::LeftBrace)?;
         let mut members = Vec::new();
         while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
@@ -658,10 +662,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.close_block()?;
-        Ok(Statement::new(
+        let mut statement = Statement::new(
             StatementKind::ClassDecl { name, attributes, modifiers, extends, accessors, implements, members },
             line,
-        ))
+        );
+        statement.body_span = Some(self.span_since(body_start));
+        Ok(statement)
     }
 
     fn parse_property(&mut self) -> Result<PropertyDeclaration> {
@@ -746,6 +752,7 @@ impl<'a> Parser<'a> {
         let params = self.parse_params()?;
         self.expect(TokenKind::RightParen)?;
 
+        let body_start = self.pos;
         let body = if self.peek_is(TokenKind::LeftBrace) {
             self.pos += 1; // {
             FunctionBody::Block(self.parse_block()?)
@@ -756,10 +763,13 @@ impl<'a> Parser<'a> {
             FunctionBody::Abstract
         };
 
-        Ok(Statement::new(
+        let body_span = if matches!(body, FunctionBody::Block(_)) { Some(self.span_since(body_start)) } else { None };
+        let mut statement = Statement::new(
             StatementKind::FunctionDecl { name, attributes, modifiers, return_type, params, body },
             line,
-        ))
+        );
+        statement.body_span = body_span;
+        Ok(statement)
     }
 
     fn parse_params(&mut self) -> Result<Vec<FunctionParam>> {

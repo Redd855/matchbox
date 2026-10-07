@@ -312,6 +312,7 @@ impl<'a> Export<'a> {
         };
         let mut node = self.node(kind, stmt.span, fields);
         if stmt.incomplete { node["incomplete"] = json!(true); }
+        if let Some(span) = stmt.body_span { node["bodySpan"] = json!({"start":span.start,"end":span.end}); }
         node
     }
     fn enum_value(&self, kind: &str, name: &str) -> Value {
@@ -584,6 +585,23 @@ mod tests {
         let root = inspect("var text='##x##';", None, false, false).unwrap();
         assert_eq!(root["statements"][0]["expression"]["right"]["ASTType"], "BoxStringLiteral");
         assert_eq!(root["statements"][0]["expression"]["right"]["value"], "#x#");
+    }
+
+    #[test]
+    fn declaration_body_spans_exclude_header_default_braces() {
+        let source = "class { function run(value={a:1}) { return value; } function empty(value={}) {} }";
+        let root = inspect(source, None, false, true).unwrap();
+        let class = &root["statements"][0];
+        assert_eq!(class["bodySpan"]["start"], source.find('{').unwrap());
+        assert_eq!(class["bodySpan"]["end"], source.len());
+        for (function, expected) in class["body"].as_array().unwrap().iter().zip(["{ return value; }", "{}"]) {
+            let start = function["bodySpan"]["start"].as_u64().unwrap() as usize;
+            let end = function["bodySpan"]["end"].as_u64().unwrap() as usize;
+            assert_eq!(&source[start..end], expected);
+        }
+        let unfinished = "function edit() { // inside\n  ";
+        let recovered = inspect(unfinished, None, true, true).unwrap();
+        assert_eq!(recovered["statements"][0]["bodySpan"]["end"], unfinished.len());
     }
 
     #[test]

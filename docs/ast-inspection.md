@@ -25,6 +25,7 @@ Nodes use `ASTType`, `ASTPackage`, `sourceText`, `comments` and node-specific fi
 
 - `position.start/end`: **one-based lines, zero-based UTF-16 columns**, end exclusive. LSP adapters subtract one from lines.
 - `span.start/end`: **zero-based UTF-8 byte offsets**, end exclusive, into the supplied/read source.
+- Recovery marks nodes containing unclosed blocks with `incomplete: true` and extends their spans through EOF trivia. Closed children are not marked; editor scope lookup can include the EOF cursor only for incomplete scopes.
 - Source-backed script statements/expressions, tokens and trivia have spans. Compiler-synthesized/desugared subnodes without retained spans omit position/span and have null sourceText rather than guessed coordinates. Interpolation expression offsets are translated back into the containing source.
 - Internal lexer `Span.col` remains one-based Unicode-scalar indexing. Consumers must not confuse it with the exported UTF-16 column.
 

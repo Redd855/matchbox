@@ -309,7 +309,9 @@ impl<'a> Export<'a> {
                 json!({"name":name,"attributes":attributes.iter().map(|(key,value)|json!({"key":self.expression(key),"value":self.expression(value)})).collect::<Vec<_>>(),"body":body.as_ref().map(|body|self.statements(body))}),
             ),
         };
-        self.node(kind, stmt.span, fields)
+        let mut node = self.node(kind, stmt.span, fields);
+        if stmt.incomplete { node["incomplete"] = json!(true); }
+        node
     }
     fn enum_value(&self, kind: &str, name: &str) -> Value {
         let package = if matches!(kind, "BoxFunctionDeclaration" | "BoxReturnType") {
@@ -387,6 +389,11 @@ impl<'a> Export<'a> {
         }
     }
     fn expression(&self, expr: &Expression) -> Value {
+        let mut node = self.expression_data(expr);
+        if expr.incomplete { node["incomplete"] = json!(true); }
+        node
+    }
+    fn expression_data(&self, expr: &Expression) -> Value {
         let (kind, fields) = match &expr.kind {
             ExpressionKind::Identifier(name) => ("BoxIdentifier", json!({"name":name})),
             ExpressionKind::Literal(literal) => return self.literal(literal, expr.span),
@@ -557,6 +564,18 @@ mod tests {
         assert_eq!(function["name"], "edit");
         assert_eq!(function["body"].as_array().unwrap().len(), 2);
         assert_eq!(function["sourceText"], "function edit() { var used=1; return used;");
+    }
+
+    #[test]
+    fn incomplete_scope_spans_include_eof_trivia() {
+        let source = "class Open { function closed() { var hidden=1; }\n  ";
+        let root = inspect(source, None, true, false).unwrap();
+        let class = &root["statements"][0];
+        assert_eq!(class["incomplete"], true);
+        assert_eq!(class["span"]["end"], source.len());
+        assert_eq!(class["sourceText"], source);
+        assert!(class["body"][0].get("incomplete").is_none());
+        assert!(class["body"][0]["span"]["end"].as_u64().unwrap() < source.len() as u64);
     }
 
     #[test]

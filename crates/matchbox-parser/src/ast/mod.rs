@@ -5,11 +5,12 @@ pub struct Statement {
     pub kind: StatementKind,
     pub line: u32,
     pub span: Option<Span>,
+    pub incomplete: bool,
 }
 
 impl Statement {
     pub fn new(kind: StatementKind, line: u32) -> Self {
-        Self { kind, line, span: None }
+        Self { kind, line, span: None, incomplete: false }
     }
 
     pub fn with_span(mut self, span: Span) -> Self {
@@ -170,11 +171,12 @@ pub struct Expression {
     pub kind: ExpressionKind,
     pub line: u32,
     pub span: Option<Span>,
+    pub incomplete: bool,
 }
 
 impl Expression {
     pub fn new(kind: ExpressionKind, line: u32) -> Self {
-        Self { kind, line, span: None }
+        Self { kind, line, span: None, incomplete: false }
     }
 
     pub fn with_span(mut self, span: Span) -> Self {

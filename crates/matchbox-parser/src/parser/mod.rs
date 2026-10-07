@@ -163,11 +163,12 @@ struct Parser<'a> {
     pos: usize,
     filename: Option<&'a str>,
     issues: Option<Vec<ParseError>>,
+    unclosed_blocks: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(source: &'a str, tokens: &'a [SyntaxToken], filename: Option<&'a str>) -> Self {
-        Self { source, tokens, pos: 0, filename, issues: None }
+        Self { source, tokens, pos: 0, filename, issues: None, unclosed_blocks: 0 }
     }
 
     fn kind(&self, offset: usize) -> Option<TokenKind> {
@@ -402,8 +403,12 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         let start = self.pos;
-        let statement = self.parse_statement_inner()?;
-        Ok(statement.with_span(self.span_since(start)))
+        let unclosed = self.unclosed_blocks;
+        let mut statement = self.parse_statement_inner()?;
+        let mut span = self.span_since(start);
+        statement.incomplete = self.unclosed_blocks > unclosed;
+        if statement.incomplete { span.end = self.source.len(); }
+        Ok(statement.with_span(span))
     }
 
     fn parse_statement_inner(&mut self) -> Result<Statement> {
@@ -803,6 +808,7 @@ impl<'a> Parser<'a> {
     fn close_block(&mut self) -> Result<()> {
         if let Err(error) = self.expect(TokenKind::RightBrace) {
             self.record_issue(error.into())?;
+            self.unclosed_blocks += 1;
         }
         Ok(())
     }
@@ -1315,8 +1321,12 @@ impl<'a> Parser<'a> {
 
     fn parse_expression(&mut self) -> Result<Expression> {
         let start = self.pos;
-        let expression = self.parse_assignment_or_conditional()?;
-        Ok(expression.with_span(self.span_since(start)))
+        let unclosed = self.unclosed_blocks;
+        let mut expression = self.parse_assignment_or_conditional()?;
+        let mut span = self.span_since(start);
+        expression.incomplete = self.unclosed_blocks > unclosed;
+        if expression.incomplete { span.end = self.source.len(); }
+        Ok(expression.with_span(span))
     }
 
     fn parse_assignment_or_conditional(&mut self) -> Result<Expression> {

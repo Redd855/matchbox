@@ -1563,6 +1563,22 @@ impl BxVM for VM {
         }
     }
 
+    fn construct_box_class(&mut self, class_name: &str, args: Vec<BxValue>, names: Option<Vec<String>>) -> Result<BxValue, String> {
+        let instance = self.construct_global_class(class_name, vec![]).map_err(|error| error.to_string())?;
+        let _root = self.heap.retain_value(instance)?;
+        if self.instance_has_method(instance, "init") {
+            let result = match names {
+                Some(names) => self.call_method_value_named(instance, "init", args, names),
+                None => self.call_method_value(instance, "init", args),
+            }.map_err(|error| error.to_string())?;
+            Ok(if result.is_null() { instance } else { result })
+        } else if args.is_empty() {
+            Ok(instance)
+        } else {
+            Err("Implicit class constructor arguments are not yet supported".into())
+        }
+    }
+
     fn instance_class_name(&self, receiver: BxValue) -> Result<String, String> {
         self.instance_class_name(receiver)
             .map_err(|e| e.to_string())
@@ -5564,7 +5580,6 @@ impl VM {
                             GcObject::Instance(inst) => {
                                 let shape_id = inst.shape_id;
                                 let properties_ptr = &inst.properties as *const Vec<BxValue>;
-                                let class = Rc::clone(&inst.class);
 
                                 let ic = {
                                     let fiber = &self.fibers[fiber_idx];
@@ -5612,16 +5627,18 @@ impl VM {
                                     self.fibers[fiber_idx].stack.push(val);
                                 } else {
                                     let name = self.interner.resolve(name_id).to_string();
-                                    if let Some(method) =
-                                        self.resolve_method(Rc::clone(&class), &name)
-                                    {
-                                        let mut method = (*method).clone();
-                                        method.captured_receiver = Some(base_val);
-                                        let m_id = self.heap.alloc(GcObject::CompiledFunction(Rc::new(method)));
-                                        self.fibers[fiber_idx].stack.push(BxValue::new_ptr(m_id));
+                                    if let Ok(value) = self.method_reference(base_val, &name) {
+                                        self.fibers[fiber_idx].stack.push(value);
                                     } else {
                                         self.fibers[fiber_idx].stack.push(BxValue::new_null());
                                     }
+                                }
+                            }
+                            GcObject::Class(_) => {
+                                let name = self.interner.resolve(name_id).to_string();
+                                match self.method_reference(base_val, &name) {
+                                    Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                                    Err(error) => vm_throw!("{}", error),
                                 }
                             }
                             GcObject::NativeObject(obj) => {
@@ -7317,6 +7334,7 @@ impl VM {
                     .native_object_call_method(id, &method_name, &args)
                     .map_err(|e| anyhow::anyhow!(e));
             }
+            GcObject::Class(_) => self.call_method_value_named(receiver, name, args, vec![]),
             GcObject::Instance(inst) => {
                 let class = Rc::clone(&inst.class);
                 if let Some(func) = self.resolve_method(class, &method_name) {
@@ -7375,13 +7393,22 @@ impl VM {
         }
     }
 
-    pub fn call_method_value_named(&mut self, receiver: BxValue, name: &str, args: Vec<BxValue>, names: Vec<String>) -> Result<BxValue> {
-        let id = receiver.as_gc_id().context("Value is not an object instance")?;
-        let GcObject::Instance(instance) = self.heap.get(id) else { bail!("Value is not an object instance"); };
-        let method = self.resolve_method(instance.class.clone(), name).with_context(|| format!("Method {name} not found on instance"))?;
+    fn method_reference(&mut self, receiver: BxValue, name: &str) -> Result<BxValue> {
+        let id = receiver.as_gc_id().context("Value is not a class or instance")?;
+        let (class, static_only) = match self.heap.get(id) {
+            GcObject::Instance(instance) => (instance.class.clone(), false),
+            GcObject::Class(class) => (class.clone(), true),
+            _ => bail!("Value is not a class or instance"),
+        };
+        let method = self.resolve_method(class, name).with_context(|| format!("Method {name} not found"))?;
+        if static_only && !method.modifiers.is_static { bail!("Non-static method {name} requires an instance"); }
         let mut method = (*method).clone();
         method.captured_receiver = Some(receiver);
-        let value = BxValue::new_ptr(self.heap.alloc(GcObject::CompiledFunction(Rc::new(method))));
+        Ok(BxValue::new_ptr(self.heap.alloc(GcObject::CompiledFunction(Rc::new(method)))))
+    }
+
+    pub fn call_method_value_named(&mut self, receiver: BxValue, name: &str, args: Vec<BxValue>, names: Vec<String>) -> Result<BxValue> {
+        let value = self.method_reference(receiver, name)?;
         self.call_function_value_named(value, args, Some(names))
     }
 
@@ -7421,6 +7448,7 @@ impl VM {
             variables: variables_scope,
         }));
         let instance_val = BxValue::new_ptr(inst_id);
+        if class.borrow().modifiers.is_abstract { bail!("Cannot instantiate abstract class {class_name}"); }
 
         let constructor = class.borrow().constructor.clone();
         let sub_chunk = constructor.chunk.clone();
@@ -8138,6 +8166,14 @@ impl VM {
             }
 
             match self.heap.get(id) {
+                GcObject::Class(_) => {
+                    let method = match self.method_reference(receiver_val, &name) {
+                        Ok(method) => method,
+                        Err(error) => return self.throw_error(fiber_idx, &error.to_string()),
+                    };
+                    self.fibers[fiber_idx].stack[receiver_idx] = method;
+                    return self.execute_call(fiber_idx, arg_count, names);
+                }
                 GcObject::Struct(_) => {
                     let method_val = self.struct_get(id, &name);
                     if let Some(method_id) = method_val.as_gc_id() {

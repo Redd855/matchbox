@@ -1628,7 +1628,6 @@ fn process_file_with_args(
             None
         };
 
-        let module_mappings = modules::mappings(&modules_info);
         // Module BIFs and settings are installed at runtime, never baked by executing hooks.
         let extra_preludes: Vec<String> = Vec::new();
         let mut chunk = matchbox_compiler::compile_with_treeshaking(
@@ -1638,7 +1637,7 @@ fn process_file_with_args(
             keep_symbols,
             no_shaking,
             no_std_lib,
-            &module_mappings,
+            !modules_info.is_empty(),
             &extra_preludes,
         )
         .map_err(|e| anyhow::anyhow!("Compiler Error: {}", e))?;
@@ -3337,7 +3336,7 @@ fn watch_mode(
                                 Vec::new(), // keep_symbols
                                 false,      // no_shaking
                                 false,      // no_std_lib
-                                &[],        // module_mappings
+                                false,      // runtime_module_classes
                                 &[],        // extra_preludes
                             )
                             .map_err(|e| anyhow::anyhow!("Compiler Error: {}", e))?;

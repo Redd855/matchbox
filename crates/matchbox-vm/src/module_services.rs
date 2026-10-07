@@ -5,7 +5,7 @@ use crate::{
     vm::{VM, gc::GcObject},
 };
 use anyhow::{Context, Result, bail};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, path::{Component, Path, PathBuf}, rc::Rc};
 
 type Fields = Rc<RefCell<HashMap<String, BxValue>>>;
 
@@ -58,11 +58,31 @@ pub(crate) fn record(
     module: &Module,
     instance: BxValue,
     settings: BxValue,
-) -> BxValue {
+) -> Result<BxValue> {
+    let (mapping, name) = if let Some(value) = vm.instance_property(instance, "mapping") {
+        if vm.is_struct_value(value) {
+            mapping_from_struct(vm, module, value, false)?
+        } else if vm.is_string_value(value) && !vm.to_string(value).trim().is_empty() {
+            let name = vm.to_string(value);
+            (mapping(&format!("/bxModules/{name}"), &module.path, false), name)
+        } else {
+            bail!("Module {} mapping must be a nonblank string or struct", module.name);
+        }
+    } else {
+        (mapping(&format!("/bxModules/{}", module.name), &module.path, false), module.name.clone())
+    };
+    let public_mapping = match vm.instance_property(instance, "publicMapping") {
+        Some(value) if vm.is_struct_value(value) => mapping_from_struct(vm, module, value, true)?.0,
+        Some(value) if vm.is_string_value(value) && !vm.to_string(value).trim().is_empty() => {
+            let public = vm.to_string(value);
+            mapping_value(&format!("{}{public}", mapping["name"].as_str().unwrap()), &module.path, &public, true)
+        }
+        _ => mapping_value(&format!("/bxModules/{}/public", module.name), &module.path, "public", true),
+    };
     let json = serde_json::json!({
         "name": module.name, "path": module.path, "physicalPath": module.path,
-        "invocationPath": format!("bxModules.{}", module.mapping),
-        "mapping": {"name": format!("/bxModules/{}", module.mapping), "path": module.path, "external": false},
+        "invocationPath": format!("bxModules.{name}"),
+        "mapping": mapping, "publicMapping": public_mapping,
         "dependencies": module.dependencies, "enabled": true, "activated": false,
         "bifs": [], "memberMethods": []
     });
@@ -83,7 +103,88 @@ pub(crate) fn record(
     }
     fields.insert("settings".into(), settings);
     fields.insert("moduleconfig".into(), instance);
-    BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(ModuleRecord { fields }))))
+    Ok(BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(ModuleRecord { fields })))))
+}
+
+fn mapping(name: &str, path: &str, external: bool) -> serde_json::Value {
+    let name = format!("{}{}{}", if name.starts_with('/') { "" } else { "/" }, name, if name.ends_with('/') { "" } else { "/" });
+    serde_json::json!({"name": name, "path": path, "external": external})
+}
+
+fn mapping_value(name: &str, root: &str, relative: &str, external: bool) -> serde_json::Value {
+    if relative.trim().is_empty() { return mapping(name, root, external); }
+    mapping(name, &std::path::Path::new(root).join(relative).to_string_lossy(), external)
+}
+
+fn mapping_from_struct(vm: &mut VM, module: &Module, value: BxValue, public: bool) -> Result<(serde_json::Value, String)> {
+    let id = value.as_gc_id().unwrap();
+    let mut name = mapping_string(vm, id, "name")?;
+    if name.trim().is_empty() {
+        name = module.name.clone();
+        let value = BxValue::new_ptr(vm.string_new(name.clone()));
+        vm.struct_set(id, "name", value);
+    }
+    let use_prefix = mapping_bool(vm, id, "usePrefix", true)?;
+    let external = mapping_bool(vm, id, "external", public)?;
+    let path = mapping_string(vm, id, "path")?;
+    let mapping_name = if use_prefix { format!("/bxModules/{name}") } else { name.clone() };
+    Ok((mapping_value(&mapping_name, &module.path, &path, external), name))
+}
+
+fn mapping_string(vm: &VM, id: usize, key: &str) -> Result<String> {
+    if !vm.struct_key_exists(id, key) { return Ok(String::new()); }
+    let value = vm.struct_get(id, key);
+    if !vm.is_string_value(value) { bail!("Module mapping {key} must be a string"); }
+    Ok(vm.to_string(value))
+}
+
+fn mapping_bool(vm: &mut VM, id: usize, key: &str, default: bool) -> Result<bool> {
+    if !vm.struct_key_exists(id, key) { return Ok(default); }
+    let value = vm.struct_get(id, key);
+    if vm.is_string_value(value) {
+        let text = vm.to_string(value);
+        let text = text.trim();
+        if !matches!(text.to_ascii_lowercase().as_str(), "true" | "false" | "yes" | "no") && text.parse::<f64>().is_err() {
+            bail!("Module mapping {key} must be a boolean");
+        }
+    } else if !value.is_bool() && !value.is_number() && !value.is_null() {
+        bail!("Module mapping {key} must be a boolean");
+    }
+    Ok(vm.cast_value_to_type(value, "boolean").map_err(anyhow::Error::msg)?.as_bool())
+}
+
+pub(crate) fn register_classes(vm: &mut VM, module: &Module, record: BxValue) -> Result<()> {
+    for field in ["mapping", "publicMapping"] {
+        let mapping = record_field(vm, record, field).as_gc_id().context("Module mapping missing")?;
+        let prefix = vm.to_string(vm.struct_get(mapping, "name")).trim_matches('/').replace('/', ".");
+        let root = normalize_path(Path::new(&vm.to_string(vm.struct_get(mapping, "path"))));
+        for class in &module.classes {
+            let path = normalize_path(&Path::new(&module.path).join(&class.path));
+            let Ok(relative) = path.strip_prefix(&root) else { continue; };
+            let name = relative.with_extension("").to_string_lossy().replace(['/', '\\'], ".");
+            let name = if prefix.is_empty() { name } else { format!("{prefix}.{name}") };
+            let value = vm.get_global(&class.global).context("Embedded module class missing")?;
+            let GcObject::Class(target) = vm.heap.get(value.as_gc_id().context("Embedded module class invalid")?) else {
+                bail!("Embedded module global is not a class");
+            };
+            if target.borrow().name == class.global { target.borrow_mut().name = name.clone(); }
+            vm.insert_global(name, value);
+        }
+    }
+    Ok(())
+}
+
+// Lexical resolution must also work after the source package has been deleted.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => (),
+            Component::ParentDir => { result.pop(); },
+            _ => result.push(component.as_os_str()),
+        }
+    }
+    result
 }
 
 pub(crate) fn record_field(vm: &VM, record: BxValue, name: &str) -> BxValue {
@@ -312,6 +413,22 @@ impl Services {
             fields.borrow_mut().insert(name.into(), value);
             vm.insert_global(format!("__mb_{name}"), value);
         }
+        vm.register_callback("__mb_construct_box_class", NativeCallback {
+            parameters: vec!["class".into(), "arguments".into(), "names".into()],
+            callback: Rc::new(|vm, values| {
+                if values.len() != 3 || !vm.is_string_value(values[0]) || !vm.is_array_value(values[1]) || !vm.is_array_value(values[2]) {
+                    return Err("Class construction requires a name, arguments and argument names".into());
+                }
+                let class = vm.to_string(values[0]);
+                let args_id = values[1].as_gc_id().unwrap();
+                let names_id = values[2].as_gc_id().unwrap();
+                if vm.array_len(args_id) != vm.array_len(names_id) { return Err("Class argument names must match arguments".into()); }
+                let args = (0..vm.array_len(args_id)).map(|index| vm.array_get(args_id, index)).collect();
+                let names: Vec<_> = (0..vm.array_len(names_id)).map(|index| vm.to_string(vm.array_get(names_id, index))).collect();
+                let named = names.iter().any(|name| !name.is_empty());
+                vm.construct_box_class(&class, args, named.then_some(names))
+            }),
+        }).expect("VM callback registration");
         vm.register_callback("__mb_component", NativeCallback {
             parameters: vec!["name".into(), "attributes".into(), "body".into()],
             callback: Rc::new(|vm, args| {
@@ -354,7 +471,6 @@ mod tests {
         let module = Module {
             name: "gc-test".into(),
             path: "/module".into(),
-            mapping: "gc-test".into(),
             dependencies: vec![],
             instance: "config".into(),
             descriptor: Chunk::default(),
@@ -366,7 +482,7 @@ mod tests {
             artifact: None,
         };
         let settings = BxValue::new_ptr(vm.struct_new());
-        let record = record(&mut vm, &module, BxValue::new_null(), settings);
+        let record = record(&mut vm, &module, BxValue::new_null(), settings).unwrap();
         services.register(&mut vm, "gc-test", record);
         for _ in 0..16 {
             vm.collect_garbage_now();

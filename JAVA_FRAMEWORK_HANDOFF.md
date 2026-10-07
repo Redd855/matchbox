@@ -22,7 +22,9 @@ The goal is to run existing BoxLang framework APIs without a JVM. The shim imple
 
 Already implemented: precompiled native plugins; a stable capability-negotiated C ABI; embedded module/library bundles; verified extraction; retained VM values; runtime module lifecycle/settings; BIF/member annotations and invocation parity; live module/function/interceptor services; synchronous global custom interception.
 
-At this checkpoint, descriptor-declared/annotated interceptors, module components, and dynamic/struct descriptor mappings are still pending. Milestone 1 also needs the minimal module-owned class-provider resolution boundary discussed for the Java shim. Confirm its actual completion and API before beginning milestone 2; this document does not invent an SDK signature.
+At the original checkpoint above, descriptor-declared/annotated interceptors, module components, and dynamic/struct descriptor mappings were pending. Subsequent foundation slices implement those registrations, normal component bodies, and runtime private/public mappings with embedded BoxLang class lookup. The application envelope is now version 6; plugin ABI-1 libraries are unchanged.
+
+**Milestone 1 is still incomplete.** The embedded BoxLang class catalog is not the minimal module-owned Java class-provider resolution boundary. That boundary, remaining component/context/interception parity, and general VM closure/scoping gaps must be assessed before beginning milestone 2. This document does not invent an SDK signature or authorize SDK publication.
 
 Important files:
 

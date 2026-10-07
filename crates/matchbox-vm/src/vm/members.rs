@@ -142,6 +142,9 @@ impl VM {
                 {
                     return None;
                 }
+                GcObject::Class(class) if self.resolve_method(class.clone(), &name).is_some() => {
+                    return None;
+                }
                 _ => (),
             }
         }

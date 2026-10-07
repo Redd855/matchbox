@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x05";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x06";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedLibrary {
@@ -234,16 +234,21 @@ pub struct Component {
     pub requires_body: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ModuleClass {
+    pub path: String,
+    pub global: String,
+    pub chunk: Chunk,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Module {
     pub name: String,
     pub path: String,
-    pub mapping: String,
     pub dependencies: Vec<String>,
     pub instance: String,
     pub descriptor: Chunk,
     pub bifs: Chunk,
     pub bif_registrations: Vec<Bif>,
-    pub classes: Vec<(String, Chunk)>,
+    pub classes: Vec<ModuleClass>,
     pub components: Vec<Component>,
     #[serde(with = "json_string")]
     pub settings: serde_json::Value,
@@ -309,9 +314,9 @@ impl Application {
                         .map_err(anyhow::Error::msg)
                         .with_context(|| format!("Module {}", module.name))?;
                 }
-                for (_, class) in &mut module.classes {
-                    class.reconstruct_functions();
-                    vm.interpret(class.clone())?;
+                for class in &mut module.classes {
+                    class.chunk.reconstruct_functions();
+                    vm.interpret(class.chunk.clone())?;
                 }
                 module.descriptor.reconstruct_functions();
                 vm.interpret(module.descriptor.clone())?;
@@ -322,11 +327,12 @@ impl Application {
                     .instance_variable(instance, "settings")
                     .unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
                 vm.set_instance_variable(instance, "settings", defaults)?;
-                let record = crate::module_services::record(vm, module, instance, defaults);
+                let record = crate::module_services::record(vm, module, instance, defaults)?;
                 services.register(vm, &module.name, record);
                 services.inject(vm, instance, record, false)?;
                 // Include partially initialized descriptors in reverse-order error cleanup.
                 records.push((instance, record, Vec::new()));
+                crate::module_services::register_classes(vm, module, record)?;
                 if vm.instance_has_method(instance, "configure") {
                     vm.call_method_value(instance, "configure", vec![])?;
                 }
@@ -374,8 +380,14 @@ impl Application {
                     let _root = vm.heap.retain_value(target).map_err(anyhow::Error::msg)?;
                     if vm.instance_has_method(target, "init") { vm.call_method_value(target, "init", vec![])?; }
                     services.inject(vm, target, record, true)?;
-                    crate::vm::components::inject_helpers(vm, target, &component.class)?;
-                    vm.register_component(target, component)?;
+                    // ponytail: linear class lookup per component; index globals if catalogs become large.
+                    let class = module.classes.iter().find(|class| class.global == component.class).context("Module component class missing")?;
+                    let invocation = vm.to_string(crate::module_services::record_field(vm, record, "invocationPath"));
+                    let name = Path::new(&class.path).with_extension("").to_string_lossy().replace(['/', '\\'], ".");
+                    let mut registration = component.clone();
+                    registration.class = format!("{invocation}.{name}");
+                    crate::vm::components::inject_helpers(vm, target, &registration.class)?;
+                    vm.register_component(target, &registration)?;
                 }
                 let components: Vec<_> = module.components.iter().flat_map(|component| &component.aliases).collect();
                 let components = vm.json_to_bx(serde_json::json!(components));

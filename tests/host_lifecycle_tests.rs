@@ -11,7 +11,7 @@ fn compile_source(source: &str) -> matchbox_vm::Chunk {
         Vec::new(),
         false,
         false,
-        &[],
+        false,
         &[],
     )
     .unwrap();

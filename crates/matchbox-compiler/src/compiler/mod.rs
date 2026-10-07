@@ -26,7 +26,8 @@ pub struct Compiler {
     scope_depth: i32,
     is_class: bool,
     imports: HashMap<String, String>, // Alias -> Full dotted path
-    pub module_paths: HashMap<String, PathBuf>, // "bxmodules.{name}" -> physical PathBuf
+    /// Module namespaces are resolved by the application VM, not by running descriptors here.
+    pub runtime_module_classes: bool,
     current_line: u32,
     pub is_repl: bool,
     continue_patches: Vec<Vec<usize>>,
@@ -52,7 +53,7 @@ impl Compiler {
             scope_depth: 0,
             is_class: false,
             imports: HashMap::new(),
-            module_paths: HashMap::new(),
+            runtime_module_classes: false,
             current_line: 0,
             is_repl: false,
             continue_patches: Vec::new(),
@@ -74,7 +75,7 @@ impl Compiler {
             scope_depth: 0,
             is_class: false,
             imports: HashMap::new(),
-            module_paths: HashMap::new(),
+            runtime_module_classes: false,
             current_line: 0,
             is_repl: false,
             continue_patches: Vec::new(),
@@ -155,7 +156,7 @@ impl Compiler {
                 constructor_compiler.is_class = true;
                 constructor_compiler.scope_depth = 1;
                 constructor_compiler.imports = self.imports.clone();
-                constructor_compiler.module_paths = self.module_paths.clone();
+                constructor_compiler.runtime_module_classes = self.runtime_module_classes;
                 constructor_compiler.source_dir = self.source_dir.clone();
                 constructor_compiler.current_line = stmt.line as u32;
                 constructor_compiler.class_has_init_map = self.class_has_init_map.clone();
@@ -246,7 +247,7 @@ impl Compiler {
                                     Compiler::with_chunk(self.chunk.new_sub_chunk());
                                 method_compiler.is_class = true;
                                 method_compiler.imports = self.imports.clone();
-                                method_compiler.module_paths = self.module_paths.clone();
+                                method_compiler.runtime_module_classes = self.runtime_module_classes;
                                 method_compiler.source_dir = self.source_dir.clone();
                                 method_compiler.current_line = inner_stmt.line as u32;
                                 method_compiler.class_methods = class_method_names.clone();
@@ -425,7 +426,7 @@ impl Compiler {
                                 Compiler::with_chunk(self.chunk.new_sub_chunk());
                             method_compiler.is_class = true;
                             method_compiler.imports = self.imports.clone();
-                            method_compiler.module_paths = self.module_paths.clone();
+                            method_compiler.runtime_module_classes = self.runtime_module_classes;
                             method_compiler.source_dir = self.source_dir.clone();
                             method_compiler.current_line = member.line;
                             let func = method_compiler.compile_function(
@@ -1473,6 +1474,27 @@ impl Compiler {
                     return Ok(());
                 }
 
+                if resolved_path.to_ascii_lowercase().starts_with("bx:") {
+                    resolved_path = resolved_path[3..].to_owned();
+                }
+                if self.is_runtime_module_class(&resolved_path) {
+                    let callback = self.chunk.add_constant(Constant::String(BoxString::new("__mb_construct_box_class")));
+                    self.chunk.emit1(op::GET_GLOBAL, callback, expr.line);
+                    let class = self.chunk.add_constant(Constant::String(BoxString::new(&resolved_path)));
+                    self.chunk.emit1(op::CONSTANT, class, expr.line);
+                    let mut names = Vec::new();
+                    for arg in args {
+                        if matches!(arg.value.kind, ExpressionKind::Spread(_)) { bail!("Runtime class constructor spread arguments are not yet supported"); }
+                        self.compile_expression(&arg.value)?;
+                        names.push(arg.name.clone().unwrap_or_default());
+                    }
+                    self.chunk.emit1(op::ARRAY, args.len() as u32, expr.line);
+                    let names = self.chunk.add_constant(Constant::StringArray(names));
+                    self.chunk.emit1(op::CONSTANT, names, expr.line);
+                    self.chunk.emit1(op::CALL, 3, expr.line);
+                    return Ok(());
+                }
+
                 let mut class_has_init = false;
                 if resolved_path.contains('.') {
                     let class_val = self.load_class_from_path(&resolved_path)?;
@@ -1975,6 +1997,10 @@ impl Compiler {
                     self.chunk.emit1(op::GET_PRIVATE, idx as u32, expr.line);
                 } else if let Some(slot) = self.resolve_local(&name) {
                     self.chunk.emit1(op::GET_LOCAL, slot as u32, expr.line);
+                } else if let Some(path) = self.imports.get(&lower_name).filter(|path| self.is_runtime_module_class(path)) {
+                    let path = if path.to_ascii_lowercase().starts_with("bx:") { &path[3..] } else { path };
+                    let idx = self.chunk.add_constant(Constant::String(BoxString::new(path)));
+                    self.chunk.emit1(op::GET_GLOBAL, idx, expr.line);
                 } else if self.is_class && !is_js_import {
                     let idx = self
                         .chunk
@@ -2410,7 +2436,7 @@ impl Compiler {
         sub_compiler.scope_depth = 1;
         sub_compiler.is_class = self.is_class;
         sub_compiler.imports = self.imports.clone();
-        sub_compiler.module_paths = self.module_paths.clone();
+        sub_compiler.runtime_module_classes = self.runtime_module_classes;
         sub_compiler.source_dir = self.source_dir.clone();
         sub_compiler.class_methods = self.class_methods.clone();
         sub_compiler.current_line = self.current_line;
@@ -2832,31 +2858,14 @@ impl Compiler {
         }
     }
 
-    fn resolve_source_file(&self, dotted_path: &str) -> Result<PathBuf> {
-        let lower = dotted_path.to_lowercase();
+    fn is_runtime_module_class(&self, path: &str) -> bool {
+        let path = if path.to_ascii_lowercase().starts_with("bx:") { &path[3..] } else { path };
+        self.runtime_module_classes && !path.contains(':') && path.contains('.')
+            && (path.to_ascii_lowercase().starts_with("bxmodules.") || self.resolve_source_file(path).is_err())
+    }
 
-        // Resolve bxModules.{name}.{...} paths via the module registry.
-        let base_path: PathBuf = if lower.starts_with("bxmodules.") {
-            let mut found = None;
-            for (prefix, module_dir) in &self.module_paths {
-                let prefix_with_dot = format!("{}.", prefix); // e.g. "bxmodules.foo."
-                if lower.starts_with(&prefix_with_dot) {
-                    let tail = &dotted_path[prefix_with_dot.len()..]; // preserve original case
-                    let rel = tail.replace('.', "/");
-                    found = Some(module_dir.join(rel));
-                    break;
-                }
-            }
-            found.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No module registered for import path '{}'. \
-                     Declare it in matchbox.toml or pass --module <path>.",
-                    dotted_path
-                )
-            })?
-        } else {
-            Path::new(&dotted_path.replace('.', "/")).to_path_buf()
-        };
+    fn resolve_source_file(&self, dotted_path: &str) -> Result<PathBuf> {
+        let base_path = Path::new(&dotted_path.replace('.', "/")).to_path_buf();
 
         // Try .bxs first, then fall back to .bx for BoxLang compatibility.
         let with_bxs = base_path.with_extension("bxs");
@@ -2959,7 +2968,7 @@ impl Compiler {
         Self::infer_class_name_from_filename(&mut ast, filename);
         let mut sub_compiler = Compiler::with_chunk(Chunk::new(filename));
         sub_compiler.imports = self.imports.clone();
-        sub_compiler.module_paths = self.module_paths.clone();
+        sub_compiler.runtime_module_classes = self.runtime_module_classes;
         sub_compiler.source_dir = file_path.parent().map(|p| p.to_path_buf());
         sub_compiler.is_class = true;
         sub_compiler.current_line = self.current_line;
@@ -3010,7 +3019,7 @@ impl Compiler {
         let filename = file_path.to_str().unwrap_or(iface_path);
         let mut sub_compiler = Compiler::with_chunk(Chunk::new(filename));
         sub_compiler.imports = self.imports.clone();
-        sub_compiler.module_paths = self.module_paths.clone();
+        sub_compiler.runtime_module_classes = self.runtime_module_classes;
         sub_compiler.source_dir = file_path.parent().map(|p| p.to_path_buf());
         sub_compiler.is_class = true;
         sub_compiler.current_line = self.current_line;

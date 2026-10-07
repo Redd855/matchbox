@@ -666,6 +666,208 @@ fn missing_capability_and_error_shutdown_are_explicit() {
 }
 
 #[test]
+fn computed_descriptor_mappings_are_resolved_only_at_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir(&module).unwrap();
+    let alias = dir.path().join("alias.txt");
+    fs::write(&alias, "One").unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"
+class {
+    this.mapping = "runtime" & fileRead("ALIAS_FILE");
+    this.publicMapping = "www";
+    function configure() {
+        var snapshot = moduleRecord.asStruct();
+        assert snapshot.mapping.name == ("/bxModules/runtime" & fileRead("ALIAS_FILE") & "/");
+        assert snapshot.invocationPath == ("bxModules.runtime" & fileRead("ALIAS_FILE"));
+        assert snapshot.mapping.path == moduleRecord.path;
+        assert !snapshot.mapping.external;
+        assert snapshot.publicMapping.name == (snapshot.mapping.name & "www/");
+        assert snapshot.publicMapping.path == (moduleRecord.path & "/www");
+        assert snapshot.publicMapping.external;
+        this.mapping = "tooLate";
+        println("configured " & moduleRecord.invocationPath);
+    }
+}
+"#.replace("ALIAS_FILE", &alias.to_string_lossy().replace('\\', "/"))).unwrap();
+    fs::write(dir.path().join("app.bxs"), "println('mapping contract OK');").unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "configured bxModules.runtimeOne\nmapping contract OK\n");
+    // Packaging must not read runtime inputs or execute configure().
+    fs::remove_file(&alias).unwrap();
+    for args in [
+        vec!["--build", "app.bxs", "--module", "module", "--output", "app.bxb"],
+        vec!["--target", "native", "app.bxs", "--module", "module", "--output", "application"],
+    ] {
+        let output = cli(dir.path(), &args); success(&output);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("configured"));
+    }
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    fs::write(&alias, "Two").unwrap();
+    for output in [
+        cli(dir.path(), &["app.bxb"]),
+        Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap(),
+    ] {
+        success(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "configured bxModules.runtimeTwo\nmapping contract OK\n");
+    }
+}
+
+#[test]
+fn struct_descriptor_mappings_honor_prefix_path_visibility_and_defaults() {
+    for (definition, mapping, public, invocation, mapping_path, public_path, external, public_external) in [
+        (r#"this.mapping = {name:'plain', usePrefix:false, external:true, path:'src'}; this.publicMapping = {name:'/assets', usePrefix:false, external:false, path:'www'};"#,
+         "/plain/", "/assets/", "bxModules.plain", "/src", "/www", true, false),
+        (r#"this.mapping = {name:' ', usePrefix:'yes', external:'no', path:''}; this.publicMapping = {};"#,
+         "/bxModules/module/", "/bxModules/module/", "bxModules.module", "", "", false, true),
+        (r#"this.mapping = {name:'renamed'}; this.publicMapping = '';"#,
+         "/bxModules/renamed/", "/bxModules/module/public/", "bxModules.renamed", "", "/public", false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("module")).unwrap();
+        let source = format!(r#"
+class {{
+    {definition}
+    function configure() {{
+        var snapshot = moduleRecord.asStruct();
+        assert snapshot.mapping.name == '{mapping}';
+        assert snapshot.mapping.path == (moduleRecord.path & '{mapping_path}');
+        assert snapshot.mapping.external == {external};
+        assert snapshot.invocationPath == '{invocation}';
+        assert snapshot.publicMapping.name == '{public}';
+        assert snapshot.publicMapping.path == (moduleRecord.path & '{public_path}');
+        assert snapshot.publicMapping.external == {public_external};
+        assert this.mapping.name == listLast('{invocation}', '.');
+        println('struct mappings OK');
+    }}
+}}
+"#);
+        fs::write(dir.path().join("module/ModuleConfig.bx"), source).unwrap();
+        fs::write(dir.path().join("app.bxs"), "").unwrap();
+        let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "struct mappings OK\n");
+    }
+}
+
+#[test]
+fn runtime_mappings_resolve_embedded_classes_in_configure_imports_and_constructors() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("models")).unwrap();
+    fs::create_dir_all(module.join("public")).unwrap();
+    let alias = dir.path().join("alias.txt");
+    fs::write(&alias, "One").unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"
+import bxModules.lateOne.Value as MappedValue;
+class {
+    this.mapping = {name:"late" & fileRead("ALIAS_FILE"), path:"models/../models"};
+    this.publicMapping = {name:"publicApi", usePrefix:false, path:"public"};
+    function configure() {
+        var created = new bxModules.lateOne.Value(value=11);
+        assert created.get() == 11;
+        println("configured mapped classes");
+    }
+}
+"#.replace("ALIAS_FILE", &alias.to_string_lossy().replace('\\', "/"))).unwrap();
+    fs::write(module.join("models/Value.bx"), r#"
+class {
+    function init(numeric value = 7) { variables.value = value; return this; }
+    function get() { return variables.value; }
+    static function kind() { return "mapped"; }
+}
+"#).unwrap();
+    fs::write(module.join("public/Exposed.bx"), r#"
+class {
+    function init() { variables.value = 42; }
+    function get() { return variables.value; }
+}
+"#).unwrap();
+    // A class outside the resolved mapping path must not shadow its mapped namesake.
+    fs::write(module.join("Value.bx"), "class { function get() { return 99; } }").unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+import bxModules.lateOne.Value as MappedValue;
+import publicApi.Exposed;
+first = new MappedValue();
+second = new bxModules.lateOne.Value(value=13);
+assert first.get() == 7;
+assert second.get() == 13;
+assert MappedValue.kind() == "mapped";
+kindReference = MappedValue.kind;
+assert kindReference() == "mapped";
+try { MappedValue.get(); throw 'non-static call accepted'; }
+catch (any error) { assert findNoCase('requires an instance', error.message) > 0; }
+visible = new Exposed();
+assert visible.get() == 42;
+println("mapped class contracts OK");
+"#).unwrap();
+    let expected = "configured mapped classes\nmapped class contracts OK\n";
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    fs::remove_file(&alias).unwrap();
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    fs::write(&alias, "One").unwrap();
+    for output in [
+        cli(dir.path(), &["app.bxb"]),
+        Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap(),
+    ] {
+        success(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+}
+
+#[test]
+fn embedding_module_classes_does_not_execute_neighboring_script_statements() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("module")).unwrap();
+    fs::write(dir.path().join("module/ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(dir.path().join("module/Program.bxs"), "class { function get() { return 8; } } throw 'neighboring script executed';").unwrap();
+    fs::write(dir.path().join("app.bxs"), "import bxModules.module.Program; target = new Program(); assert target.get() == 8;").unwrap();
+    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+    fs::remove_dir_all(dir.path().join("module")).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    success(&cli(dir.path(), &["app.bxb"]));
+}
+
+#[test]
+fn static_class_methods_share_named_binding_precedence_and_gc_roots() {
+    let source = r#"
+class StaticProbe {
+    function instanceOnly() { return 0; }
+    static function answer(numeric left=40, numeric right=2) { return left + right; }
+}
+staticReference = StaticProbe.answer;
+assert StaticProbe.answer(right=3, left=4) == 7;
+"#;
+    let ast = matchbox_compiler::parser::parse(source, None).unwrap();
+    let chunk = matchbox_compiler::compiler::Compiler::new("static-probe.bxs").compile(&ast, source).unwrap();
+    let mut vm = VM::new();
+    vm.register_callback("genericAnswer", matchbox_vm::types::NativeCallback {
+        parameters: vec!["receiver".into()],
+        callback: std::rc::Rc::new(|_, _| Ok(BxValue::new_int(-1))),
+    }).unwrap();
+    vm.register_member_method(vm.get_global("genericAnswer").unwrap(), &matchbox_vm::bundle::BifMember {
+        name:"answer".into(), type_name:"any".into(), object_argument:None,
+    }).unwrap();
+    vm.interpret(chunk).unwrap();
+    let class = vm.get_global("StaticProbe").unwrap();
+    assert_eq!(vm.call_method_value(class, "answer", vec![]).unwrap().as_number(), 42.0);
+    assert_eq!(vm.call_method_value_named(class, "answer", vec![BxValue::new_int(3), BxValue::new_int(4)], vec!["right".into(), "left".into()]).unwrap().as_number(), 7.0);
+    assert!(vm.call_method_value(class, "instanceOnly", vec![]).unwrap_err().to_string().contains("requires an instance"));
+    vm.insert_global("StaticProbe".into(), BxValue::new_null());
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    let reference = vm.get_global("staticReference").unwrap();
+    assert_eq!(vm.call_function_value(reference, vec![], None).unwrap().as_number(), 42.0);
+    // The captured class itself, not only its compiled method, must still exist.
+    assert_eq!(vm.type_name_from_value(class).as_deref(), Some("StaticProbe"));
+}
+
+#[test]
 fn module_names_mappings_dependencies_and_disabled_descriptors() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["consumer-dir", "provider-dir", "disabled"] {
@@ -1195,7 +1397,7 @@ class Config {{
 config = new Config();
 "#));
         let module = matchbox_vm::bundle::Module {
-            name:"module".into(), path:"/module".into(), mapping:"module".into(), dependencies:vec![],
+            name:"module".into(), path:"/module".into(), dependencies:vec![],
             instance:"config".into(), descriptor, bifs:compile(""), bif_registrations:vec![], classes:vec![], components:vec![],
             settings:serde_json::json!({}), artifact:None,
         };

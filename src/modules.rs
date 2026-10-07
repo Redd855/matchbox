@@ -9,7 +9,6 @@ use serde::Deserialize;
 pub struct ModuleInfo {
     /// The module name (e.g. `"bx-strings"`). Becomes the `bxModules.{name}` namespace.
     pub name: String,
-    pub mapping: String,
     pub dependencies: Vec<String>,
     /// Absolute physical path to the module root directory.
     pub path: PathBuf,
@@ -248,8 +247,6 @@ pub fn discover_modules(
         if !metadata.enabled {
             continue;
         }
-        let mapping = metadata.mapping.unwrap_or_else(|| name.clone());
-
         // Collect bifs/*.bxs sources (sorted for determinism).
         let bifs_dir = path.join("bifs");
         let mut bif_sources = Vec::new();
@@ -312,7 +309,6 @@ pub fn discover_modules(
 
         modules.push(ModuleInfo {
             name,
-            mapping,
             dependencies: metadata.dependencies,
             path,
             bif_sources,
@@ -345,7 +341,6 @@ pub fn read_datasource_configs(project_dir: &Path) -> Result<HashMap<String, Dat
 
 struct DescriptorMetadata {
     enabled: bool,
-    mapping: Option<String>,
     dependencies: Vec<String>,
 }
 fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
@@ -373,7 +368,6 @@ fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
     }
     let mut result = DescriptorMetadata {
         enabled: true,
-        mapping: None,
         dependencies: vec![],
     };
     for statement in matchbox_compiler::parser::parse(source, Some("ModuleConfig.bx"))? {
@@ -405,10 +399,6 @@ fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
                         bail!("Module enabled metadata must be a boolean literal");
                     };
                     result.enabled = enabled;
-                }
-                "mapping" => {
-                    result.mapping =
-                        Some(string(&value).context("Module mapping must be a string literal")?)
                 }
                 "dependencies" => {
                     let ExpressionKind::Literal(Literal::Array(values)) = value.kind else {
@@ -471,16 +461,4 @@ fn order_modules(modules: Vec<ModuleInfo>) -> Result<Vec<ModuleInfo>> {
         .into_iter()
         .map(|index| modules[index].clone())
         .collect())
-}
-
-pub fn mappings(modules: &[ModuleInfo]) -> Vec<(String, PathBuf)> {
-    modules
-        .iter()
-        .flat_map(|module| {
-            [
-                (module.name.clone(), module.path.clone()),
-                (module.mapping.clone(), module.path.clone()),
-            ]
-        })
-        .collect()
 }

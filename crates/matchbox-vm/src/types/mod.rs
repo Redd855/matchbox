@@ -215,6 +215,9 @@ pub trait BxVM {
     }
     fn native_object_call_method(&mut self, id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String>;
     fn construct_native_class(&mut self, class_name: &str, args: &[BxValue]) -> Result<BxValue, String>;
+    fn construct_box_class(&mut self, _class_name: &str, _args: Vec<BxValue>, _names: Option<Vec<String>>) -> Result<BxValue, String> {
+        Err("BoxLang class construction unavailable".into())
+    }
     fn instance_class_name(&self, receiver: BxValue) -> Result<String, String>;
     fn instance_variables_json(&self, receiver: BxValue) -> Result<serde_json::Value, String>;
     fn datetime_new(&mut self, dt: chrono::DateTime<chrono::Utc>) -> usize;

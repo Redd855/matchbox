@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use matchbox_compiler::{ast::*, parser};
 use matchbox_vm::{
     Chunk,
-    bundle::{Artifact, Bif, BifMember, Component, Module, SharedLibrary, TARGET},
+    bundle::{Artifact, Bif, BifMember, Component, Module, ModuleClass, SharedLibrary, TARGET},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, fs, path::Path};
@@ -108,31 +108,36 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
             )?;
             let mut classes = Vec::new();
             let mut components = Vec::new();
-            for file in class_files(&module.path)? {
-                let relative = file.strip_prefix(&module.path)?.with_extension("");
-                let name = relative.to_string_lossy().replace(['/', '\\'], ".");
+            for (class_index, file) in class_files(&module.path)?.into_iter().enumerate() {
+                let relative = file.strip_prefix(&module.path)?;
+                let name = relative.with_extension("").to_string_lossy().replace(['/', '\\'], ".");
+                let global = format!("__mb_class_{index}_{class_index}");
                 let source = fs::read_to_string(&file)?;
                 let mut ast = parser::parse(&source, file.to_str())?;
                 if !ast.iter().any(|s| matches!(s.kind, StatementKind::ClassDecl { .. })) { continue; }
-                if let Some(component) = name.strip_prefix("components.").filter(|name| !name.contains('.')) {
+                // Loading a class must not execute surrounding script/application statements.
+                ast.retain(|s| matches!(s.kind, StatementKind::Import { .. } | StatementKind::ClassDecl { .. } | StatementKind::InterfaceDecl { .. }));
+                if let Some(component) = name.strip_prefix("components.").filter(|name| !name.contains('.') && file.extension().is_some_and(|extension| extension == "bx")) {
                     for feature in ["ignoreEnableOutputOnly", "autoEvaluateBodyExpressions"] {
                         if annotation_bool(&ast, feature)? { bail!("Module component {feature} is not yet supported"); }
                     }
                     components.push(Component {
-                        class: format!("bxModules.{}.{}", module.mapping, name),
+                        class: global.clone(),
                         aliases: annotation_aliases(&ast, component, "BoxComponent")?,
                         allows_body: annotation_bool(&ast, "AllowsBody")?,
                         requires_body: annotation_bool(&ast, "RequiresBody")?,
                     });
                 }
-                rename_class(&mut ast, &format!("bxModules.{}.{}", module.mapping, name))?;
-                classes.push((name, compile(&ast, &source, &file.to_string_lossy(), modules)?));
+                rename_class(&mut ast, &global)?;
+                classes.push(ModuleClass {
+                    path: relative.to_string_lossy().into_owned(), global,
+                    chunk: compile(&ast, &source, &file.to_string_lossy(), modules)?,
+                });
             }
             let artifact = read_artifact(&module.path, target)?;
             Ok(Module {
                 name: module.name.clone(),
                 path: module.path.to_string_lossy().into_owned(),
-                mapping: module.mapping.clone(),
                 dependencies: module.dependencies.clone(),
                 instance,
                 descriptor,
@@ -154,7 +159,7 @@ fn class_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
             if path == root.join("bifs") || entry.file_name() == ".git" { continue; }
             let kind = entry.file_type()?;
             if kind.is_dir() { visit(root, &path, files)?; }
-            else if path.extension().is_some_and(|extension| extension == "bx") && path != root.join("ModuleConfig.bx") {
+            else if path.extension().is_some_and(|extension| extension == "bx" || extension == "bxs") && path != root.join("ModuleConfig.bx") {
                 if !path.canonicalize()?.starts_with(root) { bail!("Module class path escapes module package: {}", path.display()); }
                 files.push(path);
             }
@@ -321,7 +326,7 @@ fn compile(
         vec![],
         false,
         false,
-        &crate::modules::mappings(modules),
+        !modules.is_empty(),
         &[],
     )
 }

@@ -114,6 +114,7 @@ impl BxValue {
 pub trait BxVM {
     fn current_chunk(&self) -> Option<Rc<RefCell<crate::vm::chunk::Chunk>>>;
     fn current_receiver(&self) -> Option<BxValue>;
+    fn has_method_by_value(&self, _receiver: BxValue, _name: &str) -> bool { false }
     fn current_function_called_name(&self) -> String {
         String::new()
     }
@@ -214,6 +215,7 @@ pub trait BxVM {
         Err("Native callbacks are not supported by this host".into())
     }
     fn native_object_call_method(&mut self, id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String>;
+    fn resolve_class_reference(&mut self, _name: &str) -> Result<BxValue, String> { Err("Class resolution unavailable".into()) }
     fn construct_native_class(&mut self, class_name: &str, args: &[BxValue]) -> Result<BxValue, String>;
     fn construct_box_class(&mut self, _class_name: &str, _args: Vec<BxValue>, _names: Option<Vec<String>>) -> Result<BxValue, String> {
         Err("BoxLang class construction unavailable".into())
@@ -410,6 +412,10 @@ pub(crate) fn take_wasm_future_thunk(id: u64) -> Option<WasmFutureThunk> {
 }
 
 pub trait BxNativeObject: fmt::Debug {
+    /// Internal VM class-reference adapter; not part of the plugin C ABI.
+    fn class_reference_target(&self) -> Option<BxValue> { None }
+    fn class_reference_instance(&self) -> Option<BxValue> { None }
+    fn has_method(&self, name: &str) -> bool { self.delegated_callback(name).is_some() }
     fn delegated_callback(&self, _name: &str) -> Option<NativeCallback> { None }
     fn native_data(&self, _kind: &str) -> Option<*mut std::ffi::c_void> { None }
     fn get_property(&self, name: &str) -> BxValue;

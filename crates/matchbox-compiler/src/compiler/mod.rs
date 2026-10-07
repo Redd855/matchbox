@@ -1415,31 +1415,12 @@ impl Compiler {
                 if resolved_path.to_lowercase().starts_with("java:") {
                     let java_class = &resolved_path[5..];
 
-                    // Push createObject onto stack
-                    let bif_name_idx = self
-                        .chunk
-                        .add_constant(Constant::String(BoxString::new("createobject")));
-                    self.chunk.emit1(op::GET_GLOBAL, bif_name_idx, expr.line);
-
-                    // Push type "java"
-                    let type_idx = self
-                        .chunk
-                        .add_constant(Constant::String(BoxString::new("java")));
-                    self.chunk.emit1(op::CONSTANT, type_idx, expr.line);
-
-                    // Push class name
-                    let class_idx = self
-                        .chunk
-                        .add_constant(Constant::String(BoxString::new(java_class)));
-                    self.chunk.emit1(op::CONSTANT, class_idx, expr.line);
-
-                    // Push arguments
-                    for arg in args {
-                        self.compile_expression(&arg.value)?;
-                    }
-
-                    // Call createObject(type, class, ...args)
-                    self.chunk.emit1(op::CALL, 2 + args.len() as u32, expr.line);
+                    self.compile_class_reference(&format!("java:{java_class}"), expr.line);
+                    if args.iter().any(|arg| arg.name.is_some()) { bail!("Cannot use named arguments on a Java constructor."); }
+                    if args.iter().any(|arg| matches!(arg.value.kind, ExpressionKind::Spread(_))) { bail!("Java constructor spread arguments are not yet supported"); }
+                    for arg in args { self.compile_expression(&arg.value)?; }
+                    let init = self.chunk.add_constant(Constant::String(BoxString::new("init")));
+                    self.chunk.emit2(op::INVOKE, init, args.len() as u32, expr.line);
                     return Ok(());
                 }
 
@@ -1997,10 +1978,9 @@ impl Compiler {
                     self.chunk.emit1(op::GET_PRIVATE, idx as u32, expr.line);
                 } else if let Some(slot) = self.resolve_local(&name) {
                     self.chunk.emit1(op::GET_LOCAL, slot as u32, expr.line);
-                } else if let Some(path) = self.imports.get(&lower_name).filter(|path| self.is_runtime_module_class(path)) {
-                    let path = if path.to_ascii_lowercase().starts_with("bx:") { &path[3..] } else { path };
-                    let idx = self.chunk.add_constant(Constant::String(BoxString::new(path)));
-                    self.chunk.emit1(op::GET_GLOBAL, idx, expr.line);
+                } else if let Some(path) = self.imports.get(&lower_name).filter(|path| path.to_ascii_lowercase().starts_with("java:") || self.is_runtime_module_class(path)) {
+                    let path = path.clone();
+                    self.compile_class_reference(&path, expr.line);
                 } else if self.is_class && !is_js_import {
                     let idx = self
                         .chunk
@@ -2060,6 +2040,13 @@ impl Compiler {
                 Ok(())
             }
             ExpressionKind::FunctionCall { base, args } => {
+                if let ExpressionKind::Identifier(name) = &base.kind {
+                    if self.resolve_local(name).is_none() {
+                        if let Some(path) = self.imports.get(&name.to_ascii_lowercase()).filter(|path| path.to_ascii_lowercase().starts_with("java:") || self.is_runtime_module_class(path)).cloned() {
+                            return self.compile_expression(&Expression::new(ExpressionKind::New { class_path:path, args:args.clone() }, expr.line));
+                        }
+                    }
+                }
                 let mut arg_names = Vec::new();
                 let mut has_named = false;
 
@@ -2856,6 +2843,14 @@ impl Compiler {
                 break;
             }
         }
+    }
+
+    fn compile_class_reference(&mut self, path: &str, line: u32) {
+        let callback = self.chunk.add_constant(Constant::String(BoxString::new("__mb_resolve_class")));
+        self.chunk.emit1(op::GET_GLOBAL, callback, line);
+        let name = self.chunk.add_constant(Constant::String(BoxString::new(path)));
+        self.chunk.emit1(op::CONSTANT, name, line);
+        self.chunk.emit1(op::CALL, 1, line);
     }
 
     fn is_runtime_module_class(&self, path: &str) -> bool {

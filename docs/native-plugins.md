@@ -63,7 +63,31 @@ At execution, load native providers, instantiate descriptors, call `configure()`
 
 Package `.bx`/`.bxs` class declarations are embedded under private identities, then bound to the resolved mapping paths at execution, before `configure()`. Surrounding script statements are not executed when loading those declarations. Constructors and imported class references work after removing the source package; named/default `init()` arguments, null-returning initializers, and static method calls/references use the shared VM invocation machinery. Only classes contained in the packaged module are embedded—mapping metadata can describe other paths, but classes from those paths are not bundled or loaded automatically. Implicit constructor arguments and constructor spreads fail explicitly until supported.
 
-This is BoxLang package-class resolution, not the module-owned Java class-provider API. Arbitrary runtime mappings, source/template loading, complete static scopes, and Java provider registration remain separate work.
+This is BoxLang package-class resolution, distinct from the class-provider boundary below. Arbitrary runtime mappings, source/template loading, and complete BoxLang static scopes remain separate work.
+
+### Module-owned Java class providers
+
+After `configure()`, MatchBox registers the descriptor's variables-scope `classProviders` array. Each entry has an exact, case-sensitive `java:` class name and an ordinary zero-argument callable. Resolver prefixes and import aliases are case-insensitive. Duplicate names and invalid registrations fail; no wildcard provider or global `createObject()` replacement is involved.
+
+```boxlang
+function configure() {
+    // The JVM backend need not register a MatchBox provider.
+    if (boxRuntime.getFunctionService().hasGlobalFunction("myNativeClassReference")) {
+        classProviders = [{
+            name: "java:org.example.Counter",
+            provider: myNativeClassReference
+        }];
+    }
+}
+```
+
+The callable returns a native object, BoxLang class reference, or BoxLang instance representing the supported class. A returned BoxLang class runs its pseudo-constructor, but not `init()`, to create the façade. Native providers can use existing ABI-1 BIFs and object-to-BIF method mappings; no SDK capability was added. Factories run only during resolution at execution, never during packaging. Registrations retain their callable independently of mutable aliases and appear in `moduleRecord.classProviders` / `asStruct()`.
+
+`createObject("java", name)`, `new java:...`, explicit Java imports, unprefixed imports of registered names, imported-class calls, and stored class references share resolution. Unprefixed resolution prefers an embedded BoxLang class. Creation returns an uninitialized reference; `init()` and `new` invoke the provided constructor. Successful initialization retains the returned instance and forwards its methods; failed/null initialization does not replace an existing instance. Static calls, `::` member syntax, bound method references, dot/index field access, and chaining use existing VM values and dispatch. BoxLang façade fields are writable; native class fields are currently read-only. References and initialized instances survive GC, including retained method references and nested callbacks.
+
+Providers remain available through `onUnload()`, then unregister by module ownership, including partial startup and failing unload. Existing references remain usable. With any module-owned Java names registered, missing names fail without falling back to a JVM. Without those registrations, builds with the existing optional `bif-jni` feature can use the bounded JNI backend; builds without it fail explicitly. The nonfunctional `java.io.File` placeholder was removed.
+
+This is a resolution/protocol boundary, not a Java implementation. The module owns class names, overloads, methods, fields, identity and other Java behavior. Java named constructor/method arguments, constructor spreads, JAR/class-loader arguments, unsupported members, and null constructor results fail explicitly. Implicit default construction for instance methods on uninitialized references and complete Java reflection/static scopes are not implemented. The optional `bx-matchbox-java` façade module and SDK publication remain deferred.
 
 ### Injected references and startup cleanup
 
@@ -145,7 +169,7 @@ matchbox --target native app.bxs --module /path/to/package --output app
 
 Native libraries are extracted into a private content-addressed cache by target/library-group hash. Each file is published atomically across concurrent launches; every selected cached file is verified before loading. Tampered entries fail rather than being silently trusted. Set `MATCHBOX_NATIVE_CACHE` to choose the directory. Otherwise use the platform's user cache directory (or a process-specific temporary directory when no home/cache directory is available).
 
-Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 6; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
+Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 7; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
 
 ## Checks
 
@@ -155,4 +179,4 @@ cargo test -p matchbox_vm
 cargo test -p matchbox-plugin-sdk
 ```
 
-The native fixture tests runtime lifecycle, shared class BIFs, named/default arguments, object collection, structured result lifetime, retained values/callbacks, VM/provider isolation, root release during GC and after VM shutdown, caught plugin panics, missing capabilities, envelope packaging, transitive shared-library packaging without the source package, dependency-aware cache identity, cache reuse, concurrent extraction, staging-name collisions, and artifact rejection. The separate `bx-image` pilot runs an identical BoxLang contract against its existing JVM JAR and native provider.
+The native fixture tests module-owned Java resolution, creation/import/static/property protocols, provider validation and cleanup, class/reference/initialized-instance GC retention, runtime lifecycle, shared class BIFs, named/default arguments, object collection, structured result lifetime, retained values/callbacks, VM/provider isolation, root release during GC and after VM shutdown, caught plugin panics, missing capabilities, envelope packaging, transitive shared-library packaging without the source package, dependency-aware cache identity, cache reuse, concurrent extraction, staging-name collisions, and artifact rejection. The separate `bx-image` pilot runs an identical BoxLang contract against its existing JVM JAR and native provider.

@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x06";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x07";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedLibrary {
@@ -356,6 +356,9 @@ impl Application {
                         vm.append_interception_points(points);
                     }
                 }
+                let providers = vm.instance_variable(instance, "classProviders").unwrap_or_else(|| BxValue::new_ptr(vm.array_new()));
+                vm.register_class_providers(record, providers)?;
+                crate::module_services::set_record(vm, record, "classProviders", providers)?;
                 vm.struct_set(settings_id, &module.name, settings);
                 crate::module_services::set_record(vm, record, "settings", settings)?;
                 module.bifs.reconstruct_functions();
@@ -448,6 +451,7 @@ impl Application {
                     shutdown_error.get_or_insert(error);
                 }
             }
+            vm.unregister_class_providers(record);
             if let Err(error) = vm.unregister_interceptor(instance) {
                 shutdown_error.get_or_insert(anyhow::Error::msg(error));
             }

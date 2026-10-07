@@ -1485,8 +1485,8 @@ impl<'a> Parser<'a> {
                         line,
                     );
                 }
-                Some(TokenKind::Dot) => {
-                    self.pos += 1; // .
+                Some(TokenKind::Dot) | Some(TokenKind::ColonColon) => {
+                    self.pos += 1; // . or ::
                     let member = if self.peek_is(TokenKind::Contains) {
                         self.advance_lexeme().unwrap_or_default()
                     } else {

@@ -834,6 +834,251 @@ fn embedding_module_classes_does_not_execute_neighboring_script_statements() {
     success(&cli(dir.path(), &["app.bxb"]));
 }
 
+fn class_provider_package(dir: &Path) -> PathBuf {
+    let module = package(dir);
+    fs::write(module.join("ModuleConfig.bx"), r#"
+import bxModules.module.CounterReference;
+class {
+    function configure() {
+        variables.facade = CounterReference;
+        classProviders = [{name:"java:org.matchbox.fixture.Counter", provider:this.reference}];
+    }
+    function reference() { return variables.facade; }
+    function onLoad() { println("provider loaded"); }
+    function onUnload() { println("provider unloaded"); }
+}
+"#).unwrap();
+    fs::write(module.join("CounterReference.bx"), r#"
+class {
+    this.label = "fixture class";
+    this.out = fixtureNew(42);
+    function init(numeric value = 7) {
+        if (value < 0) { throw "fixture constructor rejected value"; }
+        println("initialized " & value);
+        return fixtureNew(value);
+    }
+    function answer() { return 42; }
+}
+"#).unwrap();
+    module
+}
+
+#[test]
+fn module_class_providers_resolve_java_creation_without_initializing_references() {
+    let dir = tempfile::tempdir().unwrap();
+    class_provider_package(dir.path());
+    fs::write(dir.path().join("app.bxs"), r#"
+reference = createObject("java", "org.matchbox.fixture.Counter");
+assert reference.label == "fixture class";
+assert reference.answer() == 42;
+println("reference only");
+first = reference.init(13);
+assert first.info().value == 13;
+assert reference.info().value == 13;
+assert reference.answer() == 42;
+second = new java:org.matchbox.fixture.Counter();
+assert second.info().value == 7;
+try { new java:org.matchbox.fixture.Counter(-1); throw "constructor accepted invalid value"; }
+catch (any error) { assert findNoCase("fixture constructor rejected value", error.message) > 0; }
+try { reference.init(-1); throw "constructor accepted invalid value"; }
+catch (any error) { assert findNoCase("fixture constructor rejected value", error.message) > 0; }
+assert reference.info().value == 13;
+println("provider creation OK");
+"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "provider loaded\nreference only\ninitialized 13\ninitialized 7\nprovider creation OK\nprovider unloaded\n");
+}
+
+#[test]
+fn module_class_providers_share_import_class_reference_static_and_property_protocols() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = class_provider_package(dir.path());
+    fs::write(dir.path().join("app.bxs"), r#"
+import java:org.matchbox.fixture.Counter as Probe;
+import org.matchbox.fixture.Counter as Unprefixed;
+assert Probe.label == "fixture class";
+assert Probe::answer() == 42;
+assert Probe.answer() == 42;
+assert Probe.out.info().value == 42;
+assert Unprefixed.answer() == 42;
+reference = Probe;
+assert reference.init(12).info().value == 12;
+assert new Probe(14).info().value == 14;
+assert new Unprefixed(15).info().value == 15;
+assert Probe(16).info().value == 16;
+reference.label = "changed";
+assert reference.label == "changed";
+staticReference = reference.answer;
+assert staticReference() == 42;
+createObject = function() { throw "new/import used a replaced createObject BIF"; };
+assert new java:org.matchbox.fixture.Counter(17).info().value == 17;
+assert Probe.answer() == 42;
+println("provider protocols OK");
+"#).unwrap();
+    let expected = "provider loaded\ninitialized 12\ninitialized 14\ninitialized 15\ninitialized 16\ninitialized 17\nprovider protocols OK\nprovider unloaded\n";
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("application")).env("MATCHBOX_NATIVE_CACHE", dir.path().join("fresh-cache")).current_dir(dir.path()).output().unwrap()] {
+        success(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+}
+
+#[test]
+fn module_class_provider_errors_and_frozen_class_identities_are_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    class_provider_package(dir.path());
+    fs::write(dir.path().join("app.bxs"), r#"
+reference = createObject("java", "org.matchbox.fixture.Counter");
+assert reference["label"] == "fixture class";
+reference["label"] = "indexed";
+assert reference.label == "indexed";
+try { reference.init(value=9); throw "named constructor accepted"; }
+catch (any error) { assert findNoCase("Cannot use named arguments", error.message) > 0; }
+try { reference.answer(value=9); throw "named method accepted"; }
+catch (any error) { assert findNoCase("cannot be called with named arguments", error.message) > 0; }
+try { reference.missing = 1; throw "missing field assignment accepted"; }
+catch (any error) { assert findNoCase("missing or read-only", error.message) > 0; }
+try { reference.missing(); throw "missing method accepted"; }
+catch (any error) { assert findNoCase("not found", error.message) > 0; }
+try { createObject("java", "org.matchbox.fixture.Missing"); throw "missing class accepted"; }
+catch (any error) { assert findNoCase("Java class not provided", error.message) > 0; }
+try { createObject("java", "org.matchbox.fixture.counter"); throw "case-insensitive class accepted"; }
+catch (any error) { assert findNoCase("Java class not provided", error.message) > 0; }
+try { createObject("java", "org.matchbox.fixture.Counter", "not-a-jar"); throw "JAR accepted"; }
+catch (any error) { assert findNoCase("not supported", error.message) > 0; }
+"#).unwrap();
+    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+    // The provider returned a frozen class value, not a second mutable-global lookup.
+    let source = "replaceClass(); assert createObject('java', 'org.matchbox.fixture.Counter').init(8).info().value == 8;";
+    fs::write(dir.path().join("app.bxs"), source).unwrap();
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+    let app = matchbox_vm::bundle::Application::from_executable(&fs::read(dir.path().join("app.bxb")).unwrap()).unwrap();
+    // Use a host VM to replace the mapped global without turning dotted assignment into a struct write.
+    let mut vm = VM::new();
+    vm.register_callback("replaceClass", matchbox_vm::types::NativeCallback { parameters:vec![], callback:std::rc::Rc::new(|vm, _| {
+        vm.insert_global("bxModules.module.CounterReference".into(), BxValue::new_null()); Ok(BxValue::new_null())
+    }) }).unwrap();
+    app.run(&mut vm, &dir.path().join("cache")).unwrap();
+}
+
+#[test]
+fn native_class_provider_callbacks_and_references_survive_gc_and_owner_cleanup() {
+    let compile = |source: &str| {
+        let ast = matchbox_compiler::parser::parse(source, None).unwrap();
+        matchbox_compiler::compiler::Compiler::new("native-class-provider.bxs").compile(&ast, source).unwrap()
+    };
+    let mut vm = VM::new();
+    unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
+    let module = matchbox_vm::bundle::Module {
+        name:"module".into(), path:"/module".into(), dependencies:vec![], instance:"config".into(),
+        descriptor:compile(r#"
+class Config {
+    function configure() { classProviders = [{name:"java:org.matchbox.fixture.NativeCounter", provider:fixtureClass}]; }
+    function onUnload() { assert createObject("java", "org.matchbox.fixture.NativeCounter").answer() == 42; }
+}
+config = new Config();
+"#),
+        bifs:compile(""), bif_registrations:vec![], classes:vec![], components:vec![], settings:serde_json::json!({}), artifact:None,
+    };
+    let app = matchbox_vm::bundle::Application { modules:vec![module], chunk:compile(r#"
+reference = createObject(className="org.matchbox.fixture.NativeCounter", type="java");
+assert reference.answer() == 42;
+assert new java:org.matchbox.fixture.NativeCounter(11).info().value == 11;
+reference.init(19);
+savedInstanceMethod = reference.info;
+savedStatic = reference.answer;
+savedConstructor = reference.init;
+reference = null;
+"#) };
+    let cache = tempfile::tempdir().unwrap();
+    app.run(&mut vm, cache.path()).unwrap();
+    // Lookups are removed, but existing references still own their target and library.
+    vm.insert_global("fixtureClass".into(), BxValue::new_null());
+    vm.insert_global("config".into(), BxValue::new_null());
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    let reference = vm.get_global("savedStatic").unwrap();
+    assert_eq!(vm.call_function_value(reference, vec![], None).unwrap().as_number(), 42.0);
+    let instance_method = vm.get_global("savedInstanceMethod").unwrap();
+    let info = vm.call_function_value(instance_method, vec![], None).unwrap();
+    assert_eq!(vm.struct_get(info.as_gc_id().unwrap(), "value").as_number(), 19.0);
+    let constructor = vm.get_global("savedConstructor").unwrap();
+    let instance = vm.call_function_value(constructor, vec![BxValue::new_number(17.0)], None).unwrap();
+    let info = vm.call_method_value(instance, "info", vec![]).unwrap();
+    assert_eq!(vm.struct_get(info.as_gc_id().unwrap(), "value").as_number(), 17.0);
+}
+
+#[test]
+fn class_provider_registration_unwinds_partial_startup_and_preserves_original_errors() {
+    let compile = |source: &str| {
+        let ast = matchbox_compiler::parser::parse(source, None).unwrap();
+        matchbox_compiler::compiler::Compiler::new("provider-cleanup.bxs").compile(&ast, source).unwrap()
+    };
+    for phase in ["duplicate", "startup", "application", "unload"] {
+        let mut vm = VM::new();
+        unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
+        let module = |failing: bool| {
+            let duplicate = if failing && phase == "duplicate" { ",{name:'java:org.matchbox.fixture.NativeCounter',provider:fixtureClass}" } else { "" };
+            let on_load = if failing && phase == "startup" { "throw 'original startup error';" } else { "" };
+            let on_unload = if failing { "throw 'secondary unload error';" } else { "" };
+            matchbox_vm::bundle::Module {
+                name:"module".into(), path:"/module".into(), dependencies:vec![], instance:"config".into(),
+                descriptor:compile(&format!(r#"
+class Config {{
+    function configure() {{ classProviders = [{{name:'java:org.matchbox.fixture.NativeCounter',provider:fixtureClass}}{duplicate}]; }}
+    function onLoad() {{ {on_load} }}
+    function onUnload() {{ assert createObject('java', 'org.matchbox.fixture.NativeCounter').answer() == 42; {on_unload} }}
+}}
+config = new Config();
+"#)),
+                bifs:compile(""), bif_registrations:vec![], classes:vec![], components:vec![], settings:serde_json::json!({}), artifact:None,
+            }
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let script = if phase == "application" { "throw 'original application error';" } else { "" };
+        let app = matchbox_vm::bundle::Application { modules:vec![module(true)], chunk:compile(script) };
+        let error = app.run(&mut vm, cache.path()).unwrap_err().to_string();
+        assert!(error.contains(match phase { "duplicate" => "already registered", "startup" => "original startup error", "application" => "original application error", _ => "secondary unload error" }), "{phase}: {error}");
+        // The same name can be registered again even after partial registration or failing unload.
+        let app = matchbox_vm::bundle::Application { modules:vec![module(false)], chunk:compile("assert createObject('java','org.matchbox.fixture.NativeCounter').init(9).info().value == 9;") };
+        app.run(&mut vm, cache.path()).unwrap();
+    }
+}
+
+#[test]
+fn class_provider_records_and_results_are_validated_at_execution_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = package(dir.path());
+    fs::write(dir.path().join("app.bxs"), "createObject('java','org.matchbox.fixture.Invalid');").unwrap();
+    for (providers, factory, expected) in [
+        ("{}", "return 0;", "classProviders must be an array"),
+        ("[0]", "return 0;", "Class provider must be a struct"),
+        ("[{name:1,provider:this.factory}]", "return 0;", "name must be a string"),
+        ("[{name:'rust:Invalid',provider:this.factory}]", "return 0;", "exact java:"),
+        ("[{name:'java:org.matchbox.fixture.Invalid',provider:0}]", "return 0;", "must be callable"),
+        ("[{name:'java:org.matchbox.fixture.Invalid',provider:this.factory}]", "return 0;", "did not return a class reference"),
+        ("[{name:'java:org.matchbox.fixture.Invalid',provider:this.factory}]", "throw 'original factory error';", "original factory error"),
+    ] {
+        fs::write(module.join("ModuleConfig.bx"), format!("class {{ function configure() {{ classProviders = {providers}; }} function factory() {{ {factory} }} }}")).unwrap();
+        // Packaging must not run either the descriptor or provider, including invalid definitions.
+        success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+        let output = cli(dir.path(), &["app.bxb"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    fs::write(module.join("NullFacade.bx"), "class { function init() { } }").unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "import bxModules.module.NullFacade; class { function configure() { classProviders = [{name:'java:org.matchbox.fixture.Invalid', provider:this.factory}]; } function factory() { return NullFacade; } }").unwrap();
+    fs::write(dir.path().join("app.bxs"), "createObject('java','org.matchbox.fixture.Invalid').init();").unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("init() returned null"));
+}
+
 #[test]
 fn static_class_methods_share_named_binding_precedence_and_gc_roots() {
     let source = r#"

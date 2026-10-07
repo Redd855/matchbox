@@ -4,6 +4,7 @@ pub mod intern;
 #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
 mod members;
 mod calls;
+mod classes;
 mod interceptors;
 #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
 pub(crate) mod components;
@@ -1544,6 +1545,14 @@ impl BxVM for VM {
         res
     }
 
+    fn has_method_by_value(&self, receiver: BxValue, name: &str) -> bool {
+        self.instance_has_method(receiver, name) || self.resolve_member_method(&receiver, name).is_some() || matches!(receiver.as_gc_id().and_then(|id| self.heap.get_opt(id)), Some(GcObject::NativeObject(object)) if object.borrow().has_method(name))
+    }
+
+    fn resolve_class_reference(&mut self, name: &str) -> Result<BxValue, String> {
+        VM::resolve_class_reference(self, name).map_err(|error| error.to_string())
+    }
+
     fn construct_native_class(
         &mut self,
         class_name: &str,
@@ -1564,7 +1573,11 @@ impl BxVM for VM {
     }
 
     fn construct_box_class(&mut self, class_name: &str, args: Vec<BxValue>, names: Option<Vec<String>>) -> Result<BxValue, String> {
-        let instance = self.construct_global_class(class_name, vec![]).map_err(|error| error.to_string())?;
+        let class = self.resolve_class_reference(class_name).map_err(|error| error.to_string())?;
+        if self.class_reference_target(class).is_some() {
+            return self.call_method_value_named(class, "init", args, names.unwrap_or_default()).map_err(|error| error.to_string());
+        }
+        let instance = self.construct_class_value(class, vec![]).map_err(|error| error.to_string())?;
         let _root = self.heap.retain_value(instance)?;
         if self.instance_has_method(instance, "init") {
             let result = match names {
@@ -5246,6 +5259,14 @@ impl VM {
                 op::INDEX | op::SAFE_INDEX => {
                     let index_val = self.fibers[fiber_idx].stack.pop().unwrap();
                     let base_val = self.fibers[fiber_idx].stack.pop().unwrap();
+                    if self.class_reference_target(base_val).is_some() {
+                        match self.class_reference_member(base_val, &self.to_string(index_val)) {
+                            Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                            Err(_) if opcode == op::SAFE_INDEX => self.fibers[fiber_idx].stack.push(BxValue::new_null()),
+                            Err(error) => vm_throw!("{}", error),
+                        }
+                        continue 'quantum;
+                    }
                     if let Some(id) = base_val.as_gc_id() {
                         #[cfg(all(target_arch = "wasm32", feature = "js"))]
                         if let GcObject::JsValue(js) = self.heap.get(id) {
@@ -5343,6 +5364,10 @@ impl VM {
                     let val = self.fibers[fiber_idx].stack.pop().unwrap();
                     let index_val = self.fibers[fiber_idx].stack.pop().unwrap();
                     let base_val = self.fibers[fiber_idx].stack.pop().unwrap();
+                    let base_val = match self.class_reference_assignment_target(base_val, &self.to_string(index_val)) {
+                        Ok(value) => value,
+                        Err(error) => vm_throw!("{}", error),
+                    };
 
                     if let Some(id) = base_val.as_gc_id() {
                         let index_string = self.to_string(index_val);
@@ -5457,6 +5482,14 @@ impl VM {
                     let idx = op0;
                     let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
                     let base_val = self.fibers[fiber_idx].stack.pop().unwrap();
+                    if self.class_reference_target(base_val).is_some() {
+                        let name = self.interner.resolve(name_id).to_owned();
+                        match self.class_reference_member(base_val, &name) {
+                            Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                            Err(error) => vm_throw!("{}", error),
+                        }
+                        continue 'quantum;
+                    }
 
                     if let Some(id) = base_val.as_gc_id() {
                         #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -5683,6 +5716,10 @@ impl VM {
                     let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
                     let val = self.fibers[fiber_idx].stack.pop().unwrap();
                     let base_val = self.fibers[fiber_idx].stack.pop().unwrap();
+                    let base_val = match self.class_reference_assignment_target(base_val, self.interner.resolve(name_id)) {
+                        Ok(value) => value,
+                        Err(error) => vm_throw!("{}", error),
+                    };
 
                     if let Some(id) = base_val.as_gc_id() {
                         #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -7408,6 +7445,16 @@ impl VM {
     }
 
     pub fn call_method_value_named(&mut self, receiver: BxValue, name: &str, args: Vec<BxValue>, names: Vec<String>) -> Result<BxValue> {
+        if self.class_reference_target(receiver).is_some() {
+            if names.iter().any(|name| !name.is_empty()) {
+                bail!("{}", if name.eq_ignore_ascii_case("init") { "Cannot use named arguments on a Java constructor." } else { "Methods on Java objects cannot be called with named arguments" });
+            }
+            return self.call_method_value(receiver, name, args);
+        }
+        if matches!(receiver.as_gc_id().and_then(|id| self.heap.get_opt(id)), Some(GcObject::NativeObject(_))) {
+            if names.iter().any(|name| !name.is_empty()) { bail!("Named native object method calls through this host API are not supported"); }
+            return self.call_method_value(receiver, name, args);
+        }
         let value = self.method_reference(receiver, name)?;
         self.call_function_value_named(value, args, Some(names))
     }
@@ -7428,17 +7475,17 @@ impl VM {
         class_name: &str,
         args: Vec<BxValue>,
     ) -> Result<BxValue> {
-        let class_val = self
-            .get_global(class_name)
-            .ok_or_else(|| anyhow::anyhow!("Class {} not found", class_name))?;
-        let id = class_val
-            .as_gc_id()
-            .ok_or_else(|| anyhow::anyhow!("Global {} is not a class", class_name))?;
+        let class_val = self.get_global(class_name).with_context(|| format!("Class {class_name} not found"))?;
+        self.construct_class_value(class_val, args)
+    }
 
+    fn construct_class_value(&mut self, class_val: BxValue, args: Vec<BxValue>) -> Result<BxValue> {
+        let id = class_val.as_gc_id().context("Value is not a BoxLang class")?;
         let class = match self.heap.get(id) {
             GcObject::Class(class) => Rc::clone(class),
-            _ => anyhow::bail!("Global {} is not a class", class_name),
+            _ => bail!("Value is not a BoxLang class"),
         };
+        let class_name = class.borrow().name.clone();
 
         let variables_scope = Rc::new(RefCell::new(HashMap::new()));
         let inst_id = self.heap.alloc(GcObject::Instance(BxInstance {
@@ -7738,6 +7785,7 @@ impl VM {
                 "multicharacterdelimiter",
                 "offset",
             ],
+            "createobject" => vec!["type", "classname", "properties", "externalonly", "classloader"],
             "structkeytranslate" => vec!["struct", "deep", "retainkeys"],
             "stringbuildernew" => vec!["value", "capacity"],
             "setnew" => vec!["type", "values", "casesensitive", "issynchronized"],
@@ -8078,6 +8126,16 @@ impl VM {
     ) -> Result<()> {
         let receiver_idx = self.fibers[fiber_idx].stack.len() - 1 - arg_count as usize;
         let receiver_val = self.fibers[fiber_idx].stack[receiver_idx];
+        if self.class_reference_target(receiver_val).is_some() {
+            let args = self.fibers[fiber_idx].stack[receiver_idx + 1..].to_vec();
+            let result = self.call_method_value_named(receiver_val, &name, args, names.unwrap_or_default());
+            self.fibers[fiber_idx].stack.truncate(receiver_idx);
+            match result {
+                Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                Err(error) => return self.throw_error(fiber_idx, &error.to_string()),
+            }
+            return Ok(());
+        }
 
         #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
         if let Some((member, member_receiver)) = self.registered_member(receiver_val, &name) {

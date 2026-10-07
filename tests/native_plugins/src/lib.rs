@@ -10,6 +10,87 @@ use std::{
 static ROOT_API: OnceLock<&'static RootsV1> = OnceLock::new();
 thread_local! { static RETAINED: RefCell<Option<RetainedValue>> = const { RefCell::new(None) }; }
 static DROPS: AtomicUsize = AtomicUsize::new(0);
+unsafe extern "C" fn drop_class(data: *mut c_void) {
+    drop(unsafe { Box::from_raw(data.cast::<f64>()) });
+}
+fn number_object(call: &Call<'_>, value: f64) -> Result<Value, String> {
+    let data = Box::into_raw(Box::new(value)).cast();
+    match unsafe {
+        call.object_new(
+            "fixture.number.v1",
+            data,
+            drop_object,
+            r#"{"info":"fixtureInfo"}"#,
+        )
+    } {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            unsafe {
+                drop_object(data);
+            }
+            Err(error)
+        }
+    }
+}
+unsafe extern "C" fn class_reference(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            let data = Box::into_raw(Box::new(0.0_f64)).cast();
+            match call.object_new(
+                "fixture.class.v1",
+                data,
+                drop_class,
+                r#"{"init":"fixtureClassInit","answer":"fixtureClassAnswer"}"#,
+            ) {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    drop_class(data);
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+unsafe extern "C" fn class_init(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            call.object_data(call.argument(0)?, "fixture.class.v1")?;
+            number_object(&call, call.number(call.argument(1)?)?)
+        })
+    }
+}
+unsafe extern "C" fn class_answer(
+    ctx: Context,
+    api: *const ValuesV1,
+    _: *mut c_void,
+    args: *const Value,
+    len: usize,
+    out: *mut Value,
+) -> i32 {
+    unsafe {
+        guarded(ctx, api, out, || {
+            let call = Call::new(ctx, api, args, len);
+            call.object_data(call.argument(0)?, "fixture.class.v1")?;
+            call.number_new(42.0)
+        })
+    }
+}
 unsafe extern "C" fn drop_object(data: *mut c_void) {
     drop(unsafe { Box::from_raw(data.cast::<f64>()) });
     DROPS.fetch_add(1, Ordering::SeqCst);
@@ -25,20 +106,7 @@ unsafe extern "C" fn make(
     unsafe {
         guarded(ctx, api, out, || {
             let call = Call::new(ctx, api, args, len);
-            let value = call.number(call.argument(0)?)?;
-            let data = Box::into_raw(Box::new(value)).cast();
-            match call.object_new(
-                "fixture.number.v1",
-                data,
-                drop_object,
-                r#"{"info":"fixtureInfo"}"#,
-            ) {
-                Ok(value) => Ok(value),
-                Err(error) => {
-                    drop_object(data);
-                    Err(error)
-                }
-            }
+            number_object(&call, call.number(call.argument(0)?)?)
         })
     }
 }
@@ -267,6 +335,15 @@ pub unsafe extern "C" fn matchbox_plugin_init_v1(host: *const HostV1, ctx: Conte
         return 1;
     }
     let functions = [
+        (r#"{"name":"fixtureClass"}"#, class_reference as Invoke),
+        (
+            r#"{"name":"fixtureClassInit","arguments":[{"name":"class","required":true},{"name":"value","default":7}]}"#,
+            class_init as Invoke,
+        ),
+        (
+            r#"{"name":"fixtureClassAnswer","arguments":[{"name":"class","required":true}]}"#,
+            class_answer as Invoke,
+        ),
         (
             r#"{"name":"fixtureNew","aliases":["fixtureCreate"],"arguments":[{"name":"value","default":42}]}"#,
             make as Invoke,

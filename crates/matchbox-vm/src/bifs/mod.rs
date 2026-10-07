@@ -82,12 +82,8 @@ mod jni;
 #[cfg(not(feature = "bif-jni"))]
 mod jni {
     use crate::types::{BxVM, BxValue};
-    pub fn create_java_object(
-        _vm: &mut dyn BxVM,
-        _class_name: &str,
-        _args: &[BxValue],
-    ) -> Result<BxValue, String> {
-        Err("Java interoperability is not enabled in this build.".to_string())
+    pub fn create_java_class(_vm: &mut dyn BxVM, class_name: &str) -> Result<BxValue, String> {
+        Err(format!("Java class not provided: {class_name} (JNI is not enabled)"))
     }
 }
 mod binary;
@@ -332,6 +328,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
         "createobject".to_string(),
         create_object as BxNativeFunction,
     );
+    bifs.insert("__mb_resolve_class".into(), resolve_class as BxNativeFunction);
     bifs.insert("isnull".to_string(), is_null_bif as BxNativeFunction);
     bifs.insert("nullvalue".to_string(), null_value_bif as BxNativeFunction);
     bifs.insert("isnumeric".to_string(), is_numeric_bif as BxNativeFunction);
@@ -4748,6 +4745,15 @@ fn run_async(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     vm.spawn_by_value(&args[0], Vec::new(), priority, chunk)
 }
 
+pub(crate) fn jni_class_reference(vm: &mut dyn BxVM, name: &str) -> Result<BxValue, String> {
+    jni::create_java_class(vm, name)
+}
+
+fn resolve_class(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    if args.len() != 1 || !vm.is_string_value(args[0]) { return Err("Class resolution requires a class name".into()); }
+    vm.resolve_class_reference(&vm.to_string(args[0]))
+}
+
 fn create_object(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() < 2 {
         return Err("createObject() expects at least 2 arguments: (type, class)".to_string());
@@ -4756,35 +4762,13 @@ fn create_object(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String>
     let class_name = vm.to_string(args[1]);
 
     match obj_type.as_str() {
-        "java" if class_name.eq_ignore_ascii_case("java.io.File") && args.len() == 2 => {
-            let id = vm.native_object_new(Rc::new(RefCell::new(JavaClassPlaceholder)));
-            Ok(BxValue::new_ptr(id))
+        "java" => {
+            if args.len() != 2 { return Err("Java class paths, JARs and class loaders are not supported".into()); }
+            vm.resolve_class_reference(&format!("java:{class_name}"))
         }
-        "java" => jni::create_java_object(vm, &class_name, &args[2..]),
         "rust" => vm.construct_native_class(&class_name, &args[2..]),
         "native" => Err("Use 'rust' type for native objects".to_string()),
         _ => Err(format!("Unknown object type: {}", obj_type)),
-    }
-}
-
-#[derive(Debug)]
-struct JavaClassPlaceholder;
-
-impl BxNativeObject for JavaClassPlaceholder {
-    fn get_property(&self, _name: &str) -> BxValue {
-        BxValue::new_null()
-    }
-
-    fn set_property(&mut self, _name: &str, _value: BxValue) {}
-
-    fn call_method(
-        &mut self,
-        _vm: &mut dyn BxVM,
-        _id: usize,
-        name: &str,
-        _args: &[BxValue],
-    ) -> Result<BxValue, String> {
-        Err(format!("Java class placeholder method '{}' not found", name))
     }
 }
 

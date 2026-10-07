@@ -22,9 +22,9 @@ The goal is to run existing BoxLang framework APIs without a JVM. The shim imple
 
 Already implemented: precompiled native plugins; a stable capability-negotiated C ABI; embedded module/library bundles; verified extraction; retained VM values; runtime module lifecycle/settings; BIF/member annotations and invocation parity; live module/function/interceptor services; synchronous global custom interception.
 
-At the original checkpoint above, descriptor-declared/annotated interceptors, module components, and dynamic/struct descriptor mappings were pending. Subsequent foundation slices implement those registrations, normal component bodies, and runtime private/public mappings with embedded BoxLang class lookup. The application envelope is now version 6; plugin ABI-1 libraries are unchanged.
+At the original checkpoint above, descriptor-declared/annotated interceptors, module components, and dynamic/struct descriptor mappings were pending. Subsequent foundation slices implement those registrations, normal component bodies, and runtime private/public mappings with embedded BoxLang class lookup. The application envelope is now version 7; plugin ABI-1 libraries are unchanged.
 
-**Milestone 1 is still incomplete.** The embedded BoxLang class catalog is not the minimal module-owned Java class-provider resolution boundary. That boundary, remaining component/context/interception parity, and general VM closure/scoping gaps must be assessed before beginning milestone 2. This document does not invent an SDK signature or authorize SDK publication.
+**Milestone 1 is still incomplete.** The minimal module-owned Java class-provider boundary is now implemented separately from the embedded BoxLang catalog: runtime descriptor `classProviders` registrations route creation, imports, initialization, static references and property access through ordinary BoxLang/native values, with GC retention and owner cleanup. See `docs/native-plugins.md` for the implemented contract and explicit limitations. No plugin ABI/capability change was needed. Remaining component/context/interception parity and general VM closure/scoping gaps must still be assessed before beginning milestone 2. This document does not authorize SDK publication.
 
 Important files:
 
@@ -32,6 +32,7 @@ Important files:
 - `crates/matchbox-vm/src/bundle.rs`: embedded application preparation and lifecycle.
 - `crates/matchbox-vm/src/module_services.rs`: live records/services.
 - `crates/matchbox-vm/src/plugins.rs`: native plugin loading and dispatch.
+- `crates/matchbox-vm/src/vm/classes.rs`: module class-provider resolution and reference protocols.
 - `crates/matchbox-plugin-sdk/`: independently versioned author SDK.
 - `crates/matchbox-compiler/src/compiler/mod.rs`: imports and `new` lowering.
 - `crates/matchbox-vm/src/bifs/mod.rs`: `createObject()` and existing native utilities.
@@ -53,7 +54,7 @@ createObject("java", ...), new java:..., imported Java class references
 
 MatchBox owns resolution and the VM protocols needed to use the resulting values. The module owns the supported Java names and their behavior. Reuse the existing native-object, callback, rooting, and packaging machinery rather than introducing another object model.
 
-Do not globally override `createObject()` or depend on interception of just that BIF. `new java:...` already lowers to `createObject()`, but imported class references, static members, initialization, and chaining must share a deliberate resolution path. The JVM's ordinary Java creation path does not use `onCreateObjectRequest` as a universal hook.
+Do not globally override `createObject()` or depend on interception of just that BIF. `new java:...` and imports now use the core resolver directly; `createObject()` uses that same resolution path. Class references, static members, initialization, and chaining must continue to share it. The JVM's ordinary Java creation path does not use `onCreateObjectRequest` as a universal hook.
 
 Keep the compatibility module optional. Loading it must not start/download a JVM or invoke Cargo. Unsupported classes/methods must report clear errors; never return placeholders or pretend futures.
 

@@ -4,11 +4,11 @@
 
 The approved sequence is:
 
-1. Finish the module foundation in MatchBox (current work).
-2. Build the optional **bx-matchbox-java** module.
+1. Finish the module foundation in MatchBox (bounded foundation complete).
+2. Build the optional **bx-matchbox-java** module (first slice started).
 3. Hill-climb **TestBox**, then a minimal **ColdBox** application.
 
-This document hands off milestones **2 and 3**. They are not implemented yet. Do not start a general Java implementation, publish the SDK, or expand the image pilot as part of finishing milestone 1.
+This document hands off milestones **2 and 3**. Milestone 2 has a working first slice; milestone 3 is not implemented. Do not start a general Java implementation, publish the SDK, or expand the image pilot as part of finishing milestone 1.
 
 The goal is to run existing BoxLang framework APIs without a JVM. The shim implements a bounded set of Java-compatible interfaces using BoxLang and Rust; it does **not** execute Java bytecode, load arbitrary JARs, or promise full Java compatibility.
 
@@ -40,6 +40,8 @@ Important files:
 - `tests/native_plugin_tests.rs`: end-to-end module/plugin contracts.
 
 ## Milestone 2: bx-matchbox-java
+
+Project: `../bx-matchbox-java`, https://github.com/ortus-boxlang/bx-matchbox-java (branch `main`). Its first slice provides `java.lang.StringBuilder` creation/imports, default/string/integer-capacity construction, string append/chaining, UTF-16 length, and retained callbacks through an independent ABI-1 native provider. The same package uses real Java classes on JVM BoxLang. JVM/no-JNI/source-free bytecode/standalone contracts pass. This is a bounded starter, not completed TestBox compatibility or a general Java implementation; see that project's README for exact unsupported overloads/protocols and author-only SDK overrides. SDK publication and framework hill climbing remain deferred.
 
 ### Architecture boundary
 

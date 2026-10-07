@@ -114,6 +114,7 @@ impl BxValue {
 pub trait BxVM {
     fn current_chunk(&self) -> Option<Rc<RefCell<crate::vm::chunk::Chunk>>>;
     fn current_receiver(&self) -> Option<BxValue>;
+    fn execution_context(&mut self) -> Result<BxValue, String> { Err("Execution context unavailable".into()) }
     fn has_method_by_value(&self, _receiver: BxValue, _name: &str) -> bool { false }
     fn current_function_called_name(&self) -> String {
         String::new()
@@ -122,6 +123,9 @@ pub trait BxVM {
     fn spawn(&mut self, func: Rc<BxCompiledFunction>, args: Vec<BxValue>, priority: u8, chunk: Rc<RefCell<crate::vm::chunk::Chunk>>) -> BxValue;
     fn spawn_by_value(&mut self, func: &BxValue, args: Vec<BxValue>, priority: u8, chunk: Rc<RefCell<crate::vm::chunk::Chunk>>) -> Result<BxValue, String>;
     fn call_function_by_value(&mut self, func: &BxValue, args: Vec<BxValue>, chunk: Rc<RefCell<crate::vm::chunk::Chunk>>) -> Result<BxValue, String>;
+    fn call_function_by_value_named(&mut self, _func: BxValue, _args: Vec<BxValue>, _names: Option<Vec<String>>) -> Result<BxValue, String> {
+        Err("Context callable dispatch unavailable".into())
+    }
     fn call_method_by_value(
         &mut self,
         receiver: BxValue,
@@ -235,6 +239,7 @@ pub trait BxVM {
     fn insert_global(&mut self, name: String, val: BxValue);
     fn append_interception_points(&mut self, _names: Vec<String>) -> Result<(), String> { Err("Interception unavailable".into()) }
     fn interception_points(&self) -> Vec<String> { Vec::new() }
+    fn execution_components(&self) -> Result<Vec<BxValue>, String> { Err("Component context unavailable".into()) }
     fn component_names(&self) -> Vec<String> { Vec::new() }
     fn invoke_component(&mut self, _name: &str, _attributes: BxValue, _body: BxValue) -> Result<BxValue, String> { Err("Components unavailable".into()) }
     fn register_interceptor(&mut self, _target: BxValue) -> Result<(), String> { Err("Interception unavailable".into()) }

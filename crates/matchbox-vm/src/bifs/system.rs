@@ -66,10 +66,7 @@ pub fn get_function_called_name(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<
 }
 
 pub fn get_box_context(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    let id = vm.struct_new();
-    let context_type = vm.string_new("MatchBoxContext".to_string());
-    vm.struct_set(id, "type", BxValue::new_ptr(context_type));
-    Ok(BxValue::new_ptr(id))
+    vm.execution_context()
 }
 
 pub fn run_thread_in_context(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {

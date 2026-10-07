@@ -101,6 +101,7 @@ script_test!(
 );
 script_test!(vm_functions, "vm_functions.bxs");
 script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");
+script_test!(vm_execution_contexts, "vm_execution_contexts.bxs");
 
 #[test]
 fn vm_locals_survive_stack_reallocation() {

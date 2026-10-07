@@ -6,6 +6,8 @@ mod members;
 mod calls;
 mod classes;
 mod scopes;
+mod contexts;
+mod events;
 mod interceptors;
 #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
 pub(crate) mod components;
@@ -401,6 +403,7 @@ pub struct CallFrame {
     pending_completion: Option<PendingCompletion>,
     pub promoted_constants: Vec<Option<BxValue>>,
     local_scope: Option<BxValue>,
+    context: Option<BxValue>,
     local_names: HashMap<usize, String>,
 }
 
@@ -517,6 +520,8 @@ pub struct VM {
     pub output_buffer: Option<String>,
     output_capture_stack: Vec<Option<String>>,
     pub gc_suspended: bool,
+    function_events: HashMap<usize, BxValue>,
+    automatic_event_depth: usize,
     thread_futures: HashSet<usize>,
     datetime_timezones: HashMap<usize, String>,
     /// GC tuning parameters; use `VM::with_config()` or accept defaults.
@@ -555,6 +560,11 @@ impl BxVM for VM {
             None
         }
     }
+
+    fn call_function_by_value_named(&mut self, func: BxValue, args: Vec<BxValue>, names: Option<Vec<String>>) -> Result<BxValue, String> {
+        self.call_function_value_named(func, args, names).map_err(|error| error.to_string())
+    }
+    fn execution_context(&mut self) -> Result<BxValue, String> { VM::execution_context(self) }
 
     fn current_receiver(&self) -> Option<BxValue> {
         self.current_fiber_idx
@@ -1480,6 +1490,7 @@ impl BxVM for VM {
     fn append_interception_points(&mut self, names: Vec<String>) -> Result<(), String> { VM::append_interception_points(self, names); Ok(()) }
     fn interception_points(&self) -> Vec<String> { VM::interception_points(self) }
     #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
+    fn execution_components(&self) -> Result<Vec<BxValue>, String> { Ok(VM::execution_components(self)) }
     fn component_names(&self) -> Vec<String> { VM::component_names(self) }
     #[cfg(all(not(target_family = "wasm"), not(target_os = "espidf")))]
     fn invoke_component(&mut self, name: &str, attributes: BxValue, body: BxValue) -> Result<BxValue, String> { VM::invoke_component(self, name, attributes, body).map_err(|error| error.to_string()) }
@@ -2025,6 +2036,7 @@ impl VM {
             frames: vec![CallFrame {
                 function,
                 chunk,
+                context: None,
                 ip: 0,
                 local_scope: None,
                 local_names: HashMap::new(),
@@ -2327,6 +2339,8 @@ impl VM {
             output_buffer: None,
             output_capture_stack: Vec::new(),
             gc_suspended: false,
+            function_events: HashMap::new(),
+            automatic_event_depth: 0,
             thread_futures: HashSet::new(),
             datetime_timezones: HashMap::new(),
             native_completions: VecDeque::new(),
@@ -3096,6 +3110,7 @@ impl VM {
                 promoted_constants: Vec::new(),
                 local_scope: None,
                 local_names: HashMap::new(),
+                context: None,
             }],
 
             variables: Self::new_variables_scope(),
@@ -3150,6 +3165,7 @@ impl VM {
                 promoted_constants: Vec::new(),
                 local_scope: None,
                 local_names: HashMap::new(),
+                context: None,
             }],
 
             variables: Self::new_variables_scope(),
@@ -3302,6 +3318,7 @@ impl VM {
                 promoted_constants: Vec::new(),
                 local_scope: None,
                 local_names: HashMap::new(),
+                context: None,
             }],
             variables: Self::new_variables_scope(),
             future_id,
@@ -3529,6 +3546,7 @@ impl VM {
             frames: vec![CallFrame {
                 function: func,
                 chunk,
+                context: None,
                 ip: 0,
                 local_scope: None,
                 local_names: HashMap::new(),
@@ -4400,6 +4418,14 @@ impl VM {
                 op::SET_LOCAL_POP => {
                     let val = self.fibers[fiber_idx].stack.pop().unwrap();
                     self.set_local_value(fiber_idx, op0 as usize, val);
+                }
+                op::FUNCTION_ENTER => {
+                    flush_ip!();
+                    if let Err(error) = self.enter_function_events(fiber_idx) {
+                        self.throw_error(fiber_idx, &error)?;
+                    }
+                    frame_changed = true;
+                    continue 'quantum;
                 }
                 op::BIND_LOCAL => {
                     let key = next_word!();
@@ -6424,6 +6450,7 @@ impl VM {
                             let constant_count = sub_chunk.constants().len();
 
                             let frame = CallFrame {
+                                context: None,
                                 function: Rc::new(constructor),
                                 chunk: Rc::new(RefCell::new(sub_chunk)),
                                 ip: 0,
@@ -7204,6 +7231,10 @@ impl VM {
             }
         }
 
+        let result = match self.finish_function_events(fiber_idx, result) {
+            Ok(result) => result,
+            Err(error) => { self.throw_error(fiber_idx, &error)?; return Ok(None); }
+        };
         let fiber = &mut self.fibers[fiber_idx];
         let frame = fiber.frames.pop().unwrap();
         if fiber.frames.is_empty() {
@@ -7241,6 +7272,7 @@ impl VM {
         }
 
         let val = self.normalize_thrown_value(val, &stack_trace);
+        let _root = self.heap.retain_value(val).map_err(anyhow::Error::msg)?;
 
         while !self.fibers[fiber_idx].frames.is_empty() {
             let frame_idx = self.fibers[fiber_idx].frames.len() - 1;
@@ -7278,6 +7310,7 @@ impl VM {
                 continue;
             }
 
+            self.fail_function_events(fiber_idx, val).map_err(anyhow::Error::msg)?;
             self.fibers[fiber_idx].frames.pop();
         }
         let val_str = self.exception_summary(val);
@@ -7416,6 +7449,7 @@ impl VM {
                             stack
                         },
                         frames: vec![CallFrame {
+                            context: None,
                             function: func.clone(),
                             chunk: Rc::new(RefCell::new(sub_chunk)),
                             ip: 0,
@@ -7539,6 +7573,7 @@ impl VM {
                 stack
             },
             frames: vec![CallFrame {
+                context: None,
                 function: Rc::new(constructor),
                 chunk: Rc::new(RefCell::new(sub_chunk)),
                 ip: 0,
@@ -8015,6 +8050,7 @@ impl VM {
                     let sub_chunk = func.chunk.clone();
                     let constant_count = sub_chunk.constants().len();
                     let mut frame = CallFrame {
+                        context: None,
                         function: Rc::clone(&func),
                         chunk: Rc::new(RefCell::new(sub_chunk)),
                         ip: 0,
@@ -8284,6 +8320,7 @@ impl VM {
                             let constant_count = sub_chunk.constants().len();
                             let stack_base = self.fibers[fiber_idx].stack.len() - function.arity as usize;
                             self.fibers[fiber_idx].frames.push(CallFrame {
+                                context: None,
                                 function,
                                 chunk: Rc::new(RefCell::new(sub_chunk)),
                                 ip: 0,
@@ -8465,6 +8502,7 @@ impl VM {
                         let constant_count = sub_chunk.constants().len();
                         let stack_base = self.fibers[fiber_idx].stack.len() - func.arity as usize;
                         let frame = CallFrame {
+                            context: None,
                             function: func.clone(),
                             chunk: Rc::new(RefCell::new(sub_chunk)),
                             ip: 0,
@@ -8497,6 +8535,7 @@ impl VM {
                         let sub_chunk = on_missing.chunk.clone();
                         let constant_count = sub_chunk.constants().len();
                         let mut frame = CallFrame {
+                            context: None,
                             local_scope: None,
                             local_names: HashMap::new(),
                             function: on_missing.clone(),
@@ -8959,6 +8998,7 @@ impl VM {
                 }
                 roots.extend(frame.promoted_constants.iter().flatten().copied());
                 roots.extend(frame.local_scope);
+                roots.extend(frame.context);
                 roots.extend(frame.function.captured_scopes.iter().copied());
                 if let Some(PendingCompletion::Return(value) | PendingCompletion::Throw(value)) = frame.pending_completion {
                     roots.push(value);
@@ -8970,6 +9010,7 @@ impl VM {
         roots.extend(self.global_values.iter().cloned());
         roots.extend(self.script_variables.borrow().values().copied());
         roots.extend(self.soap_clients.values().copied());
+        roots.extend(self.function_events.values().copied());
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         roots.extend(self.callback_registry.borrow().values().cloned());
         for completion in &self.native_completions {

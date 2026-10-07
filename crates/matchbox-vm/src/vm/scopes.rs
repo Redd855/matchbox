@@ -3,7 +3,7 @@ use super::{VM, gc::GcObject};
 use crate::types::{BxVM, BxValue};
 
 impl VM {
-    fn arguments_scope(&self, fiber: usize) -> Option<BxValue> {
+    pub(super) fn arguments_scope(&self, fiber: usize) -> Option<BxValue> {
         let frame = self.fibers[fiber].frames.last()?;
         if frame.function.kind == crate::types::FunctionKind::ComponentBody {
             return frame.function.captured_scopes.get(1).copied();

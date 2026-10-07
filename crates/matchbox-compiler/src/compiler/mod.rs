@@ -2526,6 +2526,9 @@ impl Compiler {
             sub_compiler.chunk.emit0(op::POP, self.current_line);
         }
 
+        if kind != FunctionKind::ComponentBody {
+            sub_compiler.chunk.emit0(op::FUNCTION_ENTER, self.current_line);
+        }
         match body {
             FunctionBody::Block(stmts) | FunctionBody::Component(stmts) => {
                 for stmt in stmts {

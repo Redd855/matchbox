@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x09";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x0A";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedLibrary {
@@ -416,6 +416,7 @@ impl Application {
             }
             for (instance, record, targets) in &mut records {
                 let (instance, record) = (*instance, *record);
+                announce_module_event(vm, "preModuleLoad", record)?;
                 vm.register_interceptor(instance).map_err(anyhow::Error::msg)?;
                 let entries = vm.instance_variable(instance, "interceptors").unwrap_or_else(|| BxValue::new_ptr(vm.array_new())).as_gc_id().unwrap();
                 for index in 0..vm.array_len(entries) {
@@ -446,12 +447,16 @@ impl Application {
                     "activated",
                     BxValue::new_bool(true),
                 )?;
+                announce_module_event(vm, "postModuleLoad", record)?;
             }
             self.chunk.reconstruct_functions();
             vm.interpret(self.chunk)
         })();
         let mut shutdown_error = None;
         for (instance, record, targets) in records.into_iter().rev() {
+            if let Err(error) = announce_module_event(vm, "preModuleUnload", record) {
+                shutdown_error.get_or_insert(error);
+            }
             if vm.instance_has_method(instance, "onUnload") {
                 if let Err(error) = vm.call_method_value(instance, "onUnload", vec![]) {
                     shutdown_error.get_or_insert(error);
@@ -474,6 +479,9 @@ impl Application {
             ) {
                 shutdown_error.get_or_insert(error);
             }
+            if let Err(error) = announce_module_event(vm, "postModuleUnload", record) {
+                shutdown_error.get_or_insert(error);
+            }
         }
         match (result, shutdown_error) {
             (Err(error), _) => Err(error),
@@ -481,6 +489,11 @@ impl Application {
             (Ok(value), None) => Ok(value),
         }
     }
+}
+
+fn announce_module_event(vm: &mut VM, name: &str, record: BxValue) -> Result<()> {
+    let module_name = crate::module_services::record_field(vm, record, "name");
+    vm.announce_event(name, &[("moduleName", module_name), ("moduleRecord", record)]).map_err(anyhow::Error::msg)
 }
 
 fn merge_settings(vm: &mut VM, id: usize, overrides: &serde_json::Map<String, serde_json::Value>) {

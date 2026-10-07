@@ -1488,29 +1488,17 @@ impl<'a> Parser<'a> {
                         line,
                     );
                 }
-                Some(TokenKind::Dot) | Some(TokenKind::ColonColon) => {
-                    self.pos += 1; // . or ::
-                    let member = if self.peek_is(TokenKind::Contains) {
-                        self.advance_lexeme().unwrap_or_default()
-                    } else {
-                        self.expect_get(TokenKind::Identifier)?
-                    };
-                    expr = Expression::new(
-                        ExpressionKind::MemberAccess { base: Box::new(expr), member },
-                        line,
-                    );
-                }
-                Some(TokenKind::QuestionDot) => {
-                    self.pos += 1; // ?.
-                    let member = if self.peek_is(TokenKind::Contains) {
-                        self.advance_lexeme().unwrap_or_default()
-                    } else {
-                        self.expect_get(TokenKind::Identifier)?
-                    };
-                    expr = Expression::new(
-                        ExpressionKind::SafeMemberAccess { base: Box::new(expr), member },
-                        line,
-                    );
+                Some(TokenKind::Dot | TokenKind::ColonColon | TokenKind::QuestionDot) => {
+                    let safe = self.peek_is(TokenKind::QuestionDot);
+                    self.pos += 1;
+                    let member = if self.peek_lexeme().is_some_and(|name| {
+                        name.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '$')
+                            && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+                    }) { self.advance_lexeme().unwrap() }
+                    else { self.expect_get(TokenKind::Identifier)? };
+                    let kind = if safe { ExpressionKind::SafeMemberAccess { base: Box::new(expr), member } }
+                        else { ExpressionKind::MemberAccess { base: Box::new(expr), member } };
+                    expr = Expression::new(kind, line);
                 }
                 Some(TokenKind::PlusPlus) | Some(TokenKind::MinusMinus) => {
                     let operator = self.advance_lexeme().unwrap_or_default();

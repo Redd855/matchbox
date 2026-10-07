@@ -81,6 +81,7 @@ pub(crate) fn body_result(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue
 }
 
 const COMPONENTS: &str = "__mb_components";
+const COMPONENT_STACK: &str = "__mb_component_stack";
 
 pub(crate) fn inject_helpers(vm: &mut VM, target: BxValue, name: &str) -> Result<()> {
     let name = name.to_owned();
@@ -138,8 +139,17 @@ fn process_body(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> 
     if args.len() != 3 {
         return Err("processBody() requires context, body and buffer".into());
     }
+    if vm
+        .native_object_data(args[0], "matchbox.context.v1")
+        .is_none()
+    {
+        return Err("processBody() requires an execution context".into());
+    }
     if args[1].is_null() {
         return Ok(default_body_result(vm));
+    }
+    if !vm.value_matches_type_name(args[1], "function") {
+        return Err("processBody() body must be callable".into());
     }
     let chunk = vm
         .current_chunk()
@@ -187,7 +197,9 @@ impl VM {
             .as_gc_id()
             .unwrap();
         let record = self.struct_new();
-        let name = BxValue::new_ptr(self.string_new(component.class.clone()));
+        let name = BxValue::new_ptr(
+            self.string_new(component.class.rsplit('.').next().unwrap().to_string()),
+        );
         self.struct_set(record, "name", name);
         self.struct_set(record, "target", target);
         self.struct_set(
@@ -204,6 +216,18 @@ impl VM {
             self.struct_set(registry, alias, BxValue::new_ptr(record));
         }
         Ok(())
+    }
+
+    pub(crate) fn execution_components(&self) -> Vec<BxValue> {
+        self.get_global(COMPONENT_STACK)
+            .and_then(|value| value.as_gc_id())
+            .map(|id| {
+                (0..self.array_len(id))
+                    .rev()
+                    .map(|index| self.array_get(id, index))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn component_names(&self) -> Vec<String> {
@@ -246,13 +270,21 @@ impl VM {
             body
         };
         let target = self.struct_get(record, "target");
-        let context = self.call_function("getBoxContext", vec![], None)?;
+        let context = self.execution_context().map_err(anyhow::Error::msg)?;
         let state = self.struct_new();
         let registered_name = self.struct_get(record, "name");
         self.struct_set(state, "name", registered_name);
         self.struct_set(state, "attributes", attributes);
         let collection = BxValue::new_ptr(self.struct_new());
         self.struct_set(state, "dataCollection", collection);
+        let stack = if let Some(stack) = self.get_global(COMPONENT_STACK) {
+            stack.as_gc_id().unwrap()
+        } else {
+            let stack = BxValue::new_ptr(self.array_new());
+            self.insert_global(COMPONENT_STACK.into(), stack);
+            stack.as_gc_id().unwrap()
+        };
+        self.array_push(stack, BxValue::new_ptr(state));
         let result = self.call_method_value_named(
             target,
             "invoke",
@@ -263,7 +295,9 @@ impl VM {
                 "body".into(),
                 "executionState".into(),
             ],
-        )?;
+        );
+        self.array_pop(stack).expect("balanced component stack");
+        let result = result?;
         if !result.is_null()
             && !result.as_gc_id().is_some_and(|id| match self.heap.get(id) {
                 GcObject::NativeObject(object) => object

@@ -5,6 +5,15 @@ use std::{cell::RefCell, rc::Rc};
 
 const POINTS: &str = "__mb_interception_points";
 const STATES: &str = "__mb_interceptor_states";
+const BUILTIN_POINTS: &[&str] = &[
+    "preModuleLoad",
+    "postModuleLoad",
+    "preModuleUnload",
+    "postModuleUnload",
+    "preFunctionInvoke",
+    "postFunctionInvoke",
+    "onFunctionException",
+];
 
 impl VM {
     fn interception_registry(&mut self, name: &str) -> usize {
@@ -22,10 +31,37 @@ impl VM {
     }
 
     pub(crate) fn interception_points(&self) -> Vec<String> {
-        self.get_global(POINTS)
+        let mut points: Vec<String> = BUILTIN_POINTS.iter().map(|name| (*name).into()).collect();
+        if let Some(id) = self.get_global(POINTS).and_then(|value| value.as_gc_id()) {
+            for name in self.struct_key_array(id) {
+                if !points.iter().any(|point| point.eq_ignore_ascii_case(&name)) {
+                    points.push(name);
+                }
+            }
+        }
+        points
+    }
+
+    pub(crate) fn has_interception_state(&self, name: &str) -> bool {
+        self.get_global(STATES)
             .and_then(|value| value.as_gc_id())
-            .map(|id| self.struct_key_array(id))
-            .unwrap_or_default()
+            .and_then(|id| self.struct_get(id, name).as_gc_id())
+            .is_some_and(|id| self.array_len(id) != 0)
+    }
+
+    pub(crate) fn announce_event(
+        &mut self,
+        name: &str,
+        fields: &[(&str, BxValue)],
+    ) -> Result<(), String> {
+        if !self.has_interception_state(name) {
+            return Ok(());
+        }
+        let data = self.struct_new();
+        for (key, value) in fields {
+            self.struct_set(data, key, *value);
+        }
+        self.announce(name, BxValue::new_ptr(data))
     }
 
     pub(crate) fn register_interceptor(&mut self, target: BxValue) -> Result<(), String> {
@@ -33,11 +69,21 @@ impl VM {
             return Err("Interceptor must be a BoxLang class instance".into());
         }
         let points = self.interception_points();
-        let GcObject::Instance(instance) = self.heap.get(target.as_gc_id().unwrap()) else { unreachable!() };
+        let GcObject::Instance(instance) = self.heap.get(target.as_gc_id().unwrap()) else {
+            unreachable!()
+        };
         // JVM class metadata discovers declared functions, not inherited handlers.
-        let names: Vec<_> = instance.class.borrow().methods.iter()
-            .filter(|(name, method)| method.modifiers.interception_point || points.iter().any(|point| point.eq_ignore_ascii_case(name)))
-            .map(|(name, _)| name.clone()).collect();
+        let names: Vec<_> = instance
+            .class
+            .borrow()
+            .methods
+            .iter()
+            .filter(|(name, method)| {
+                method.modifiers.interception_point
+                    || points.iter().any(|point| point.eq_ignore_ascii_case(name))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
         self.append_interception_points(names.clone());
         let states = self.interception_registry(STATES);
         for name in names {
@@ -88,10 +134,7 @@ impl VM {
             .map(|value| self.heap.retain_value(value))
             .collect::<Result<Vec<_>, _>>()?;
         let _data = self.heap.retain_value(data)?;
-        // ponytail: existing MatchBoxContext, add context methods when an interceptor needs them.
-        let context = self
-            .call_function("getBoxContext", vec![], None)
-            .map_err(|error| error.to_string())?;
+        let context = self.execution_context()?;
         let _context = self.heap.retain_value(context)?;
         for target in observers {
             let target = self.heap.read_retained_value(&target)?;

@@ -1976,6 +1976,130 @@ fn component_body_results_trace_return_values_across_collections() {
 }
 
 #[test]
+fn component_and_interceptor_contexts_expose_live_caller_scopes_and_active_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"class {
+        function configure() { customInterceptionPoints = ["contextProbe"]; }
+        function contextProbe(data, context) {
+            if (context.getScopeNearby("arguments").seed != data.seed) { throw "Announce context is not the caller"; }
+            context.getScopeNearby("local").seen = true;
+        }
+    }"#).unwrap();
+    fs::write(module.join("components/ContextFrame.bx"), r#"@RequiresBody(true) class {
+        function invoke(context, attributes, body, executionState) {
+            var states = context.getComponents();
+            if (context.findClosestComponent("ContextFrame") != executionState || (attributes.depth == 2 && context.findClosestComponent("ContextFrame", 1) != states[2])) { throw "Closest component did not find ancestors"; }
+            if (arrayLen(states) != attributes.depth || states[1] != executionState || states[1].name != "ContextFrame") { throw "Component states are not live or ordered"; }
+            context.writeToBuffer("<");
+            var result = processBody(context, body, newBuffer());
+            context.writeToBuffer(">");
+            return result;
+        }
+    }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"function probe(seed = 7) {
+        var context = getBoxContext();
+        var seen = false;
+        boxAnnounce("contextProbe", {seed:seed});
+        if (!seen) { throw "Caller local was not updated"; }
+        bx:contextFrame depth=1 {
+            if (getBoxContext() != context) { throw "Body did not retain declaring context"; }
+            bx:contextFrame depth=2 { if (getBoxContext() != context) { throw "Nested body context changed"; } }
+        }
+        if (arrayLen(context.getComponents()) != 0) { throw "Component context leaked"; }
+        try { bx:contextFrame depth=1 { throw "body failure"; } } catch(any error) {}
+        if (arrayLen(context.getComponents()) != 0) { throw "Component state leaked on failure"; }
+    }
+    probe();
+    println("component contexts OK");"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "<><component contexts OK\n");
+}
+
+#[test]
+fn retained_execution_contexts_keep_live_scopes_and_callbacks_across_gc() {
+    let mut vm = VM::new();
+    let source = include_str!("scripts/vm_execution_contexts.bxs");
+    let ast = matchbox_compiler::parser::parse(source, None).unwrap();
+    let chunk = matchbox_compiler::compiler::Compiler::new("context-gc.bxs").compile(&ast, source).unwrap();
+    vm.interpret_sync(chunk).unwrap();
+    vm.insert_global("readerReference".into(), BxValue::new_null());
+    vm.insert_global("keepContext".into(), BxValue::new_null());
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    let context = vm.get_global("savedContext").unwrap();
+    let local = BxValue::new_ptr(vm.string_new("local".into()));
+    let scope = vm.call_method_value(context, "getScopeNearby", vec![local]).unwrap().as_gc_id().unwrap();
+    let callback = vm.struct_get(scope, "reader");
+    let result = vm.call_method_value(context, "invokeFunction", vec![callback]).unwrap();
+    assert_eq!(result.as_number(), 16.0);
+    assert_eq!(vm.struct_get(scope, "count").as_number(), 16.0);
+    vm.insert_global("savedContext".into(), BxValue::new_null());
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    assert!(vm.heap.get_opt(context.as_gc_id().unwrap()).is_none());
+    assert!(vm.heap.get_opt(scope).is_none());
+}
+
+#[test]
+fn module_lifecycle_interception_points_emit_live_records_in_dependency_order() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["watcher", "worker"] { fs::create_dir(dir.path().join(name)).unwrap(); }
+    fs::write(dir.path().join("watcher/ModuleConfig.bx"), r#"class {
+        this.events = [];
+        function onLoad() { if (!interceptorService.hasInterceptionPoint("preModuleLoad") || !interceptorService.hasInterceptionPoint("postModuleUnload")) { throw "Built-in lifecycle points missing"; } }
+        function preModuleLoad(data) { this.events.append("pre:" & data.moduleName & ":" & data.moduleRecord.isActivated()); }
+        function postModuleLoad(data) { this.events.append("post:" & data.moduleName & ":" & data.moduleRecord.isActivated()); }
+        function preModuleUnload(data) { this.events.append("unload:" & data.moduleName & ":" & data.moduleRecord.isActivated()); }
+        function postModuleUnload(data) { this.events.append("unloaded:" & data.moduleName & ":" & data.moduleRecord.isActivated()); }
+        function onUnload() { println(arrayToList(this.events)); }
+    }"#).unwrap();
+    fs::write(dir.path().join("worker/ModuleConfig.bx"), r#"class { this.dependencies = ["watcher"]; }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), "println(\"application\");").unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "worker", "--module", "watcher"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "application\npost:watcher:true,pre:worker:false,post:worker:true,unload:worker:true,unloaded:worker:false,unload:watcher:true\n");
+}
+
+#[test]
+fn function_interception_mutates_arguments_results_and_observes_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(&module).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"class {
+        this.events = [];
+        function preFunctionInvoke(data) {
+            if (data.name == "probe") {
+                if (data.context.getScopeNearby("arguments") != data.arguments || !isCustomFunction(data.function)) { throw "Function event context missing"; }
+                data.arguments.value += 1;
+                this.events.append("pre");
+            }
+        }
+        function postFunctionInvoke(data) { if (data.name == "probe") { this.events.append("post"); data.result += 1; } }
+        function onFunctionException(data) { if (data.name == "probeFailure") { this.events.append("error:" & data.exception.message); } }
+        function onUnload() { println(arrayToList(this.events)); }
+    }"#).unwrap();
+    let source = format!("{}\n{}", r#"function probe(value = 40) { return value; }
+        function probeFailure() { throw "observed failure"; }
+        if (probe(value=40) != 42 || probe() != 42) { throw "Function interception did not change default/named arguments and results"; }
+        try { probeFailure(); } catch(any error) { if (!find("observed failure", error.message)) { throw error; } }
+        println("function events OK");"#, include_str!("scripts/vm_execution_contexts.bxs"));
+    fs::write(dir.path().join("app.bxs"), source).unwrap();
+    let expected = "function events OK\ncontext scopes OK\npre,post,pre,post,error:observed failure\n";
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(&module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap()] {
+        success(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+}
+
+#[test]
 fn component_body_errors_restore_output_and_root_return_stops_execution() {
     let dir = tempfile::tempdir().unwrap();
     let module = dir.path().join("module");

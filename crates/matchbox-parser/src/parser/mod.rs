@@ -104,8 +104,7 @@ pub fn parse(source: &str, filename: Option<&str>) -> Result<Vec<Statement>> {
     }
 }
 
-/// Editor inspection keeps completed top-level statements and reports every recovered error.
-/// ponytail: recovery synchronizes at statement boundaries; preserve incomplete nested nodes when the parser gains error nodes.
+/// Editor inspection retains valid statements within their original scopes and reports recovered errors.
 pub fn parse_recover(source: &str, filename: Option<&str>) -> (Vec<Statement>, Vec<ParseError>) {
     let lexed = lex(source);
     let mut errors: Vec<_> = lexed.errors().iter().map(|(span, message)|
@@ -113,23 +112,9 @@ pub fn parse_recover(source: &str, filename: Option<&str>) -> (Vec<Statement>, V
     let tokens: Vec<_> = lexed.tokens().iter().copied().filter(|token|
         !lexed.errors().iter().any(|(span, _)| token.span.start >= span.start && token.span.start < span.end)).collect();
     let mut parser = Parser::new(source, &tokens, filename);
-    let mut statements = Vec::new();
-    while parser.peek_kind().is_some() {
-        let start = parser.pos;
-        match parser.parse_statement() {
-            Ok(statement) => statements.push(statement),
-            Err(error) => {
-                errors.push(error.downcast_ref::<ParseError>().cloned()
-                    .unwrap_or_else(|| parser.error_current(error.to_string())));
-                parser.pos = parser.pos.max(start + 1);
-                while let Some(kind) = parser.peek_kind() {
-                    if matches!(kind, TokenKind::Function | TokenKind::Class | TokenKind::Var | TokenKind::Return) { break; }
-                    parser.pos += 1;
-                    if matches!(kind, TokenKind::Semicolon | TokenKind::RightBrace) { break; }
-                }
-            }
-        }
-    }
+    parser.issues = Some(Vec::new());
+    let statements = parser.parse_program().expect("recovery records statement errors");
+    errors.extend(parser.issues.take().unwrap());
     (statements, errors)
 }
 
@@ -177,11 +162,12 @@ struct Parser<'a> {
     tokens: &'a [SyntaxToken],
     pos: usize,
     filename: Option<&'a str>,
+    issues: Option<Vec<ParseError>>,
 }
 
 impl<'a> Parser<'a> {
     fn new(source: &'a str, tokens: &'a [SyntaxToken], filename: Option<&'a str>) -> Self {
-        Self { source, tokens, pos: 0, filename }
+        Self { source, tokens, pos: 0, filename, issues: None }
     }
 
     fn kind(&self, offset: usize) -> Option<TokenKind> {
@@ -367,9 +353,51 @@ impl<'a> Parser<'a> {
     fn parse_program(&mut self) -> Result<Vec<Statement>> {
         let mut stmts = Vec::new();
         while self.peek_kind().is_some() {
-            stmts.push(self.parse_statement()?);
+            let start = self.pos;
+            match self.parse_statement() {
+                Ok(statement) => stmts.push(statement),
+                Err(error) => self.recover_statement(error, start, false)?,
+            }
         }
         Ok(stmts)
+    }
+
+    fn record_issue(&mut self, error: anyhow::Error) -> Result<()> {
+        if self.issues.is_none() { return Err(error); }
+        let issue = error.downcast_ref::<ParseError>().cloned()
+            .unwrap_or_else(|| self.error_current(error.to_string()));
+        self.issues.as_mut().unwrap().push(issue);
+        Ok(())
+    }
+
+    fn recover_statement(&mut self, error: anyhow::Error, start: usize, in_block: bool) -> Result<()> {
+        self.record_issue(error)?;
+        // Rescan the failed statement so consumed delimiters cannot steal the enclosing brace.
+        self.pos = start;
+        let mut braces = 0usize;
+        let mut parens = 0usize;
+        let mut brackets = 0usize;
+        while let Some(kind) = self.peek_kind() {
+            if braces == 0 && kind == TokenKind::RightBrace {
+                if !in_block { self.pos += 1; }
+                break;
+            }
+            if braces == 0 && parens == 0 && brackets == 0 {
+                if kind == TokenKind::Semicolon { self.pos += 1; break; }
+                if self.pos > start && matches!(kind, TokenKind::Function | TokenKind::Class | TokenKind::Var | TokenKind::Return) { break; }
+            }
+            match kind {
+                TokenKind::LeftBrace => braces += 1,
+                TokenKind::RightBrace => braces = braces.saturating_sub(1),
+                TokenKind::LeftParen => parens += 1,
+                TokenKind::RightParen => parens = parens.saturating_sub(1),
+                TokenKind::LeftBracket => brackets += 1,
+                TokenKind::RightBracket => brackets = brackets.saturating_sub(1),
+                _ => {},
+            }
+            self.pos += 1;
+        }
+        Ok(())
     }
 
     fn parse_statement(&mut self) -> Result<Statement> {
@@ -612,7 +640,7 @@ impl<'a> Parser<'a> {
 
         self.expect(TokenKind::LeftBrace)?;
         let mut members = Vec::new();
-        while !self.peek_is(TokenKind::RightBrace) {
+        while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
             if self.peek_is(TokenKind::Property) {
                 self.pos += 1; // property
                 let mut prop_name = self.expect_get(TokenKind::Identifier)?;
@@ -625,10 +653,14 @@ impl<'a> Parser<'a> {
                 members.push(ClassMember::Property(prop_name));
                 if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
             } else {
-                members.push(ClassMember::Statement(self.parse_statement()?));
+                let start = self.pos;
+                match self.parse_statement() {
+                    Ok(statement) => members.push(ClassMember::Statement(statement)),
+                    Err(error) => self.recover_statement(error, start, true)?,
+                }
             }
         }
-        self.pos += 1; // }
+        self.close_block()?;
         Ok(Statement::new(
             StatementKind::ClassDecl { name, attributes, modifiers, extends, accessors, implements, members },
             line,
@@ -643,11 +675,7 @@ impl<'a> Parser<'a> {
             String::new()
         };
         self.expect(TokenKind::LeftBrace)?;
-        let mut members = Vec::new();
-        while !self.peek_is(TokenKind::RightBrace) {
-            members.push(self.parse_statement()?);
-        }
-        self.pos += 1; // }
+        let members = self.parse_block()?;
         Ok(Statement::new(StatementKind::InterfaceDecl { name, members }, line))
     }
 
@@ -762,10 +790,21 @@ impl<'a> Parser<'a> {
     fn parse_block(&mut self) -> Result<Vec<Statement>> {
         let mut stmts = Vec::new();
         while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
-            stmts.push(self.parse_statement()?);
+            let start = self.pos;
+            match self.parse_statement() {
+                Ok(statement) => stmts.push(statement),
+                Err(error) => self.recover_statement(error, start, true)?,
+            }
         }
-        self.expect(TokenKind::RightBrace)?;
+        self.close_block()?;
         Ok(stmts)
+    }
+
+    fn close_block(&mut self) -> Result<()> {
+        if let Err(error) = self.expect(TokenKind::RightBrace) {
+            self.record_issue(error.into())?;
+        }
+        Ok(())
     }
 
     fn parse_for(&mut self, line: u32) -> Result<Statement> {
@@ -1993,6 +2032,11 @@ fn parse_string_content(raw: &str, source: &str, offset: usize) -> Vec<StringPar
             continue;
         }
         if chars[i] == '#' {
+            if i + 1 < chars.len() && chars[i + 1] == '#' {
+                text.push('#');
+                i += 2;
+                continue;
+            }
             let closing = chars[i + 1..].iter().position(|character| *character == '#');
             let valid_interpolation = closing.is_some_and(|closing| {
                 let expression: String = chars[i + 1..i + 1 + closing].iter().collect();
@@ -2009,11 +2053,6 @@ fn parse_string_content(raw: &str, source: &str, offset: usize) -> Vec<StringPar
                 continue;
             }
             i += 1;
-            if i < chars.len() && chars[i] == '#' {
-                text.push('#');
-                i += 1;
-                continue;
-            }
             // Interpolation start
             if !text.is_empty() {
                 parts.push(StringPart::Text(std::mem::take(&mut text)));

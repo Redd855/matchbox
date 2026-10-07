@@ -534,6 +534,39 @@ fn capitalize(name: &str) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn recovery_preserves_function_scope_after_an_invalid_statement() {
+        let source = "function edit() { var used=1; var broken=; return used; }";
+        assert!(inspect(source, None, false, false).is_err());
+        let root = inspect(source, None, true, false).unwrap();
+        assert_eq!(root["issues"].as_array().unwrap().len(), 1);
+        assert_eq!(root["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(root["statements"][0]["name"], "edit");
+        assert_eq!(root["statements"][0]["body"].as_array().unwrap().len(), 2);
+        assert_eq!(root["statements"][0]["body"][1]["expression"]["name"], "used");
+    }
+
+    #[test]
+    fn recovery_retains_unclosed_nested_declarations_without_hoisting_locals() {
+        let source = "class Editor { function edit() { var used=1; return used;";
+        assert!(inspect(source, None, false, false).is_err());
+        let root = inspect(source, None, true, false).unwrap();
+        assert_eq!(root["issues"].as_array().unwrap().len(), 2);
+        assert_eq!(root["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(root["statements"][0]["name"], "Editor");
+        let function = &root["statements"][0]["body"][0];
+        assert_eq!(function["name"], "edit");
+        assert_eq!(function["body"].as_array().unwrap().len(), 2);
+        assert_eq!(function["sourceText"], "function edit() { var used=1; return used;");
+    }
+
+    #[test]
+    fn doubled_hashes_remain_literal_text() {
+        let root = inspect("var text='##x##';", None, false, false).unwrap();
+        assert_eq!(root["statements"][0]["expression"]["right"]["ASTType"], "BoxStringLiteral");
+        assert_eq!(root["statements"][0]["expression"]["right"]["value"], "#x#");
+    }
+
+    #[test]
     fn positioned_tree_tokens_and_recovery() {
         let source =
             "// comment\nname = \"😀\"; other = 1 + 2 + 3;\nfunction add(a,b) { return a+b; }";
@@ -570,7 +603,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(recovered["statements"].as_array().unwrap().len(), 2);
+        assert_eq!(recovered["statements"].as_array().unwrap().len(), 3);
         assert_eq!(recovered["issues"].as_array().unwrap().len(), 2);
         assert_eq!(recovered["issues"][0]["filename"], "edit.bxs");
         assert_eq!(

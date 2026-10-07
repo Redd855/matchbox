@@ -16,7 +16,7 @@ Arguments retain the JVM order: `source`, `filepath`, `returnType="struct"`, `so
 - `struct`: a real nested AST rooted at `BoxScript`.
 - `json`: the same exported data as JSON.
 - `text`: original parsed source text; not a formatting/PrettyPrint implementation.
-- Strict parsing throws parse/lexical errors. `recover=true` preserves completed top-level statements and adds `issues` containing message, filename, position and span. It does not fabricate a successful complete tree for malformed input.
+- Strict parsing throws parse/lexical errors. `recover=true` preserves valid statements inside their original function/class/block scopes, including unclosed bodies and adds `issues` containing message, filename, position and span. It does not fabricate a successful complete tree for malformed input.
 - `includeTokens=true` adds source-backed `tokens` and `trivia` (whitespace and comments). Comments are also collected on the root; JVM comment-to-node attachment is not reproduced.
 
 Nodes use `ASTType`, `ASTPackage`, `sourceText`, `comments` and node-specific fields. The exporter is separate from internal Rust enum layouts. Familiar JVM node names/fields are used where retained by the compiler; compiler-only forms use explicit `MatchBox*` names. This is a **bounded exported schema, not exact JVM AST parity**.
@@ -30,7 +30,7 @@ Nodes use `ASTType`, `ASTPackage`, `sourceText`, `comments` and node-specific fi
 
 ## Current boundaries
 
-The compiler AST loses some original syntax: compound assignments and some unary forms are desugared; assignment targets, parameters, properties, argument names, annotations and other synthesized nodes do not yet all retain individual spans. Recovery currently synchronizes at top-level statement boundaries and discards incomplete nested declarations. Full source-preserving node/schema parity requires further frontend work.
+The compiler AST loses some original syntax: compound assignments and some unary forms are desugared; assignment targets, parameters, properties, argument names, annotations and other synthesized nodes do not yet all retain individual spans. Recovery skips invalid statements at balanced boundaries and reports missing closing braces without inventing tokens. Incomplete declaration headers and malformed class properties are not yet retained. Full source-preserving node/schema parity requires further frontend work.
 
 `sourceType="template"`, `"cfscript"` and `"cftemplate"` currently fail explicitly. In particular, the template compiler currently fabricates loop/condition/function data; exposing those results as faithful analysis would be incorrect. Existing template compilation remains available and is not certified by the inspection API.
 

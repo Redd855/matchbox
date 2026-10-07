@@ -84,6 +84,9 @@ pub fn parse_bxm(source: &str, filename: Option<&str>) -> Result<Vec<Statement>>
 
 pub fn parse(source: &str, filename: Option<&str>) -> Result<Vec<Statement>> {
     let lexed = lex(source);
+    if let Some((span, message)) = lexed.errors().first() {
+        return Err(ParseError::new(filename, *span, message).with_source(source).into());
+    }
     match Parser::new(source, lexed.tokens(), filename).parse_program() {
         Ok(stmts) => Ok(stmts),
         Err(err) => {
@@ -99,6 +102,35 @@ pub fn parse(source: &str, filename: Option<&str>) -> Result<Vec<Statement>> {
             Err(err)
         }
     }
+}
+
+/// Editor inspection keeps completed top-level statements and reports every recovered error.
+/// ponytail: recovery synchronizes at statement boundaries; preserve incomplete nested nodes when the parser gains error nodes.
+pub fn parse_recover(source: &str, filename: Option<&str>) -> (Vec<Statement>, Vec<ParseError>) {
+    let lexed = lex(source);
+    let mut errors: Vec<_> = lexed.errors().iter().map(|(span, message)|
+        ParseError::new(filename, *span, message).with_source(source)).collect();
+    let tokens: Vec<_> = lexed.tokens().iter().copied().filter(|token|
+        !lexed.errors().iter().any(|(span, _)| token.span.start >= span.start && token.span.start < span.end)).collect();
+    let mut parser = Parser::new(source, &tokens, filename);
+    let mut statements = Vec::new();
+    while parser.peek_kind().is_some() {
+        let start = parser.pos;
+        match parser.parse_statement() {
+            Ok(statement) => statements.push(statement),
+            Err(error) => {
+                errors.push(error.downcast_ref::<ParseError>().cloned()
+                    .unwrap_or_else(|| parser.error_current(error.to_string())));
+                parser.pos = parser.pos.max(start + 1);
+                while let Some(kind) = parser.peek_kind() {
+                    if matches!(kind, TokenKind::Function | TokenKind::Class | TokenKind::Var | TokenKind::Return) { break; }
+                    parser.pos += 1;
+                    if matches!(kind, TokenKind::Semicolon | TokenKind::RightBrace) { break; }
+                }
+            }
+        }
+    }
+    (statements, errors)
 }
 
 /// Parse `source` as if it began at `line_offset` blank lines. Used by the
@@ -173,28 +205,22 @@ impl<'a> Parser<'a> {
     /// is one past the end of the last token so the caret sits at true
     /// end-of-input rather than re-pointing at the previously-consumed token.
     fn current_span(&self) -> Span {
-        if let Some(tok) = self.tokens.get(self.pos) {
-            return tok.span;
+        self.tokens.get(self.pos).map(|token| token.span)
+            .unwrap_or_else(|| Span::at(self.source, self.source.len(), self.source.len()))
+    }
+
+    fn span_since(&self, start: usize) -> Span {
+        let mut span = self.tokens.get(start).map(|token| token.span)
+            .unwrap_or_else(|| self.current_span());
+        if self.pos > start {
+            if let Some(last) = self.tokens.get(self.pos.saturating_sub(1)) { span.end = last.span.end; }
         }
-        // No current token: synthesize an EOF span just past the last token.
-        let eof_byte = self.source.len();
-        match self.tokens.last() {
-            Some(last) => {
-                let last_len = last.span.end.saturating_sub(last.span.start) as u32;
-                Span {
-                    start: eof_byte,
-                    end: eof_byte,
-                    line: last.span.line,
-                    col: last.span.col.saturating_add(last_len),
-                }
-            }
-            None => Span {
-                start: eof_byte,
-                end: eof_byte,
-                line: 1,
-                col: 1,
-            },
-        }
+        span
+    }
+
+    fn span_from(&self, mut span: Span) -> Span {
+        if let Some(last) = self.tokens.get(self.pos.saturating_sub(1)) { span.end = last.span.end; }
+        span
     }
 
     fn peek_is(&self, kind: TokenKind) -> bool {
@@ -347,6 +373,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Statement> {
+        let start = self.pos;
+        let statement = self.parse_statement_inner()?;
+        Ok(statement.with_span(self.span_since(start)))
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Statement> {
         let line = self.peek_line();
 
         if self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon) {
@@ -360,7 +392,7 @@ impl<'a> Parser<'a> {
                 self.parse_class(line)
             }
             Some(TokenKind::Interface) => self.parse_interface(line),
-            Some(TokenKind::Function) | Some(TokenKind::At)
+            Some(TokenKind::Function) | Some(TokenKind::At) | Some(TokenKind::Identifier)
             | Some(TokenKind::Public) | Some(TokenKind::Private)
             | Some(TokenKind::Remote) | Some(TokenKind::Package)
             | Some(TokenKind::Static) | Some(TokenKind::Abstract) | Some(TokenKind::Final)
@@ -732,7 +764,7 @@ impl<'a> Parser<'a> {
         while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
             stmts.push(self.parse_statement()?);
         }
-        self.pos += 1; // }
+        self.expect(TokenKind::RightBrace)?;
         Ok(stmts)
     }
 
@@ -829,6 +861,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for_init(&mut self) -> Result<Statement> {
+        let start = self.pos;
         if self.peek_is(TokenKind::Var) {
             let line = self.peek_line();
             self.pos += 1; // var
@@ -838,11 +871,11 @@ impl<'a> Parser<'a> {
             return Ok(Statement::new(
                 StatementKind::VariableDecl { name, value },
                 line,
-            ));
+            ).with_span(self.span_since(start)));
         }
         // Assignment or expression (don't consume trailing semicolon)
         let expr = self.parse_expression()?;
-        Ok(Statement::new(StatementKind::Expression(expr), self.peek_line()))
+        Ok(Statement::new(StatementKind::Expression(expr), self.peek_line()).with_span(self.span_since(start)))
     }
 
     fn parse_for_body(&mut self) -> Result<Vec<Statement>> {
@@ -1242,7 +1275,9 @@ impl<'a> Parser<'a> {
     // ---- Expression parser (Pratt) ----
 
     fn parse_expression(&mut self) -> Result<Expression> {
-        self.parse_assignment_or_conditional()
+        let start = self.pos;
+        let expression = self.parse_assignment_or_conditional()?;
+        Ok(expression.with_span(self.span_since(start)))
     }
 
     fn parse_assignment_or_conditional(&mut self) -> Result<Expression> {
@@ -1276,13 +1311,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expression> {
+        let start = self.pos;
         let line = self.peek_line();
         let left = self.parse_unary()?;
-
-        self.parse_binary_tail(left, min_prec, line)
+        let expression = self.parse_binary_tail(left, min_prec, line)?;
+        Ok(expression.with_span(self.span_since(start)))
     }
 
     fn parse_binary_tail(&mut self, mut left: Expression, min_prec: u8, line: u32) -> Result<Expression> {
+        let start_span = left.span.unwrap_or_else(|| self.current_span());
         loop {
             if let Some((op_prec, op, consume)) = self.phrase_operator() {
                 if op_prec < min_prec {
@@ -1320,7 +1357,7 @@ impl<'a> Parser<'a> {
                 left = Expression::new(
                     ExpressionKind::Binary { left: Box::new(left), operator: op, right: Box::new(right) },
                     line,
-                );
+                ).with_span(self.span_from(start_span));
                 continue;
             }
 
@@ -1392,7 +1429,7 @@ impl<'a> Parser<'a> {
             left = Expression::new(
                 ExpressionKind::Binary { left: Box::new(left), operator: op, right: Box::new(right) },
                 line,
-            );
+            ).with_span(self.span_from(start_span));
         }
 
         // Check for simple assignment after primary
@@ -1422,6 +1459,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expression> {
+        let start = self.pos;
+        let expression = self.parse_unary_inner()?;
+        Ok(expression.with_span(self.span_since(start)))
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expression> {
         let line = self.peek_line();
         match self.peek_kind() {
             Some(TokenKind::Bang) => {
@@ -1465,6 +1508,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix(&mut self) -> Result<Expression> {
+        let start = self.pos;
         let line = self.peek_line();
         let mut expr = self.parse_primary()?;
 
@@ -1509,12 +1553,19 @@ impl<'a> Parser<'a> {
                 }
                 _ => break,
             }
+            expr = expr.with_span(self.span_since(start));
         }
 
         Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expression> {
+        let start = self.pos;
+        let expression = self.parse_primary_inner()?;
+        Ok(expression.with_span(self.span_since(start)))
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expression> {
         let line = self.peek_line();
 
         match self.peek_kind() {
@@ -1541,8 +1592,9 @@ impl<'a> Parser<'a> {
                 Ok(Expression::new(ExpressionKind::Identifier(name), line))
             }
             Some(TokenKind::String) => {
+                let offset = self.current_span().start;
                 let lexeme = self.advance_lexeme().unwrap_or_default();
-                let parts = parse_string_content(&lexeme);
+                let parts = parse_string_content(&lexeme, self.source, offset);
                 Ok(Expression::new(ExpressionKind::Literal(Literal::String(parts)), line))
             }
             Some(TokenKind::StringStart) => {
@@ -1925,7 +1977,7 @@ impl<'a> Parser<'a> {
 }
 
 // Parse string content (between quotes) into StringParts, handling #expr# interpolation
-fn parse_string_content(raw: &str) -> Vec<StringPart> {
+fn parse_string_content(raw: &str, source: &str, offset: usize) -> Vec<StringPart> {
     let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { return vec![]; };
     let quote = raw.chars().next().unwrap_or('"');
 
@@ -1966,6 +2018,7 @@ fn parse_string_content(raw: &str) -> Vec<StringPart> {
             if !text.is_empty() {
                 parts.push(StringPart::Text(std::mem::take(&mut text)));
             }
+            let expression_start = i;
             let mut expr = String::new();
             while i < chars.len() {
                 if chars[i] == '"' {
@@ -2004,7 +2057,17 @@ fn parse_string_content(raw: &str) -> Vec<StringPart> {
             }
             if !expr.is_empty() {
                 let lexed = crate::tokenizer::lex(&expr);
-                let mut p = Parser::new(&expr, lexed.tokens(), None);
+                let base = offset + 1 + chars[..expression_start].iter().map(|ch| ch.len_utf8()).sum::<usize>();
+                let origin = Span::at(source, base, base);
+                let tokens: Vec<_> = lexed.tokens().iter().map(|token| {
+                    let mut token = *token;
+                    token.span.start += base;
+                    token.span.end += base;
+                    if token.span.line == 1 { token.span.col += origin.col - 1; }
+                    token.span.line += origin.line - 1;
+                    token
+                }).collect();
+                let mut p = Parser::new(source, &tokens, None);
                 if let Ok(e) = p.parse_expression() {
                     parts.push(StringPart::Expression(e));
                 }
@@ -2047,7 +2110,7 @@ fn expr_to_assignment_target(expr: &Expression) -> Result<AssignmentTarget> {
         }),
         _ => {
             // No parser context here; report against the expression's line.
-            let span = Span { start: 0, end: 0, line: expr.line, col: 1 };
+            let span = expr.span.unwrap_or(Span { start: 0, end: 0, line: expr.line, col: 1 });
             Err(ParseError::new(None, span, "invalid assignment target").into())
         }
     }
@@ -2099,6 +2162,13 @@ mod tests {
     }
 
     #[test]
+    fn typed_function_without_access_modifier() {
+        let ast = parse("numeric function answer() { return 42; }", None).unwrap();
+        assert_eq!(ast.len(), 1);
+        assert!(matches!(&ast[0].kind, StatementKind::FunctionDecl { return_type: Some(name), .. } if name == "numeric"));
+    }
+
+    #[test]
     fn parse_function_decl() {
         let ast = parse("function foo(x) { return x; }\n", None).unwrap();
         assert_eq!(ast.len(), 1);
@@ -2125,6 +2195,9 @@ mod tests {
         let ast = parse("for (var i = 0; i < 10; i = i + 1) { }\n", None).unwrap();
         assert_eq!(ast.len(), 1);
         assert!(matches!(ast[0].kind, StatementKind::ForClassic { .. }));
+        if let StatementKind::ForClassic { init: Some(init), .. } = &ast[0].kind {
+            assert_eq!((init.span.unwrap().start, init.span.unwrap().end), (5, 14));
+        }
     }
 
     #[test]
@@ -2231,7 +2304,7 @@ mod tests {
     fn preserves_backslash_sequences_in_string_literals() {
         let source = format!("{}{}{}{}", '"', char::from(92), 'n', '"');
         assert_eq!(
-            parse_string_content(&source),
+            parse_string_content(&source, &source, 0),
             vec![StringPart::Text(format!("{}{}", char::from(92), 'n'))]
         );
     }
@@ -2240,7 +2313,7 @@ mod tests {
     fn collapses_doubled_string_delimiters() {
         let source = format!("{}he{}{}llo{}", '"', '"', '"', '"');
         assert_eq!(
-            parse_string_content(&source),
+            parse_string_content(&source, &source, 0),
             vec![StringPart::Text("he\"llo".to_string())]
         );
     }

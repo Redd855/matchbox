@@ -1,0 +1,581 @@
+//! Public AST data, independent of Rust enum layouts. BoxLang-style names/fields
+//! are used where the compiler AST retains them; compiler-only forms are namespaced.
+use crate::{
+    ast::*,
+    parser,
+    tokenizer::{Span, TriviaKind, lex},
+};
+use serde_json::{Value, json};
+
+pub fn inspect(
+    source: &str,
+    filename: Option<&str>,
+    recover: bool,
+    include_tokens: bool,
+) -> anyhow::Result<Value> {
+    let (statements, issues) = if recover {
+        parser::parse_recover(source, filename)
+    } else {
+        (parser::parse(source, filename)?, Vec::new())
+    };
+    let export = Export::new(source);
+    let lexed = lex(source);
+    let mut root = export.node(
+        "BoxScript",
+        Some(Span::at(source, 0, source.len())),
+        json!({"statements": export.statements(&statements)}),
+    );
+    root["comments"] = json!(
+        lexed
+            .trivia()
+            .iter()
+            .filter(|trivia| trivia.kind != TriviaKind::Whitespace)
+            .map(|trivia| {
+                export.node(
+                    if trivia.kind == TriviaKind::LineComment {
+                        "BoxSingleLineComment"
+                    } else {
+                        "BoxMultiLineComment"
+                    },
+                    Some(trivia.span),
+                    json!({"commentText": lexed.text(trivia.span)}),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+    if recover {
+        root["issues"] = json!(issues.iter().map(|issue| json!({"message": issue.message, "filename": issue.filename, "position": export.position(issue.span), "span": {"start":issue.span.start,"end":issue.span.end}})).collect::<Vec<_>>());
+    }
+    if include_tokens {
+        root["tokens"] = json!(lexed.tokens().iter().map(|token| json!({"kind":token.kind.to_string(), "text":lexed.text(token.span), "position":export.position(token.span), "span":{"start":token.span.start,"end":token.span.end}})).collect::<Vec<_>>());
+        root["trivia"] = json!(lexed.trivia().iter().map(|trivia| json!({"kind":match trivia.kind {TriviaKind::Whitespace=>"whitespace", TriviaKind::LineComment=>"lineComment", TriviaKind::BlockComment=>"blockComment"}, "text":lexed.text(trivia.span), "position":export.position(trivia.span), "span":{"start":trivia.span.start,"end":trivia.span.end}})).collect::<Vec<_>>());
+    }
+    Ok(root)
+}
+
+struct Export<'a> {
+    source: &'a str,
+    lines: Vec<usize>,
+}
+impl<'a> Export<'a> {
+    fn new(source: &'a str) -> Self {
+        let mut lines = vec![0];
+        lines.extend(source.match_indices('\n').map(|(index, _)| index + 1));
+        Self { source, lines }
+    }
+    fn point(&self, offset: usize) -> Value {
+        let line = self.lines.partition_point(|start| *start <= offset) - 1;
+        // ponytail: per-line UTF-16 scans; cache column offsets if minified inputs dominate.
+        json!({"line": line + 1, "column": self.source[self.lines[line]..offset].encode_utf16().count()})
+    }
+    fn position(&self, span: Span) -> Value {
+        json!({"start":self.point(span.start), "end":self.point(span.end)})
+    }
+    fn node(&self, kind: &str, span: Option<Span>, mut fields: Value) -> Value {
+        fields["ASTType"] = json!(kind);
+        let package = if kind.starts_with("MatchBox") {
+            "matchbox.parser"
+        } else if matches!(kind, "BoxScript" | "BoxClass" | "BoxInterface") {
+            "ortus.boxlang.compiler.ast"
+        } else if kind.ends_with("Comment") {
+            "ortus.boxlang.compiler.ast.comment"
+        } else if matches!(
+            kind,
+            "BoxExpressionStatement"
+                | "BoxFunctionDeclaration"
+                | "BoxReturn"
+                | "BoxThrow"
+                | "BoxRethrow"
+                | "BoxBreak"
+                | "BoxContinue"
+                | "BoxIfElse"
+                | "BoxWhile"
+                | "BoxDo"
+                | "BoxForIn"
+                | "BoxForIndex"
+                | "BoxImport"
+                | "BoxStatementBlock"
+                | "BoxTry"
+                | "BoxAssert"
+                | "BoxInclude"
+                | "BoxParam"
+                | "BoxSwitch"
+                | "BoxBufferOutput"
+                | "BoxComponent"
+                | "BoxArgumentDeclaration"
+                | "BoxReturnType"
+                | "BoxProperty"
+        ) {
+            "ortus.boxlang.compiler.ast.statement"
+        } else {
+            "ortus.boxlang.compiler.ast.expression"
+        };
+        fields["ASTPackage"] = json!(package);
+        fields["sourceText"] = span
+            .map(|span| json!(&self.source[span.start..span.end]))
+            .unwrap_or(Value::Null);
+        fields["comments"] = json!([]);
+        if let Some(span) = span {
+            fields["position"] = self.position(span);
+            fields["span"] = json!({"start":span.start,"end":span.end});
+        }
+        fields
+    }
+    fn statements(&self, body: &[Statement]) -> Value {
+        json!(
+            body.iter()
+                .map(|stmt| self.statement(stmt))
+                .collect::<Vec<_>>()
+        )
+    }
+    fn optional(&self, expr: &Option<Expression>) -> Value {
+        expr.as_ref()
+            .map(|expr| self.expression(expr))
+            .unwrap_or(Value::Null)
+    }
+    fn block(&self, body: &[Statement]) -> Value {
+        let span = body
+            .first()
+            .and_then(|first| first.span)
+            .zip(body.last().and_then(|last| last.span))
+            .map(|(mut first, last)| {
+                first.end = last.end;
+                first
+            });
+        self.node(
+            "BoxStatementBlock",
+            span,
+            json!({"statements":self.statements(body)}),
+        )
+    }
+    fn params(&self, params: &[FunctionParam]) -> Value {
+        json!(params.iter().map(|param| self.node("BoxArgumentDeclaration", None, json!({"name":param.name,"type":param.type_name,"required":param.required,"value":self.optional(&param.default_value),"annotations":[],"documentation":[]}))).collect::<Vec<_>>())
+    }
+    fn body(&self, body: &FunctionBody) -> Value {
+        match body {
+            FunctionBody::Block(stmts) | FunctionBody::Component(stmts) => self.statements(stmts),
+            FunctionBody::Expression(expr) => json!([self.node(
+                "BoxReturn",
+                expr.span,
+                json!({"expression":self.expression(expr)})
+            )]),
+            FunctionBody::Abstract => Value::Null,
+        }
+    }
+    fn args(&self, args: &[Argument]) -> Value {
+        json!(args.iter().map(|arg| self.node("BoxArgument", arg.value.span, json!({"name":arg.name.as_ref().map(|name| self.node("BoxIdentifier",None,json!({"name":name}))),"value":self.expression(&arg.value)}))).collect::<Vec<_>>())
+    }
+    fn attributes(&self, attributes: &[Attribute]) -> Value {
+        json!(
+            attributes
+                .iter()
+                .map(|attr| self.node(
+                    "BoxAnnotation",
+                    None,
+                    json!({"key":attr.name,"value":self.args(&attr.args)})
+                ))
+                .collect::<Vec<_>>()
+        )
+    }
+    fn statement(&self, stmt: &Statement) -> Value {
+        let (kind, fields) = match &stmt.kind {
+            StatementKind::Expression(expr) => (
+                "BoxExpressionStatement",
+                json!({"expression":self.expression(expr)}),
+            ),
+            StatementKind::VariableDecl { name, value } => {
+                let assignment = self.node("BoxAssignment",stmt.span,json!({"left":self.node("BoxIdentifier",None,json!({"name":name})),"right":self.expression(value),"op":self.enum_value("BoxAssignment","Equal"),"modifiers":[self.enum_value("BoxAssignment","Var")]}));
+                ("BoxExpressionStatement", json!({"expression":assignment}))
+            }
+            StatementKind::FunctionDecl {
+                name,
+                attributes,
+                modifiers,
+                return_type,
+                params,
+                body,
+            } => (
+                "BoxFunctionDeclaration",
+                json!({"name":name,"args":self.params(params),"body":self.body(body),"type":return_type.as_ref().map(|name|self.return_type(name)),"accessModifier":modifiers.access.as_ref().map(|name|self.enum_value("BoxFunctionDeclaration",&capitalize(name))),"modifiers":([("Static",modifiers.is_static),("Abstract",modifiers.is_abstract),("Final",modifiers.is_final)].iter().filter(|(_,enabled)|*enabled).map(|(name,_)|self.enum_value("BoxFunctionDeclaration",name)).collect::<Vec<_>>()),"annotations":self.attributes(attributes),"documentation":[]}),
+            ),
+            StatementKind::ClassDecl {
+                name,
+                attributes,
+                modifiers,
+                extends,
+                accessors,
+                implements,
+                members,
+            } => (
+                "BoxClass",
+                json!({"name":name,"extends":extends,"accessors":accessors,"implements":implements,"annotations":self.attributes(attributes),"modifiers":{"abstract":modifiers.is_abstract,"final":modifiers.is_final},"body":members.iter().filter_map(|member|if let ClassMember::Statement(stmt)=member{Some(self.statement(stmt))}else{None}).collect::<Vec<_>>(),"properties":members.iter().filter_map(|member|if let ClassMember::Property(name)=member{Some(self.node("BoxProperty",None,json!({"name":name})))}else{None}).collect::<Vec<_>>() }),
+            ),
+            StatementKind::InterfaceDecl { name, members } => (
+                "BoxInterface",
+                json!({"name":name,"body":self.statements(members)}),
+            ),
+            StatementKind::Import { path, alias } => (
+                "BoxImport",
+                json!({"expression":self.node("BoxFQN",None,json!({"value":path})),"alias":alias.as_ref().map(|name|self.node("BoxIdentifier",None,json!({"name":name})))}),
+            ),
+            StatementKind::Return(expr) => ("BoxReturn", json!({"expression":self.optional(expr)})),
+            StatementKind::Throw(expr) => ("BoxThrow", json!({"expression":self.optional(expr)})),
+            StatementKind::Rethrow => ("BoxRethrow", json!({})),
+            StatementKind::Continue => ("BoxContinue", json!({})),
+            StatementKind::Break => ("BoxBreak", json!({})),
+            StatementKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => (
+                "BoxIfElse",
+                json!({"condition":self.expression(condition),"thenBody":self.block(then_branch),"elseBody":else_branch.as_ref().map(|body|self.block(body))}),
+            ),
+            StatementKind::WhileLoop { condition, body } => (
+                "BoxWhile",
+                json!({"condition":self.expression(condition),"body":self.block(body)}),
+            ),
+            StatementKind::DoWhile { body, condition } => (
+                "BoxDo",
+                json!({"condition":self.expression(condition),"body":self.block(body)}),
+            ),
+            StatementKind::ForLoop {
+                item,
+                index,
+                collection,
+                body,
+            } => (
+                "BoxForIn",
+                json!({"variable":self.node("BoxIdentifier",None,json!({"name":item})),"secondVariable":index,"expression":self.expression(collection),"body":self.block(body)}),
+            ),
+            StatementKind::ForClassic {
+                init,
+                condition,
+                update,
+                body,
+            } => (
+                "BoxForIndex",
+                json!({"initializer":init.as_ref().map(|stmt|self.statement(stmt)),"condition":self.optional(condition),"step":self.optional(update),"body":self.block(body)}),
+            ),
+            StatementKind::TryCatch {
+                try_branch,
+                catches,
+                finally_branch,
+            } => (
+                "BoxTry",
+                json!({"tryBody":self.statements(try_branch),"catches":catches.iter().map(|catch|json!({"exception":catch.exception_var,"body":self.statements(&catch.body)})).collect::<Vec<_>>(),"finallyBody":finally_branch.as_ref().map(|body|self.statements(body))}),
+            ),
+            StatementKind::Switch {
+                value,
+                cases,
+                default_case,
+            } => (
+                "BoxSwitch",
+                json!({"condition":self.expression(value),"cases":cases.iter().map(|case|json!({"condition":self.expression(&case.value),"body":self.statements(&case.body)})).collect::<Vec<_>>(),"defaultBody":default_case.as_ref().map(|body|self.statements(body))}),
+            ),
+            StatementKind::Assert { condition, message } => (
+                "BoxAssert",
+                json!({"expression":self.expression(condition),"message":self.optional(message)}),
+            ),
+            StatementKind::Param { name, default } => (
+                "BoxParam",
+                json!({"name":name,"default":self.optional(default)}),
+            ),
+            StatementKind::Include(expr) => {
+                ("BoxInclude", json!({"expression":self.expression(expr)}))
+            }
+            StatementKind::BufferOutput(expr) => (
+                "BoxBufferOutput",
+                json!({"expression":self.expression(expr)}),
+            ),
+            StatementKind::Not(expr) => (
+                "MatchBoxNotStatement",
+                json!({"expression":self.expression(expr)}),
+            ),
+            StatementKind::Destructure {
+                kind,
+                source,
+                bindings,
+            } => (
+                "MatchBoxDestructure",
+                json!({"kind":match kind{DestructureKind::Array=>"array",DestructureKind::Object=>"object"},"source":self.expression(source),"bindings":bindings}),
+            ),
+            StatementKind::Component {
+                name,
+                attributes,
+                body,
+            } => (
+                "BoxComponent",
+                json!({"name":name,"attributes":attributes.iter().map(|(key,value)|json!({"key":self.expression(key),"value":self.expression(value)})).collect::<Vec<_>>(),"body":body.as_ref().map(|body|self.statements(body))}),
+            ),
+        };
+        self.node(kind, stmt.span, fields)
+    }
+    fn enum_value(&self, kind: &str, name: &str) -> Value {
+        let package = if matches!(kind, "BoxFunctionDeclaration" | "BoxReturnType") {
+            "ortus.boxlang.compiler.ast.statement"
+        } else {
+            "ortus.boxlang.compiler.ast.expression"
+        };
+        json!({"ASTType":kind,"ASTPackage":package,"sourceText":name})
+    }
+    fn return_type(&self, name: &str) -> Value {
+        let known = matches!(
+            name.to_ascii_lowercase().as_str(),
+            "numeric"
+                | "string"
+                | "boolean"
+                | "component"
+                | "interface"
+                | "any"
+                | "array"
+                | "struct"
+                | "query"
+                | "void"
+        );
+        let kind = if known {
+            capitalize(name)
+        } else {
+            "Fqn".into()
+        };
+        self.node("BoxReturnType",None,json!({"type":self.enum_value("BoxReturnType",&kind),"fqn":if known {Value::Null} else {json!(name)}}))
+    }
+    fn binary_operator(&self, operator: &str) -> (&'static str, String) {
+        let (kind, name) = match operator.to_ascii_lowercase().as_str() {
+            "==" => ("BoxComparisonOperation", "Equal"),
+            "!=" => ("BoxComparisonOperation", "NotEqual"),
+            "===" => ("BoxComparisonOperation", "TEqual"),
+            "!==" => ("BoxComparisonOperation", "TNotEqual"),
+            "<" => ("BoxComparisonOperation", "LessThan"),
+            "<=" => ("BoxComparisonOperation", "LessThanEquals"),
+            ">" => ("BoxComparisonOperation", "GreaterThan"),
+            ">=" => ("BoxComparisonOperation", "GreaterThanEquals"),
+            "+" => ("BoxBinaryOperation", "Plus"),
+            "-" => ("BoxBinaryOperation", "Minus"),
+            "*" => ("BoxBinaryOperation", "Star"),
+            "/" => ("BoxBinaryOperation", "Slash"),
+            "%" => ("BoxBinaryOperation", "Mod"),
+            "^" => ("BoxBinaryOperation", "Power"),
+            "\\" => ("BoxBinaryOperation", "Backslash"),
+            "&&" => ("BoxBinaryOperation", "And"),
+            "||" => ("BoxBinaryOperation", "Or"),
+            "xor" => ("BoxBinaryOperation", "Xor"),
+            "eqv" => ("BoxBinaryOperation", "Equivalence"),
+            "contains" => ("BoxBinaryOperation", "Contains"),
+            "not contains" => ("BoxBinaryOperation", "NotContains"),
+            "castas" => ("BoxBinaryOperation", "CastAs"),
+            "instanceof" => ("BoxBinaryOperation", "InstanceOf"),
+            ".." => ("BoxBinaryOperation", "Range"),
+            ">.." => ("BoxBinaryOperation", "RangeLeftExclusive"),
+            "..<" => ("BoxBinaryOperation", "RangeRightExclusive"),
+            ">..<" => ("BoxBinaryOperation", "RangeFullExclusive"),
+            "b&" => ("BoxBinaryOperation", "BitwiseAnd"),
+            "b|" => ("BoxBinaryOperation", "BitwiseOr"),
+            "b^" => ("BoxBinaryOperation", "BitwiseXor"),
+            "b<<" => ("BoxBinaryOperation", "BitwiseSignedLeftShift"),
+            "b>>" => ("BoxBinaryOperation", "BitwiseSignedRightShift"),
+            "b>>>" => ("BoxBinaryOperation", "BitwiseUnsignedRightShift"),
+            _ => return ("MatchBoxBinaryOperation", operator.into()),
+        };
+        (kind, name.into())
+    }
+    fn target(&self, target: &AssignmentTarget) -> Value {
+        match target {
+            AssignmentTarget::Identifier(name)=>self.node("BoxIdentifier",None,json!({"name":name})),
+            AssignmentTarget::Member{base,member}=>self.node("BoxDotAccess",None,json!({"context":self.expression(base),"access":self.node("BoxIdentifier",None,json!({"name":member})),"safe":false})),
+            AssignmentTarget::Index{base,index}=>self.node("BoxArrayAccess",None,json!({"context":self.expression(base),"access":self.expression(index),"safe":false})),
+        }
+    }
+    fn expression(&self, expr: &Expression) -> Value {
+        let (kind, fields) = match &expr.kind {
+            ExpressionKind::Identifier(name) => ("BoxIdentifier", json!({"name":name})),
+            ExpressionKind::Literal(literal) => return self.literal(literal, expr.span),
+            ExpressionKind::Assignment { target, value } => (
+                "BoxAssignment",
+                json!({"left":self.target(target),"right":self.expression(value),"op":self.enum_value("BoxAssignment","Equal"),"modifiers":[]}),
+            ),
+            ExpressionKind::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let (kind, name) = self.binary_operator(operator);
+                (
+                    kind,
+                    json!({"left":self.expression(left),"operator":self.enum_value(kind,&name),"right":self.expression(right)}),
+                )
+            }
+            ExpressionKind::UnaryNot(value) | ExpressionKind::UnaryBitwiseNot(value) => (
+                "BoxUnaryOperation",
+                json!({"expr":self.expression(value),"operator":self.enum_value("BoxUnaryOperation",if matches!(expr.kind,ExpressionKind::UnaryNot(_)){"Not"}else{"BitwiseComplement"})}),
+            ),
+            ExpressionKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => (
+                "BoxTernaryOperation",
+                json!({"condition":self.expression(condition),"whenTrue":self.expression(then_expr),"whenFalse":self.expression(else_expr)}),
+            ),
+            ExpressionKind::Elvis { left, right } => (
+                "BoxBinaryOperation",
+                json!({"left":self.expression(left),"operator":self.enum_value("BoxBinaryOperation","Elvis"),"right":self.expression(right)}),
+            ),
+            ExpressionKind::FunctionCall { base, args } => match &base.kind {
+                ExpressionKind::Identifier(name) => (
+                    "BoxFunctionInvocation",
+                    json!({"name":name,"arguments":self.args(args)}),
+                ),
+                ExpressionKind::MemberAccess {
+                    base: object,
+                    member,
+                }
+                | ExpressionKind::SafeMemberAccess {
+                    base: object,
+                    member,
+                } => (
+                    "BoxMethodInvocation",
+                    json!({"obj":self.expression(object),"name":self.node("BoxIdentifier",None,json!({"name":member})),"arguments":self.args(args),"safe":matches!(base.kind,ExpressionKind::SafeMemberAccess{..})}),
+                ),
+                _ => (
+                    "BoxExpressionInvocation",
+                    json!({"expr":self.expression(base),"arguments":self.args(args)}),
+                ),
+            },
+            ExpressionKind::ArrayAccess { base, index } => (
+                "BoxArrayAccess",
+                json!({"context":self.expression(base),"access":self.expression(index),"safe":false}),
+            ),
+            ExpressionKind::MemberAccess { base, member }
+            | ExpressionKind::SafeMemberAccess { base, member } => (
+                "BoxDotAccess",
+                json!({"context":self.expression(base),"access":self.node("BoxIdentifier",None,json!({"name":member})),"safe":matches!(expr.kind,ExpressionKind::SafeMemberAccess{..})}),
+            ),
+            ExpressionKind::New { class_path, args } => (
+                "BoxNew",
+                json!({"expression":self.node("BoxIdentifier",None,json!({"name":class_path})),"arguments":self.args(args)}),
+            ),
+            ExpressionKind::Prefix { operator, target } => (
+                "BoxUnaryOperation",
+                json!({"expr":self.target(target),"operator":operator,"prefix":true}),
+            ),
+            ExpressionKind::Postfix { base, operator } => (
+                "BoxUnaryOperation",
+                json!({"expr":self.expression(base),"operator":operator,"prefix":false}),
+            ),
+            ExpressionKind::Spread(value) => (
+                "MatchBoxSpread",
+                json!({"expression":self.expression(value)}),
+            ),
+        };
+        self.node(kind, expr.span, fields)
+    }
+    fn literal(&self, literal: &Literal, span: Option<Span>) -> Value {
+        let (kind, fields) = match literal {
+            Literal::Null => ("BoxNull", json!({})),
+            Literal::Boolean(value) => ("BoxBooleanLiteral", json!({"value":value})),
+            Literal::Number(value) => (
+                if value.fract() == 0.0 {
+                    "BoxIntegerLiteral"
+                } else {
+                    "BoxDecimalLiteral"
+                },
+                json!({"value":value.to_string()}),
+            ),
+            Literal::Array(values) => (
+                "BoxArrayLiteral",
+                json!({"values":values.iter().map(|value|self.expression(value)).collect::<Vec<_>>() }),
+            ),
+            Literal::Struct(entries) => (
+                "BoxStructLiteral",
+                json!({"values":entries.iter().flat_map(|(key,value)|[self.expression(key),self.expression(value)]).collect::<Vec<_>>() }),
+            ),
+            Literal::String(parts) => {
+                if parts.iter().all(|part| matches!(part, StringPart::Text(_))) {
+                    (
+                        "BoxStringLiteral",
+                        json!({"value":parts.iter().map(|part|if let StringPart::Text(text)=part{text.as_str()}else{""}).collect::<String>()}),
+                    )
+                } else {
+                    (
+                        "BoxStringInterpolation",
+                        json!({"values":parts.iter().map(|part|match part{StringPart::Text(text)=>self.node("BoxStringLiteral",None,json!({"value":text})),StringPart::Expression(expr)=>self.expression(expr)}).collect::<Vec<_>>() }),
+                    )
+                }
+            }
+            Literal::Function {
+                params,
+                body,
+                is_lambda,
+            } => (
+                if *is_lambda {
+                    "BoxLambda"
+                } else {
+                    "BoxClosure"
+                },
+                json!({"args":self.params(params),"body":self.body(body)}),
+            ),
+        };
+        self.node(kind, span, fields)
+    }
+}
+
+fn capitalize(name: &str) -> String {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|first| {
+            first.to_uppercase().collect::<String>() + &chars.as_str().to_ascii_lowercase()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn positioned_tree_tokens_and_recovery() {
+        let source =
+            "// comment\nname = \"😀\"; other = 1 + 2 + 3;\nfunction add(a,b) { return a+b; }";
+        let root = inspect(source, None, false, true).unwrap();
+        assert_eq!(root["statements"][2]["name"], "add");
+        assert_eq!(
+            root["statements"][2]["body"][0]["expression"]["left"]["name"],
+            "a"
+        );
+        assert_eq!(root["statements"][1]["position"]["start"]["column"], 13);
+        assert_eq!(
+            root["statements"][1]["expression"]["right"]["left"]["sourceText"],
+            "1 + 2"
+        );
+        assert_eq!(root["comments"][0]["sourceText"], "// comment");
+        assert_eq!(
+            root["statements"][2]["body"][0]["expression"]["operator"]["sourceText"],
+            "Plus"
+        );
+        let interpolated =
+            inspect("prefix=1; text=\"value #name + 1#\";", None, false, false).unwrap();
+        assert_eq!(
+            interpolated["statements"][1]["expression"]["right"]["values"][1]["left"]["sourceText"],
+            "name"
+        );
+        assert!(root["tokens"].as_array().unwrap().len() > 10);
+        assert!(inspect("function broken() {", None, false, false).is_err());
+        assert!(inspect("x = '😀", None, false, false).is_err());
+        assert!(inspect("/* missing", None, false, false).is_err());
+        let recovered = inspect(
+            "var good=1; var bad=; var next=2; function broken() {",
+            Some("edit.bxs"),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(recovered["statements"].as_array().unwrap().len(), 2);
+        assert_eq!(recovered["issues"].as_array().unwrap().len(), 2);
+        assert_eq!(recovered["issues"][0]["filename"], "edit.bxs");
+        assert_eq!(
+            inspect("", None, true, true).unwrap()["statements"],
+            json!([])
+        );
+    }
+}

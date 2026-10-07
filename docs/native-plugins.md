@@ -162,6 +162,12 @@ Compatibility rules:
 
 Plugins are trusted arbitrary native code, not sandboxed. SHA-256 pins content; it does not establish publisher trust. Cache permissions prevent other users from substituting code; same-user compromise is outside this trust model.
 
+## Binary VM values
+
+`matchbox.bytes.v1` is an additive capability with `get` and `new` operations. Binary data is not passed through UTF-8 strings. `get` exposes a call-scoped borrowed byte view; `new` copies plugin bytes before returning. SDK authors negotiate with `require_bytes()` and use `Call::bytes()` / `Call::bytes_new()`. Hosts lacking this capability fail initialization explicitly; existing ValuesV1/RootsV1 tables and ABI major 1 remain unchanged.
+
+The optional [`bx-matchbox-std`](../modules/bx-matchbox-std/README.md) package starts incremental standard-library migration with raw standard streams, TCP, timeouts, buffered exact/delimited reads, and strict UTF-8 decoding. It is explicitly selectable and embeddable, not automatically baked into every runtime. Parser inspection remains a core API; see [AST inspection](ast-inspection.md).
+
 ## Retained VM values
 
 `matchbox.roots.v1` is an additive capability; `HostV1`, `ValuesV1`, and the ABI major are unchanged, so existing prebuilt plugins need no rebuild. Plugins requiring roots request `require_roots(host, context)` during initialization; older hosts report the missing capability explicitly.

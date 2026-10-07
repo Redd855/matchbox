@@ -4,6 +4,7 @@ members = [
     "crates/matchbox-embedded",
     "crates/matchbox-vm",
     "crates/matchbox-compiler",
+    "crates/matchbox-parser",
     "crates/matchbox-macros",
     "crates/matchbox-server",
     "crates/matchbox-lambda-runner",

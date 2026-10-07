@@ -1795,6 +1795,7 @@ name = "matchbox_compiler"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "matchbox_parser",
  "matchbox_vm",
  "serde",
 ]
@@ -1811,6 +1812,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "zip",
+]
+
+[[package]]
+name = "matchbox_parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
 ]
 
 [[package]]
@@ -1886,6 +1895,7 @@ dependencies = [
  "libloading 0.8.9",
  "matchbox-macros",
  "matchbox-plugin-sdk",
+ "matchbox_parser",
  "md-5",
  "postcard",
  "postgres",

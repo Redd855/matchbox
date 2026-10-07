@@ -1039,6 +1039,14 @@ name = "matchbox-plugin-sdk"
 version = "0.1.0"
 
 [[package]]
+name = "matchbox_parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
+
+[[package]]
 name = "matchbox_runner"
 version = "0.2.0"
 dependencies = [
@@ -1082,6 +1090,7 @@ dependencies = [
  "libloading",
  "matchbox-macros",
  "matchbox-plugin-sdk",
+ "matchbox_parser",
  "md-5",
  "postcard",
  "rand 0.10.0",

@@ -38,25 +38,42 @@ pub fn box_announce(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Stri
 }
 
 pub fn box_ast(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    if args.is_empty() {
-        return Err("boxAST() expects source".to_string());
+    if args.len() > 6 { return Err("boxAST() accepts source, filepath, returnType, sourceType, recover, includeTokens".into()); }
+    let text_arg = |index: usize, default: &str| args.get(index).filter(|value| !value.is_null()).map(|value| vm.to_string(*value)).unwrap_or_else(|| default.into());
+    let mut source = text_arg(0, "");
+    let filepath = text_arg(1, "");
+    let return_type = text_arg(2, "struct").to_ascii_lowercase();
+    let mut source_type = text_arg(3, "script").to_ascii_lowercase();
+    let bool_arg = |index: usize| -> Result<bool, String> {
+        match args.get(index).filter(|value| !value.is_null()) {
+            None => Ok(false), Some(value) if value.is_bool() => Ok(value.as_bool()),
+            _ => Err("boxAST() recover and includeTokens must be booleans".into()),
+        }
+    };
+    let recover = bool_arg(4)?;
+    let include_tokens = bool_arg(5)?;
+    if !matches!(return_type.as_str(), "struct" | "json" | "text") { return Err("boxAST() returnType must be one of struct, json, text".into()); }
+    if !matches!(source_type.as_str(), "script" | "template" | "cfscript" | "cftemplate") { return Err("boxAST() sourceType must be one of script, template, cfscript, cftemplate".into()); }
+    if source.trim().is_empty() && !filepath.trim().is_empty() {
+        #[cfg(feature = "bif-io")]
+        {
+            source = std::fs::read_to_string(&filepath).map_err(|error| format!("boxAST() {}: {}", filepath, error))?;
+            if filepath.to_ascii_lowercase().ends_with(".bxm") { source_type = "template".into(); }
+        }
+        #[cfg(not(feature = "bif-io"))]
+        return Err("boxAST() filepath requires the bif-io build feature".into());
+    } else if source.trim().is_empty() && !recover {
+        return Err("Either 'source' or 'filepath' argument must be provided to boxAST()".into());
     }
-    let return_type = args
-        .get(1)
-        .map(|value| vm.to_string(*value).to_ascii_lowercase())
-        .unwrap_or_else(|| "struct".to_string());
-    if matches!(return_type.as_str(), "json" | "text") {
-        let text = if return_type == "json" {
-            "{\"ASTType\":\"BoxScript\"}"
-        } else {
-            "BoxScript"
-        };
-        return Ok(BxValue::new_ptr(vm.string_new(text.to_string())));
+    // Template ASTs currently contain compiler stubs/desugaring, not faithful source data.
+    if source_type != "script" { return Err(format!("boxAST() {} AST inspection is not implemented", source_type)); }
+    let root = matchbox_parser::inspect::inspect(&source, if filepath.is_empty() { None } else { Some(&filepath) }, recover, include_tokens).map_err(|error| error.to_string())?;
+    match return_type.as_str() {
+        "struct" => Ok(super::json::json_to_bx(vm, root)),
+        "json" => Ok(BxValue::new_ptr(vm.string_new(serde_json::to_string(&root).map_err(|error| error.to_string())?))),
+        // Text is source text, not a placeholder or invented pretty-print transformation.
+        _ => Ok(BxValue::new_ptr(vm.string_new(source))),
     }
-    let id = vm.struct_new();
-    let ast_type = vm.string_new("BoxScript".to_string());
-    vm.struct_set(id, "ASTType", BxValue::new_ptr(ast_type));
-    Ok(BxValue::new_ptr(id))
 }
 
 pub fn get_function_called_name(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {

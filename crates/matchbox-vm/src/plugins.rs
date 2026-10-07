@@ -39,6 +39,7 @@ struct CallContext<'a> {
     vm: &'a mut dyn BxVM,
     values: Vec<BxValue>,
     strings: Vec<String>,
+    bytes: Vec<Vec<u8>>,
     library: Rc<Library>,
     functions: Rc<HashMap<String, (Function, Invoke)>>,
     error: Option<String>,
@@ -74,6 +75,7 @@ unsafe extern "C" fn capability(name: Text) -> *const c_void {
     match unsafe { text(name) }.ok() {
         Some(VALUES_V1) => (&VALUES as *const ValuesV1).cast(),
         Some(ROOTS_V1) => (&ROOTS as *const RootsV1).cast(),
+        Some(BYTES_V1) => (&BYTES as *const BytesV1).cast(),
         _ => std::ptr::null(),
     }
 }
@@ -245,6 +247,7 @@ fn invoke_function(
         vm,
         values,
         strings: Vec::new(),
+        bytes: Vec::new(),
         library: library.clone(),
         functions: functions.clone(),
         error: None,
@@ -548,6 +551,29 @@ unsafe extern "C" fn root_release(root: RootHandle) {
         drop(unsafe { Box::from_raw(root.cast::<HostRoot>()) });
     }
 }
+unsafe extern "C" fn bytes_get(ctx: Context, value: Value, out: *mut Bytes) -> i32 {
+    let ctx = unsafe { context(ctx) };
+    let result = (|| {
+        if out.is_null() { return Err("Null output pointer".into()); }
+        let value = ctx.value(value)?;
+        ctx.bytes.push(ctx.vm.to_bytes(value)?);
+        unsafe { *out = Bytes::new(ctx.bytes.last().unwrap()) };
+        Ok(())
+    })();
+    operation(ctx, result)
+}
+unsafe extern "C" fn bytes_new(ctx: Context, bytes: Bytes, out: *mut Value) -> i32 {
+    let ctx = unsafe { context(ctx) };
+    if out.is_null() { return operation(ctx, Err("Null output pointer".into())); }
+    if bytes.len != 0 && bytes.ptr.is_null() { return operation(ctx, Err("Null binary input pointer".into())); }
+    let bytes = if bytes.len == 0 { Vec::new() } else {
+        unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+    };
+    let id = ctx.vm.bytes_new(bytes);
+    output(ctx, BxValue::new_ptr(id), out)
+}
+static BYTES: BytesV1 = BytesV1 { get: bytes_get, new: bytes_new };
+
 static ROOTS: RootsV1 = RootsV1 {
     retain: root_retain,
     get: root_get,

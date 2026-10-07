@@ -231,7 +231,7 @@ pub fn load_properties(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, S
     Ok(BxValue::new_ptr(struct_id))
 }
 
-fn json_to_bx(vm: &mut dyn BxVM, val: JsonValue) -> BxValue {
+pub(crate) fn json_to_bx(vm: &mut dyn BxVM, val: JsonValue) -> BxValue {
     match val {
         JsonValue::Null => BxValue::new_null(),
         JsonValue::Bool(b) => BxValue::new_bool(b),

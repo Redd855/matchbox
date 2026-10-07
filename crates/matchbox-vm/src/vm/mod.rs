@@ -2766,6 +2766,7 @@ impl VM {
                      "second" => Some("second".to_string()),
                      "millisecond" => Some("millisecond".to_string()),
                     "fromjson" => Some("deserializejson".to_string()),
+                    "toast" => Some("boxast".to_string()),
                     "rematch" => Some("rematch".to_string()),
                     "rematchnocase" => Some("rematchnocase".to_string()),
                     "refind" => Some("refind".to_string()),
@@ -7863,7 +7864,7 @@ impl VM {
             "getlocaledisplayname" | "getlocaleinfo" => vec!["locale", "dsplocale"],
             "asyncallapply" => vec!["items", "mapper", "timeout", "timeunit"],
             "threadnew" => vec!["runnable", "name", "virtual"],
-            "boxast" => vec!["source", "returntype"],
+            "boxast" => vec!["source", "filepath", "returntype", "sourcetype", "recover", "includetokens"],
             "runthreadincontext" => vec!["context", "callback"],
             "lock" => vec!["name", "timeout", "type"],
             "compress" => vec![

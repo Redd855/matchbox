@@ -1,12 +1,20 @@
+use crate::tokenizer::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub kind: StatementKind,
     pub line: u32,
+    pub span: Option<Span>,
 }
 
 impl Statement {
     pub fn new(kind: StatementKind, line: u32) -> Self {
-        Self { kind, line }
+        Self { kind, line, span: None }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
     }
 }
 
@@ -161,11 +169,17 @@ pub enum ClassMember {
 pub struct Expression {
     pub kind: ExpressionKind,
     pub line: u32,
+    pub span: Option<Span>,
 }
 
 impl Expression {
     pub fn new(kind: ExpressionKind, line: u32) -> Self {
-        Self { kind, line }
+        Self { kind, line, span: None }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
     }
 }
 

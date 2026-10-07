@@ -71,6 +71,7 @@ The SDK has its own Cargo version, independent of MatchBox releases. Binary comp
 
 - `matchbox.values.v1`: call-scoped values, scalar/string operations, structs, opaque native objects, and errors.
 - `matchbox.roots.v1`: optional retained VM values with explicit ownership and an RAII Rust wrapper.
+- `matchbox.bytes.v1`: optional binary-value access. `require_bytes()` negotiates the immutable table; `Call::bytes()` copies binary data and `Call::bytes_new()` creates a host-owned copy. Raw `get` views last until the invocation ends; raw `new` copies before returning. NUL and non-UTF-8 bytes are preserved. Existing ABI-1/ValuesV1/RootsV1 layouts are unchanged.
 - A newer SDK may request a capability an older host lacks; initialization fails clearly rather than guessing a layout.
 - Existing capability layouts/signatures/semantics do not change. Add functionality through a new capability name/version.
 

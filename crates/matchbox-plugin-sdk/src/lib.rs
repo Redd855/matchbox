@@ -4,6 +4,7 @@ use std::ffi::c_void;
 pub const ABI_MAJOR: u32 = 1;
 pub const VALUES_V1: &str = "matchbox.values.v1";
 pub const ROOTS_V1: &str = "matchbox.roots.v1";
+pub const BYTES_V1: &str = "matchbox.bytes.v1";
 pub type Value = u64;
 /// Host-owned opaque allocation, valid until released exactly once on the VM thread.
 pub type RootHandle = *mut c_void;
@@ -32,6 +33,25 @@ impl Text {
             len: s.len(),
         }
     }
+}
+
+/// Arbitrary bytes, not UTF-8. Borrowed only for the documented call lifetime.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Bytes {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+impl Bytes {
+    pub fn new(bytes: &[u8]) -> Self { Self { ptr: bytes.as_ptr(), len: bytes.len() } }
+}
+
+/// Additive binary-value capability. `get` borrows until the invocation ends;
+/// `new` copies the supplied bytes before returning. No VM layout crosses the ABI.
+#[repr(C)]
+pub struct BytesV1 {
+    pub get: unsafe extern "C" fn(Context, Value, *mut Bytes) -> i32,
+    pub new: unsafe extern "C" fn(Context, Bytes, *mut Value) -> i32,
 }
 
 /// JSON registration metadata: {"name":"...","arguments":[{"name":"...",
@@ -164,6 +184,18 @@ impl<'a> Call<'a> {
         };
         String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
     }
+    pub fn bytes(&self, api: &BytesV1, value: Value) -> Result<Vec<u8>, String> {
+        let mut out = Bytes::new(&[]);
+        if unsafe { (api.get)(self.context, value, &mut out) } != 0 { return Err("Expected binary value".into()); }
+        if out.len == 0 { return Ok(Vec::new()); }
+        Ok(unsafe { std::slice::from_raw_parts(out.ptr, out.len) }.to_vec())
+    }
+    pub fn bytes_new(&self, api: &BytesV1, bytes: &[u8]) -> Result<Value, String> {
+        self.value(|out| unsafe { (api.new)(self.context, Bytes::new(bytes), out) })
+    }
+    pub fn null_new(&self) -> Result<Value, String> {
+        self.value(|out| unsafe { (self.api.null_new)(self.context, out) })
+    }
     pub fn number_new(&self, number: f64) -> Result<Value, String> {
         self.value(|out| unsafe { (self.api.number_new)(self.context, number, out) })
     }
@@ -255,6 +287,12 @@ pub unsafe fn require_roots(
     unsafe { require_capability(host, context, ROOTS_V1).map(|api| &*api.cast()) }
 }
 
+/// # Safety
+/// Must be called with the pointers supplied to matchbox_plugin_init_v1.
+pub unsafe fn require_bytes(host: *const HostV1, context: Context) -> Result<&'static BytesV1, i32> {
+    unsafe { require_capability(host, context, BYTES_V1).map(|api| &*api.cast()) }
+}
+
 unsafe fn require_capability(
     host: *const HostV1,
     context: Context,
@@ -293,5 +331,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<ValuesV1>(), 11 * pointer);
         assert_eq!(std::mem::offset_of!(ValuesV1, error), 10 * pointer);
         assert_eq!(std::mem::size_of::<RootsV1>(), 3 * pointer);
+        assert_eq!(std::mem::size_of::<BytesV1>(), 2 * pointer);
+        assert_eq!(std::mem::size_of::<Bytes>(), 2 * pointer);
     }
 }

@@ -783,7 +783,9 @@ pub fn run() -> Result<()> {
         return run_chunk(embedded_chunk, &[]);
     }
 
-    let args: Vec<String> = std_env::args().collect();
+    let all_args: Vec<String> = std_env::args().collect();
+    let separator = all_args.iter().position(|arg| arg == "--");
+    let args = &all_args[..separator.unwrap_or(all_args.len())];
     if args.get(1).map(|s| s.as_str()) == Some("esp32-doctor") {
         run_esp32_doctor()?;
         return Ok(());
@@ -947,11 +949,12 @@ pub fn run() -> Result<()> {
     match filename {
         Some(name) => {
             let path = Path::new(name);
-            let script_args = args
-                .iter()
-                .position(|arg| arg == name)
-                .map(|position| args[position + 1..].to_vec())
-                .unwrap_or_default();
+            let script_args = if let Some(separator) = separator {
+                all_args[separator + 1..].to_vec()
+            } else {
+                args.iter().position(|arg| arg == name)
+                    .map(|position| args[position + 1..].to_vec()).unwrap_or_default()
+            };
             if path.is_dir() {
                 process_directory(
                     path,
@@ -1030,6 +1033,7 @@ fn print_usage() {
     println!("  --no-shaking        Disable tree-shaking and include all prelude BIFs");
     println!("  --no-std-lib        Exclude the standard library (prelude) entirely");
     println!("  --output <path>     Set the output file path for compiled artifacts");
+    println!("  --                  Pass remaining arguments only to the application");
     println!("  --strip-source      Strip embedded source text from compiled output");
     println!(
         "                      Errors still report file:line; native binaries fall back to disk for snippets"

@@ -42,6 +42,7 @@ pub struct Compiler {
     /// can still determine whether to emit an `init` invocation.
     class_has_init_map: HashMap<String, bool>,
     current_function_is_static: bool,
+    is_function: bool,
 }
 
 impl Compiler {
@@ -64,6 +65,7 @@ impl Compiler {
             source_dir,
             class_has_init_map: HashMap::new(),
             current_function_is_static: false,
+            is_function: false,
         }
     }
 
@@ -86,6 +88,7 @@ impl Compiler {
             source_dir,
             class_has_init_map: HashMap::new(),
             current_function_is_static: false,
+            is_function: false,
         }
     }
 
@@ -296,6 +299,7 @@ impl Compiler {
                                 params: Vec::new(),
                                 modifiers: VmFunctionModifiers::default(),
                                 captured_receiver: None,
+                                captured_scopes: Vec::new(),
                                 chunk: getter_chunk,
                             };
                             methods.insert(getter_name.to_lowercase(), func);
@@ -321,6 +325,7 @@ impl Compiler {
                                 params: vec!["val".to_string()],
                                 modifiers: VmFunctionModifiers::default(),
                                 captured_receiver: None,
+                                captured_scopes: Vec::new(),
                                 chunk: setter_chunk,
                             };
                             methods.insert(setter_name.to_lowercase(), func);
@@ -379,6 +384,7 @@ impl Compiler {
                     params: Vec::new(),
                     modifiers: VmFunctionModifiers::default(),
                     captured_receiver: None,
+                    captured_scopes: Vec::new(),
                     chunk: constructor_compiler.chunk,
                 };
 
@@ -894,7 +900,7 @@ impl Compiler {
                                     optimized_condition =
                                         Some((true, slot as u32, const_idx as u32)); // true = is_local
                                     handled = true;
-                                } else if !self.is_class {
+                                } else if !self.is_class && !self.is_function {
                                     // Global optimized candidate
                                     let name_lower = name.to_lowercase();
                                     let name_idx = self.chunk.add_constant(Constant::String(
@@ -977,7 +983,7 @@ impl Compiler {
                                         );
                                     }
                                     optimized_update = true;
-                                } else if !self.is_class {
+                                } else if !self.is_class && !self.is_function {
                                     let name_idx = self.chunk.add_constant(Constant::String(
                                         BoxString::new(name.as_str()),
                                     ));
@@ -1981,7 +1987,7 @@ impl Compiler {
                 } else if let Some(path) = self.imports.get(&lower_name).filter(|path| path.to_ascii_lowercase().starts_with("java:") || self.is_runtime_module_class(path)) {
                     let path = path.clone();
                     self.compile_class_reference(&path, expr.line);
-                } else if self.is_class && !is_js_import {
+                } else if (self.is_class || self.is_function) && !is_js_import {
                     let idx = self
                         .chunk
                         .add_constant(Constant::String(BoxString::new(name.as_str())));
@@ -2009,7 +2015,7 @@ impl Compiler {
                         self.compile_expression(value)?;
                         if let Some(slot) = self.resolve_local(&name) {
                             self.chunk.emit1(op::SET_LOCAL, slot as u32, expr.line);
-                        } else if self.is_class && !is_js_import {
+                        } else if (self.is_class || self.is_function) && !is_js_import {
                             let name_idx = self
                                 .chunk
                                 .add_constant(Constant::String(BoxString::new(name.as_str())));
@@ -2311,7 +2317,7 @@ impl Compiler {
                         }
                         if let Some(slot) = self.resolve_local(&name) {
                             self.chunk.emit1(op::SET_LOCAL, slot as u32, expr.line);
-                        } else if self.is_class {
+                        } else if self.is_class || self.is_function {
                             let idx = self
                                 .chunk
                                 .add_constant(Constant::String(BoxString::new(name.as_str())));
@@ -2355,7 +2361,7 @@ impl Compiler {
                         }
                         if let Some(slot) = self.resolve_local(&name) {
                             self.chunk.emit1(op::SET_LOCAL, slot as u32, expr.line);
-                        } else if self.is_class {
+                        } else if self.is_class || self.is_function {
                             let idx = self
                                 .chunk
                                 .add_constant(Constant::String(BoxString::new(name.as_str())));
@@ -2421,6 +2427,7 @@ impl Compiler {
         // Source text lives only in the root chunk to avoid N copies per file.
         // The VM falls back to disk when chunk.source is empty.
         sub_compiler.scope_depth = 1;
+        sub_compiler.is_function = true;
         sub_compiler.is_class = self.is_class;
         sub_compiler.imports = self.imports.clone();
         sub_compiler.runtime_module_classes = self.runtime_module_classes;
@@ -2536,6 +2543,7 @@ impl Compiler {
                 is_final: modifiers.is_final,
             },
             captured_receiver: None,
+            captured_scopes: Vec::new(),
             chunk: sub_compiler.chunk,
         })
     }
@@ -2672,7 +2680,7 @@ impl Compiler {
                         self.compile_expression(value)?;
                         if let Some(slot) = self.resolve_local(&name) {
                             self.chunk.emit1(op::SET_LOCAL_POP, slot as u32, expr.line);
-                        } else if self.is_class {
+                        } else if self.is_class || self.is_function {
                             let name_idx = self.chunk.add_constant(Constant::String(
                                 BoxString::new(lower_name.as_str()),
                             ));
@@ -2717,7 +2725,7 @@ impl Compiler {
                                 self.chunk.emit0(op::DEC, expr.line);
                                 self.chunk.emit1(op::SET_LOCAL_POP, slot as u32, expr.line);
                             }
-                        } else if !self.is_class {
+                        } else if !self.is_class && !self.is_function {
                             let name_idx = self
                                 .chunk
                                 .add_constant(Constant::String(BoxString::new(name.as_str())));
@@ -2771,7 +2779,7 @@ impl Compiler {
                                 self.chunk.emit0(op::DEC, expr.line);
                                 self.chunk.emit1(op::SET_LOCAL_POP, slot as u32, expr.line);
                             }
-                        } else if !self.is_class {
+                        } else if !self.is_class && !self.is_function {
                             let name_idx = self
                                 .chunk
                                 .add_constant(Constant::String(BoxString::new(name.as_str())));
@@ -2823,6 +2831,10 @@ impl Compiler {
     }
 
     fn add_local(&mut self, name: String) {
+        if self.is_function && !name.is_empty() {
+            let key = self.chunk.add_constant(Constant::String(BoxString::new(&name)));
+            self.chunk.emit2(op::BIND_LOCAL, self.locals.len() as u32, key, self.current_line);
+        }
         self.locals.push(Local {
             name: name.to_lowercase(),
             depth: self.scope_depth,

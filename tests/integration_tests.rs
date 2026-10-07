@@ -100,6 +100,7 @@ script_test!(
     "vm_throw_structured_exception.bxs"
 );
 script_test!(vm_functions, "vm_functions.bxs");
+script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");
 
 #[test]
 fn vm_locals_survive_stack_reallocation() {

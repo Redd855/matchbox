@@ -1226,6 +1226,9 @@ impl<'a> Parser<'a> {
     }
 
     fn at_statement_boundary(&self) -> bool {
+        if self.peek_is(TokenKind::Function) && self.kind(1) == Some(TokenKind::LeftParen) {
+            return false;
+        }
         matches!(self.peek_kind(),
             Some(TokenKind::RightBrace) | Some(TokenKind::Case) | Some(TokenKind::Default)
             | Some(TokenKind::Import) | Some(TokenKind::Class) | Some(TokenKind::Interface)

@@ -22,9 +22,9 @@ The goal is to run existing BoxLang framework APIs without a JVM. The shim imple
 
 Already implemented: precompiled native plugins; a stable capability-negotiated C ABI; embedded module/library bundles; verified extraction; retained VM values; runtime module lifecycle/settings; BIF/member annotations and invocation parity; live module/function/interceptor services; synchronous global custom interception.
 
-At the original checkpoint above, descriptor-declared/annotated interceptors, module components, and dynamic/struct descriptor mappings were pending. Subsequent foundation slices implement those registrations, normal component bodies, and runtime private/public mappings with embedded BoxLang class lookup. The application envelope is now version 7; plugin ABI-1 libraries are unchanged.
+At the original checkpoint above, descriptor-declared/annotated interceptors, module components, and dynamic/struct descriptor mappings were pending. Subsequent foundation slices implement those registrations, normal component bodies, and runtime private/public mappings with embedded BoxLang class lookup. The application envelope is now version 8; plugin ABI-1 libraries are unchanged.
 
-**Milestone 1 is still incomplete.** The minimal module-owned Java class-provider boundary is now implemented separately from the embedded BoxLang catalog: runtime descriptor `classProviders` registrations route creation, imports, initialization, static references and property access through ordinary BoxLang/native values, with GC retention and owner cleanup. See `docs/native-plugins.md` for the implemented contract and explicit limitations. No plugin ABI/capability change was needed. Remaining component/context/interception parity and general VM closure/scoping gaps must still be assessed before beginning milestone 2. This document does not authorize SDK publication.
+**Milestone 1 is still incomplete.** The minimal module-owned Java class-provider boundary is now implemented separately from the embedded BoxLang catalog: runtime descriptor `classProviders` registrations route creation, imports, initialization, static references and property access through ordinary BoxLang/native values, with GC retention and owner cleanup. See `docs/native-plugins.md` for the implemented contract and explicit limitations. No plugin ABI/capability change was needed. Mutable lexical closure capture and BoxLang reentrant implicit-assignment scoping are now implemented through shared VM scopes, with JVM, GC, JIT-writeback, native-root, and source-free module contracts. Component non-local completion/flags, execution-context and built-in interception behavior, and the descriptor/service audit remain open before milestone 2; full CFML/context scoping is not claimed. This document does not authorize SDK publication.
 
 Important files:
 
@@ -33,6 +33,7 @@ Important files:
 - `crates/matchbox-vm/src/module_services.rs`: live records/services.
 - `crates/matchbox-vm/src/plugins.rs`: native plugin loading and dispatch.
 - `crates/matchbox-vm/src/vm/classes.rs`: module class-provider resolution and reference protocols.
+- `crates/matchbox-vm/src/vm/scopes.rs`: shared local/argument capture, binding and JIT writeback.
 - `crates/matchbox-plugin-sdk/`: independently versioned author SDK.
 - `crates/matchbox-compiler/src/compiler/mod.rs`: imports and `new` lowering.
 - `crates/matchbox-vm/src/bifs/mod.rs`: `createObject()` and existing native utilities.

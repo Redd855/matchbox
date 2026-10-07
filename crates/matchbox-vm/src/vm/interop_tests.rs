@@ -479,6 +479,7 @@ mod tests {
                 params: Vec::new(),
                 modifiers: crate::types::FunctionModifiers::default(),
                 captured_receiver: None,
+                captured_scopes: Vec::new(),
                 chunk: Chunk::default(),
             },
             methods: Vec::new(),

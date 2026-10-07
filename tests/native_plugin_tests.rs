@@ -301,6 +301,41 @@ receiver = null;
 }
 
 #[test]
+fn retained_lexical_scopes_survive_mutation_collection_and_release() {
+    let mut vm = VM::new();
+    unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
+    let source = r#"
+function retainState(prefix = "scope:") {
+    var payload = {text: "original"};
+    return fixtureHold(function(text = "changed") {
+        payload = {text: prefix & text};
+        return payload;
+    });
+}
+holder = retainState();
+retainState = null;
+"#;
+    let ast = matchbox_compiler::parser::parse(source, None).unwrap();
+    let chunk = matchbox_compiler::compiler::Compiler::new("lexical-gc.bxs").compile(&ast, source).unwrap();
+    vm.interpret_sync(chunk).unwrap();
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    let holder = vm.get_global("holder").unwrap();
+    let callback = vm.call_method_value(holder, "get", vec![]).unwrap();
+    let payload = vm.call_function_value(callback, vec![], None).unwrap();
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    assert_eq!(vm.to_string(vm.struct_get(payload.as_gc_id().unwrap(), "text")), "scope:changed");
+    let next = BxValue::new_ptr(vm.string_new("next".into()));
+    let replacement = vm.call_function_value(callback, vec![next], None).unwrap();
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    assert_eq!(vm.to_string(vm.struct_get(replacement.as_gc_id().unwrap(), "text")), "scope:next");
+    assert!(vm.heap.get_opt(payload.as_gc_id().unwrap()).is_none());
+    vm.insert_global("holder".into(), BxValue::new_null());
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    assert!(vm.heap.get_opt(callback.as_gc_id().unwrap()).is_none());
+    assert!(vm.heap.get_opt(replacement.as_gc_id().unwrap()).is_none());
+}
+
+#[test]
 fn module_contract_direct_bytecode_and_standalone() {
     let dir = tempfile::tempdir().unwrap();
     package(dir.path());
@@ -1692,6 +1727,68 @@ class {
 }
 
 #[test]
+fn module_callbacks_scope_reentrant_interception_and_bodies_without_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = package(dir.path());
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), r#"class {
+        function configure() {
+            customInterceptionPoints = ["scopeProbe"];
+            interceptors = [{class:"Probe"}];
+        }
+    }"#).unwrap();
+    fs::write(module.join("Probe.bx"), r#"class {
+        function scopeProbe(data) {
+            stamp = data.depth;
+            if (stamp == 0) { data.depth = 1; interceptorService.announce("scopeProbe", data); }
+            arrayAppend(data.trace, stamp);
+            arrayAppend(data.values, data.callback());
+        }
+    }"#).unwrap();
+    fs::write(module.join("bifs/ScopeCounter.bx"), r#"class {
+        function invoke(label = "seed") {
+            count = 0;
+            return function(step = 1) { count += step; return label & ":" & count; };
+        }
+    }"#).unwrap();
+    fs::write(module.join("components/ScopeWrap.bx"), r#"@RequiresBody(true) class {
+        function invoke(context, attributes, body) {
+            buffer = newBuffer();
+            buffer.append("pre:");
+            result = processBody(context, body, buffer);
+            writeOutput("[" & buffer.toString() & "]");
+            return result;
+        }
+    }"#).unwrap();
+    let source = format!(r#"{}
+alpha = scopeCounter("alpha"); beta = scopeCounter("beta");
+if (alpha() != "alpha:1" || beta() != "beta:1" || alpha() != "alpha:2") {{ throw "Module BIF scopes were shared across calls"; }}
+data = {{depth:0, trace:[], values:[], callback:scopeCounter("event")}};
+boxAnnounce("scopeProbe", data);
+if (data.trace[1] != 1 || data.trace[2] != 0 || data.values[1] != "event:1" || data.values[2] != "event:2") {{ throw "Reentrant interceptor scopes were overwritten"; }}
+function render(prefix) {{
+    tail = "!";
+    bx:scopeWrap {{ writeOutput(prefix); bx:scopeWrap {{ writeOutput("inner"); }} writeOutput(tail); }}
+}}
+render("outer");
+"#, include_str!("scripts/vm_lexical_closures.bxs"));
+    fs::write(dir.path().join("app.bxs"), source).unwrap();
+    let expected = "lexical closures OK\n[pre:outer[pre:inner]!]";
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    fs::remove_dir_all(dir.path().join("cache")).unwrap();
+    let output = cli(dir.path(), &["app.bxb"]); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    let output = Command::new(dir.path().join("application")).current_dir(dir.path())
+        .env("MATCHBOX_NATIVE_CACHE", dir.path().join("native-cache")).output().unwrap(); success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
+
+#[test]
 fn component_bodies_capture_nested_output_and_can_be_processed_repeatedly() {
     let dir = tempfile::tempdir().unwrap();
     let module = dir.path().join("module");
@@ -1702,9 +1799,9 @@ fn component_bodies_capture_nested_output_and_can_be_processed_repeatedly() {
 @RequiresBody(true)
 class {
     function invoke(context, attributes, body, executionState) {
-        var buffer = newBuffer();
+        buffer = newBuffer();
         buffer.append("pre:");
-        var result = processBody(context,body,buffer);
+        result = processBody(context,body,buffer);
         assert !result.isEarlyExit();
         writeOutput("[" & buffer.toString() & "]");
         return result;

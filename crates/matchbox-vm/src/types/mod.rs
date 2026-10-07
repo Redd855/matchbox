@@ -525,6 +525,9 @@ pub struct BxCompiledFunction {
     /// Captured `this` for class closures and bound method references.
     #[serde(skip)]
     pub captured_receiver: Option<BxValue>,
+    /// Shared declaring local/arguments scopes, from nearest to outermost.
+    #[serde(skip)]
+    pub captured_scopes: Vec<BxValue>,
     /// The actual bytecode for this function.
     pub chunk: crate::vm::chunk::Chunk,
 }

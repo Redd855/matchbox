@@ -362,6 +362,9 @@ impl Heap {
                 if let Some(receiver) = &function.captured_receiver {
                     self.add_to_worklist(receiver, worklist);
                 }
+                for scope in &function.captured_scopes {
+                    self.add_to_worklist(scope, worklist);
+                }
             }
             GcObject::NativeObject(obj) => {
                 let mut tracer = WorklistTracer {
@@ -421,6 +424,9 @@ impl Heap {
             GcObject::CompiledFunction(function) => {
                 if let Some(receiver) = &function.captured_receiver {
                     self.add_to_worklist_young(receiver, worklist);
+                }
+                for scope in &function.captured_scopes {
+                    self.add_to_worklist_young(scope, worklist);
                 }
             }
             GcObject::NativeObject(obj) => {

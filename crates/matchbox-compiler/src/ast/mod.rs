@@ -125,6 +125,11 @@ pub enum StatementKind {
         name: String,
         value: Expression,
     },
+    Component {
+        name: String,
+        attributes: Vec<(Expression, Expression)>,
+        body: Option<Vec<Statement>>,
+    },
     Expression(Expression),
 }
 
@@ -256,6 +261,7 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionBody {
     Block(Vec<Statement>),
+    Component(Vec<Statement>),
     Expression(Box<Expression>),
     Abstract,
 }

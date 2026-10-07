@@ -1871,7 +1871,112 @@ class {
 }
 
 #[test]
-fn component_body_errors_restore_output_and_unsupported_flow_fails_explicitly() {
+fn component_body_returns_reach_the_declaring_function() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/FlowPass.bx"), r#"@RequiresBody(true) class {
+        function invoke(context, attributes, body) {
+            var buffer = newBuffer();
+            var result = processBody(context, body, buffer);
+            if (!result.isReturn() || result.resultType() != 1 || result.returnValue() != 42) { throw "Invalid body return result"; }
+            writeOutput(buffer.toString());
+            return result;
+        }
+    }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"function probe() {
+        bx:flowPass { writeOutput("before:"); return 42; writeOutput("unreachable"); }
+        throw "Component return did not reach its declaring function";
+    }
+    if (probe() != 42) { throw "Component body return value was lost"; }
+    println("return OK");"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "before:return OK\n");
+}
+
+#[test]
+fn component_completion_preserves_declaring_context_and_finally_without_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/FlowPass.bx"), r#"@RequiresBody(true) class {
+        function invoke(context, attributes, body) { return processBody(context, body, newBuffer()); }
+    }"#).unwrap();
+    let source = format!("{}\nif (!result.state.innerFinally || !result.state.outerFinally) {{ throw \"Finally did not unwind\"; }}", include_str!("scripts/module_component_flow.bxs"));
+    fs::write(dir.path().join("app.bxs"), source).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "nested OK\ndeclarations OK\n");
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "standalone"]));
+    fs::remove_dir_all(&module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("standalone")).current_dir(dir.path()).output().unwrap()] {
+        success(&output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "nested OK\ndeclarations OK\n");
+    }
+}
+
+#[test]
+fn component_break_continue_results_can_be_inspected_and_forwarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/Control.bx"), r#"@RequiresBody(true) class {
+        function invoke(context, attributes, body) {
+            var result = processBody(context, body, newBuffer());
+            if (attributes.kind == 2 && (!result.isBreak() || !result.isBreak("unused"))) { throw "Break result missing"; }
+            if (attributes.kind == 3 && (!result.isContinue() || !result.isContinue("unused"))) { throw "Continue result missing"; }
+            if (!result.isEarlyExit() || result.isReturn() || result.resultType() != attributes.kind || !isNull(result.label()) || !isNull(result.returnValue())) { throw "Invalid control result"; }
+            if (attributes.consume) { return; }
+            return result;
+        }
+    }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"
+function breakProbe() { bx:control kind=2 consume=false { break; } return "unreachable"; }
+function continueProbe() { bx:control kind=3 consume=false { continue; } return "unreachable"; }
+if (!isNull(breakProbe()) || !isNull(continueProbe())) { throw "Non-local control result did not reach the function boundary"; }
+bx:control kind=2 consume=true { break; }
+bx:control kind=3 consume=true { continue; }
+println("control results OK");
+"#).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "control results OK\n");
+}
+
+#[test]
+fn component_body_results_trace_return_values_across_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir_all(module.join("components")).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    fs::write(module.join("components/FlowPass.bx"), r#"@RequiresBody(true) class {
+        function invoke(context, attributes, body) { this.saved = processBody(context, body, newBuffer()); return this.saved; }
+    }"#).unwrap();
+    fs::write(dir.path().join("app.bxs"), r#"function probe() {
+        bx:flowPass { return {text:"retained body result"}; }
+    }
+    probe();"#).unwrap();
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+    let app = matchbox_vm::bundle::Application::from_executable(&fs::read(dir.path().join("app.bxb")).unwrap()).unwrap();
+    let mut vm = VM::new();
+    app.run(&mut vm, &dir.path().join("cache")).unwrap();
+    for _ in 0..16 { vm.collect_garbage_now(); }
+    let registry = vm.get_global("__mb_components").unwrap().as_gc_id().unwrap();
+    let record = vm.struct_get(registry, "flowPass").as_gc_id().unwrap();
+    let target = vm.struct_get(record, "target");
+    let saved = vm.instance_property(target, "saved").unwrap();
+    let payload = vm.call_method_value(saved, "returnValue", vec![]).unwrap();
+    assert_eq!(vm.to_string(vm.struct_get(payload.as_gc_id().unwrap(), "text")), "retained body result");
+}
+
+#[test]
+fn component_body_errors_restore_output_and_root_return_stops_execution() {
     let dir = tempfile::tempdir().unwrap();
     let module = dir.path().join("module");
     fs::create_dir_all(module.join("components")).unwrap();
@@ -1884,8 +1989,7 @@ fn component_body_errors_restore_output_and_unsupported_flow_fails_explicitly() 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "partial");
     fs::write(dir.path().join("early.bxs"), "bx:capture { return; }").unwrap();
     let output = cli(dir.path(), &["early.bxs", "--module", "module"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("non-local return is not yet supported"));
+    success(&output);
     assert!(output.stdout.is_empty());
 }
 

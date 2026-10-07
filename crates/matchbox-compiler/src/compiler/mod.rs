@@ -43,6 +43,7 @@ pub struct Compiler {
     class_has_init_map: HashMap<String, bool>,
     current_function_is_static: bool,
     is_function: bool,
+    is_component_body: bool,
 }
 
 impl Compiler {
@@ -66,6 +67,7 @@ impl Compiler {
             class_has_init_map: HashMap::new(),
             current_function_is_static: false,
             is_function: false,
+            is_component_body: false,
         }
     }
 
@@ -89,6 +91,7 @@ impl Compiler {
             class_has_init_map: HashMap::new(),
             current_function_is_static: false,
             is_function: false,
+            is_component_body: false,
         }
     }
 
@@ -473,7 +476,15 @@ impl Compiler {
                 }
                 Ok(())
             }
+            StatementKind::Component { name, attributes, body } => {
+                self.compile_component(name, attributes, body.as_deref(), stmt.line)
+            }
             StatementKind::Return(expr) => {
+                if self.is_component_body {
+                    self.compile_body_result(1, expr.as_ref(), stmt.line)?;
+                    self.chunk.emit0(op::RETURN, stmt.line);
+                    return Ok(());
+                }
                 if let Some(e) = expr {
                     self.compile_expression(e)?;
                 } else {
@@ -494,6 +505,11 @@ impl Compiler {
                 Ok(())
             }
             StatementKind::Continue => {
+                if self.is_component_body && self.continue_patches.is_empty() {
+                    self.compile_body_result(3, None, stmt.line)?;
+                    self.chunk.emit0(op::RETURN, stmt.line);
+                    return Ok(());
+                }
                 // Pop any locals added within the loop body
                 if let Some(target_local_count) = self.loop_locals.last() {
                     let current_local_count = self.locals.len();
@@ -514,6 +530,11 @@ impl Compiler {
                 Ok(())
             }
             StatementKind::Break => {
+                if self.is_component_body && self.break_patches.is_empty() {
+                    self.compile_body_result(2, None, stmt.line)?;
+                    self.chunk.emit0(op::RETURN, stmt.line);
+                    return Ok(());
+                }
                 // Pop any locals added within the loop/switch body
                 if let Some(target_local_count) = self.loop_locals.last() {
                     let current_local_count = self.locals.len();
@@ -2428,6 +2449,7 @@ impl Compiler {
         // The VM falls back to disk when chunk.source is empty.
         sub_compiler.scope_depth = 1;
         sub_compiler.is_function = true;
+        sub_compiler.is_component_body = matches!(body, FunctionBody::Component(_));
         sub_compiler.is_class = self.is_class;
         sub_compiler.imports = self.imports.clone();
         sub_compiler.runtime_module_classes = self.runtime_module_classes;
@@ -2505,7 +2527,7 @@ impl Compiler {
         }
 
         match body {
-            FunctionBody::Block(stmts) => {
+            FunctionBody::Block(stmts) | FunctionBody::Component(stmts) => {
                 for stmt in stmts {
                     sub_compiler.compile_statement(stmt, false)?;
                 }
@@ -2546,6 +2568,50 @@ impl Compiler {
             captured_scopes: Vec::new(),
             chunk: sub_compiler.chunk,
         })
+    }
+
+    fn compile_body_result(&mut self, kind: u32, value: Option<&Expression>, line: u32) -> Result<()> {
+        let callback = self.chunk.add_constant(Constant::String(BoxString::new("__mb_body_result")));
+        self.chunk.emit1(op::GET_GLOBAL, callback, line);
+        let kind = self.chunk.add_constant(Constant::Number(kind as f64));
+        self.chunk.emit1(op::CONSTANT, kind, line);
+        if let Some(value) = value { self.compile_expression(value)?; }
+        else { let null = self.chunk.add_constant(Constant::Null); self.chunk.emit1(op::CONSTANT, null, line); }
+        self.chunk.emit1(op::CALL, 2, line);
+        Ok(())
+    }
+
+    fn compile_component(&mut self, name: &str, attributes: &[(Expression, Expression)], body: Option<&[Statement]>, line: u32) -> Result<()> {
+        let callback = self.chunk.add_constant(Constant::String(BoxString::new("__mb_component")));
+        self.chunk.emit1(op::GET_GLOBAL, callback, line);
+        let name = self.chunk.add_constant(Constant::String(BoxString::new(name)));
+        self.chunk.emit1(op::CONSTANT, name, line);
+        self.compile_expression(&Expression::new(ExpressionKind::Literal(Literal::Struct(attributes.to_vec())), line))?;
+        if let Some(body) = body {
+            let function = self.compile_function(&format!("component@{line}@{}", self.chunk.code.len()), &[], &FunctionBody::Component(body.to_vec()), AstFunctionModifiers::default(), FunctionKind::ComponentBody)?;
+            let function = self.chunk.add_constant(Constant::CompiledFunction(function));
+            self.chunk.emit1(op::CONSTANT, function, line);
+        } else {
+            let null = self.chunk.add_constant(Constant::Null);
+            self.chunk.emit1(op::CONSTANT, null, line);
+        }
+        self.chunk.emit1(op::CALL, 3, line);
+        self.chunk.emit0(op::DUP, line);
+        let early = self.chunk.add_constant(Constant::String(BoxString::new("isEarlyExit")));
+        self.chunk.emit2(op::INVOKE, early, 0, line);
+        let skip = self.chunk.code.len();
+        self.chunk.emit1(op::JUMP_IF_FALSE, 0, line);
+        self.chunk.emit0(op::POP, line);
+        if !self.is_component_body {
+            let value = self.chunk.add_constant(Constant::String(BoxString::new("returnValue")));
+            self.chunk.emit1(op::MEMBER, value, line);
+        }
+        self.chunk.emit0(op::RETURN, line);
+        let target = self.chunk.code.len();
+        self.chunk.code[skip] = op::JUMP_IF_FALSE as u32 | (((target - skip - 1) as u32) << 8);
+        self.chunk.emit0(op::POP, line);
+        self.chunk.emit0(op::POP, line);
+        Ok(())
     }
 
     fn resolve_local(&self, name: &str) -> Option<usize> {
@@ -3177,6 +3243,10 @@ impl DependencyTracker {
             StatementKind::Expression(expr) => {
                 self.track_expression(expr);
             }
+            StatementKind::Component { attributes, body, .. } => {
+                for (key, value) in attributes { self.track_expression(key); self.track_expression(value); }
+                if let Some(body) = body { self.track_statements(body); }
+            }
             StatementKind::TryCatch {
                 try_branch,
                 catches,
@@ -3268,7 +3338,7 @@ impl DependencyTracker {
 
     fn track_function_body(&mut self, body: &FunctionBody) {
         match body {
-            FunctionBody::Block(stmts) => self.track_statements(stmts),
+            FunctionBody::Block(stmts) | FunctionBody::Component(stmts) => self.track_statements(stmts),
             FunctionBody::Expression(expr) => self.track_expression(expr),
             _ => {}
         }

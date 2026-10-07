@@ -602,32 +602,7 @@ impl<'a> TemplateParser<'a> {
 }
 
 pub(super) fn component_statement(name: &str, attributes: Vec<(Expression, Expression)>, body: Option<Vec<Statement>>, line: u32) -> Result<Statement> {
-    fn validate_body(body: &[Statement], loops: usize) -> Result<()> {
-        for statement in body {
-            match &statement.kind {
-                // ponytail: normal body closures only; non-local flow needs compiler/VM completion propagation.
-                StatementKind::Return(_) => anyhow::bail!("Component body non-local return is not yet supported"),
-                StatementKind::Break | StatementKind::Continue if loops == 0 => anyhow::bail!("Component body non-local break/continue is not yet supported"),
-                StatementKind::If {then_branch,else_branch,..} => { validate_body(then_branch,loops)?; if let Some(body) = else_branch { validate_body(body,loops)?; } }
-                StatementKind::ForLoop {body,..} | StatementKind::ForClassic {body,..} | StatementKind::WhileLoop {body,..} | StatementKind::DoWhile {body,..} => validate_body(body,loops + 1)?,
-                StatementKind::TryCatch {try_branch,catches,finally_branch} => { validate_body(try_branch,loops)?; for catch in catches { validate_body(&catch.body,loops)?; } if let Some(body) = finally_branch { validate_body(body,loops)?; } }
-                StatementKind::Switch {cases,default_case,..} => { for case in cases { validate_body(&case.body,loops + 1)?; } if let Some(body) = default_case { validate_body(body,loops + 1)?; } }
-                _ => (),
-            }
-        }
-        Ok(())
-    }
-    let body = if let Some(body) = body {
-        validate_body(&body,0)?;
-        Expression::new(ExpressionKind::Literal(Literal::Function {params:vec![], body:FunctionBody::Block(body), is_lambda:false}),line)
-    } else { Expression::new(ExpressionKind::Literal(Literal::Null),line) };
-    let args = vec![
-        Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(name.into())])), line),
-        Expression::new(ExpressionKind::Literal(Literal::Struct(attributes)), line), body,
-    ].into_iter().map(|value| Argument { name: None, value }).collect();
-    Ok(Statement::new(StatementKind::Expression(Expression::new(ExpressionKind::FunctionCall {
-        base: Box::new(Expression::new(ExpressionKind::Identifier("__mb_component".into()),line)), args,
-    },line)),line))
+    Ok(Statement::new(StatementKind::Component { name: name.into(), attributes, body }, line))
 }
 
 fn decode_template_text(text: &str) -> String {

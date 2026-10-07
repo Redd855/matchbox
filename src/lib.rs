@@ -358,6 +358,17 @@ fn collect_esp32_unsupported_features_in_stmt(
                 }
             }
         }
+        StatementKind::Component { attributes, body, .. } => {
+            for (key, value) in attributes {
+                collect_esp32_unsupported_features_in_expr(key, findings, embedded_web_enabled);
+                collect_esp32_unsupported_features_in_expr(value, findings, embedded_web_enabled);
+            }
+            if let Some(body) = body {
+                for statement in body {
+                    collect_esp32_unsupported_features_in_stmt(statement, findings, embedded_web_enabled);
+                }
+            }
+        }
         StatementKind::VariableDecl { value, .. } | StatementKind::Expression(value) => {
             collect_esp32_unsupported_features_in_expr(value, findings, embedded_web_enabled);
         }
@@ -394,7 +405,7 @@ fn collect_esp32_unsupported_features_in_function_body(
     embedded_web_enabled: bool,
 ) {
     match body {
-        ast::FunctionBody::Block(statements) => {
+        ast::FunctionBody::Block(statements) | ast::FunctionBody::Component(statements) => {
             for statement in statements {
                 collect_esp32_unsupported_features_in_stmt(
                     statement,

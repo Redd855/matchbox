@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const TARGET: &str = env!("MATCHBOX_TARGET");
-pub const MAGIC: &[u8; 8] = b"MBMODS\0\x08";
+pub const MAGIC: &[u8; 8] = b"MBMODS\0\x09";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedLibrary {

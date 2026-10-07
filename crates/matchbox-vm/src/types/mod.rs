@@ -503,6 +503,7 @@ pub enum FunctionKind {
     Udf,
     Closure,
     Lambda,
+    ComponentBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

@@ -5,6 +5,9 @@ use crate::types::{BxVM, BxValue};
 impl VM {
     fn arguments_scope(&self, fiber: usize) -> Option<BxValue> {
         let frame = self.fibers[fiber].frames.last()?;
+        if frame.function.kind == crate::types::FunctionKind::ComponentBody {
+            return frame.function.captured_scopes.get(1).copied();
+        }
         (frame.function.arity as usize == frame.function.params.len() + 1)
             .then(|| self.fibers[fiber].stack[frame.stack_base + frame.function.params.len()])
     }
@@ -13,7 +16,11 @@ impl VM {
         if let Some(scope) = self.fibers[fiber].frames.last().unwrap().local_scope {
             return scope;
         }
-        let scope = BxValue::new_ptr(self.struct_new());
+        let frame = self.fibers[fiber].frames.last().unwrap();
+        let captured = (frame.function.kind == crate::types::FunctionKind::ComponentBody)
+            .then(|| frame.function.captured_scopes.first().copied())
+            .flatten();
+        let scope = captured.unwrap_or_else(|| BxValue::new_ptr(self.struct_new()));
         self.fibers[fiber].frames.last_mut().unwrap().local_scope = Some(scope);
         scope
     }
@@ -41,6 +48,13 @@ impl VM {
     }
 
     pub(super) fn local_value(&self, fiber: usize, slot: usize) -> BxValue {
+        let frame = self.fibers[fiber].frames.last().unwrap();
+        if frame.function.kind == crate::types::FunctionKind::ComponentBody
+            && slot == frame.function.params.len()
+            && let Some(arguments) = self.arguments_scope(fiber)
+        {
+            return arguments;
+        }
         let value = self
             .slot_scope(fiber, slot)
             .and_then(|(scope, name)| self.scope_value(BxValue::new_ptr(scope), name));
@@ -137,6 +151,10 @@ impl VM {
     }
 
     pub(super) fn capture_scopes(&mut self, fiber: usize) -> Vec<BxValue> {
+        let function = &self.fibers[fiber].frames.last().unwrap().function;
+        if function.kind == crate::types::FunctionKind::ComponentBody {
+            return function.captured_scopes.clone();
+        }
         let Some(arguments) = self.arguments_scope(fiber) else {
             return Vec::new();
         };

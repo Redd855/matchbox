@@ -429,6 +429,10 @@ impl Services {
                 vm.construct_box_class(&class, args, named.then_some(names))
             }),
         }).expect("VM callback registration");
+        vm.register_callback("__mb_body_result", NativeCallback {
+            parameters: vec!["type".into(), "value".into()],
+            callback: Rc::new(crate::vm::components::body_result),
+        }).expect("VM callback registration");
         vm.register_callback("__mb_component", NativeCallback {
             parameters: vec!["name".into(), "attributes".into(), "body".into()],
             callback: Rc::new(|vm, args| {

@@ -5120,7 +5120,10 @@ impl VM {
                     if instance.is_none() && function.kind != crate::types::FunctionKind::Lambda
                         && !self.has_global_function(&name) && self.get_global(&name).is_some() {
                         self.insert_global(name, val);
-                    } else if !declared && function.arity as usize == function.params.len() + 1 {
+                    } else if instance.is_none() && function.kind == crate::types::FunctionKind::ComponentBody && function.captured_scopes.is_empty() {
+                        self.insert_global(name, val);
+                    } else if !declared && function.arity as usize == function.params.len() + 1
+                        && !(function.kind == crate::types::FunctionKind::ComponentBody && function.captured_scopes.is_empty()) {
                         let scope = self.local_scope(fiber_idx).as_gc_id().unwrap();
                         self.struct_set(scope, &name, val);
                     } else if let Some(id) = instance {
@@ -8644,7 +8647,7 @@ impl VM {
             let frame = self.fibers[fiber_idx].frames.last().unwrap();
             let chunk = frame.chunk.borrow();
             match &chunk.constants()[idx] {
-                Constant::CompiledFunction(function) if function.kind == crate::types::FunctionKind::Closure => Some(function.clone()),
+                Constant::CompiledFunction(function) if matches!(function.kind, crate::types::FunctionKind::Closure | crate::types::FunctionKind::ComponentBody) => Some(function.clone()),
                 _ => None,
             }
         };
@@ -8957,6 +8960,9 @@ impl VM {
                 roots.extend(frame.promoted_constants.iter().flatten().copied());
                 roots.extend(frame.local_scope);
                 roots.extend(frame.function.captured_scopes.iter().copied());
+                if let Some(PendingCompletion::Return(value) | PendingCompletion::Throw(value)) = frame.pending_completion {
+                    roots.push(value);
+                }
             }
             roots.push(BxValue::new_ptr(fiber.future_id));
         }

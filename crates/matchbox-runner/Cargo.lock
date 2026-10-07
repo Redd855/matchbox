@@ -1053,7 +1053,6 @@ dependencies = [
  "anyhow",
  "bincode",
  "console_error_panic_hook",
- "ctrlc",
  "js-sys",
  "matchbox_vm",
  "postcard",

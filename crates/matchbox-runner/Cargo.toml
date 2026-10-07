@@ -20,9 +20,6 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window"] }
 console_error_panic_hook = "0.1"
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-ctrlc = "3.5.2"
-
 [features]
 default = []
 js = ["matchbox_vm/js"]

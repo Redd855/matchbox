@@ -422,11 +422,9 @@ pub fn file_move(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String>
     let src = vm.to_string(args[0]);
     let dest = vm.to_string(args[1]);
 
-    if Path::new(&dest).exists() {
-        fs::remove_file(&dest).map_err(|e| e.to_string())?;
-    }
-    fs_extra::file::move_file(&src, &dest, &fs_extra::file::CopyOptions::new())
-        .map_err(|e| e.to_string())?;
+    // ponytail: atomic same-filesystem moves; cross-device moves need a staged-copy implementation.
+    // Never remove the destination first: a failed move must leave its contents intact.
+    fs::rename(&src, &dest).map_err(|e| e.to_string())?;
 
     Ok(BxValue::new_bool(true))
 }

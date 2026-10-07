@@ -162,8 +162,23 @@ pub enum DestructureKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClassMember {
-    Property(String),
+    Property(PropertyDeclaration),
     Statement(Statement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyDeclaration {
+    pub name: String,
+    pub annotations: Vec<PropertyAnnotation>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyAnnotation {
+    pub key: String,
+    pub key_span: Span,
+    pub value: Option<Expression>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

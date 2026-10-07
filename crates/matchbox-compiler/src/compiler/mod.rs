@@ -199,17 +199,17 @@ impl Compiler {
                 }
                 for member in members {
                     match member {
-                        ClassMember::Property(prop_name) => {
-                            properties.push(prop_name.clone());
-                            let null_idx = constructor_compiler.chunk.add_constant(Constant::Null);
-                            constructor_compiler.chunk.emit1(
-                                op::CONSTANT,
-                                null_idx,
-                                stmt.line as u32,
-                            );
+                        ClassMember::Property(property) => {
+                            properties.push(property.name.clone());
+                            if let Some(value) = property.annotations.iter().find(|annotation| annotation.key.eq_ignore_ascii_case("default")).and_then(|annotation| annotation.value.as_ref()) {
+                                constructor_compiler.compile_expression(value)?;
+                            } else {
+                                let null_idx = constructor_compiler.chunk.add_constant(Constant::Null);
+                                constructor_compiler.chunk.emit1(op::CONSTANT, null_idx, property.span.line);
+                            }
                             let name_idx = constructor_compiler
                                 .chunk
-                                .add_constant(Constant::String(BoxString::new(prop_name.as_str())));
+                                .add_constant(Constant::String(BoxString::new(property.name.as_str())));
                             constructor_compiler.chunk.emit1(
                                 op::SET_PRIVATE,
                                 name_idx as u32,

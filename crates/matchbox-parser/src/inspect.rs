@@ -103,6 +103,7 @@ impl<'a> Export<'a> {
                 | "BoxBufferOutput"
                 | "BoxComponent"
                 | "BoxArgumentDeclaration"
+                | "BoxAnnotation"
                 | "BoxReturnType"
                 | "BoxProperty"
         ) {
@@ -208,7 +209,7 @@ impl<'a> Export<'a> {
                 members,
             } => (
                 "BoxClass",
-                json!({"name":name,"extends":extends,"accessors":accessors,"implements":implements,"annotations":self.attributes(attributes),"modifiers":{"abstract":modifiers.is_abstract,"final":modifiers.is_final},"body":members.iter().filter_map(|member|if let ClassMember::Statement(stmt)=member{Some(self.statement(stmt))}else{None}).collect::<Vec<_>>(),"properties":members.iter().filter_map(|member|if let ClassMember::Property(name)=member{Some(self.node("BoxProperty",None,json!({"name":name})))}else{None}).collect::<Vec<_>>() }),
+                json!({"name":name,"extends":extends,"accessors":accessors,"implements":implements,"annotations":self.attributes(attributes),"modifiers":{"abstract":modifiers.is_abstract,"final":modifiers.is_final},"body":members.iter().filter_map(|member|if let ClassMember::Statement(stmt)=member{Some(self.statement(stmt))}else{None}).collect::<Vec<_>>(),"properties":members.iter().filter_map(|member|if let ClassMember::Property(property)=member{Some(self.node("BoxProperty",Some(property.span),json!({"name":property.name,"annotations":property.annotations.iter().map(|annotation|self.node("BoxAnnotation",Some(annotation.span),json!({"key":self.node("BoxFQN",Some(annotation.key_span),json!({"value":annotation.key})),"value":self.optional(&annotation.value)}))).collect::<Vec<_>>(),"documentation":[]})))}else{None}).collect::<Vec<_>>() }),
             ),
             StatementKind::InterfaceDecl { name, members } => (
                 "BoxInterface",
@@ -583,6 +584,26 @@ mod tests {
         let root = inspect("var text='##x##';", None, false, false).unwrap();
         assert_eq!(root["statements"][0]["expression"]["right"]["ASTType"], "BoxStringLiteral");
         assert_eq!(root["statements"][0]["expression"]["right"]["value"], "#x#");
+    }
+
+    #[test]
+    fn property_annotations_and_source_spans_are_retained() {
+        let source = "class { property String label; property name='id' type='numeric' default=1; function run(){return 1;} }";
+        let root = inspect(source, None, false, true).unwrap();
+        let class = &root["statements"][0];
+        assert_eq!(class["body"].as_array().unwrap().len(), 1);
+        let properties = class["properties"].as_array().unwrap();
+        assert_eq!(properties.len(), 2);
+        assert_eq!(properties[0]["name"], "label");
+        assert_eq!(properties[0]["sourceText"], "property String label;");
+        assert_eq!(properties[0]["annotations"][0]["key"]["value"], "String");
+        assert_eq!(properties[1]["name"], "id");
+        assert_eq!(properties[1]["sourceText"], "property name='id' type='numeric' default=1;");
+        assert_eq!(properties[1]["annotations"][0]["sourceText"], "name='id'");
+        assert_eq!(properties[1]["annotations"][0]["key"]["sourceText"], "name");
+        assert_eq!(properties[1]["annotations"][0]["value"]["value"], "id");
+        assert_eq!(properties[1]["annotations"][2]["value"]["value"], "1");
+        assert_eq!(properties[1]["span"]["start"], source.find("property name").unwrap());
     }
 
     #[test]

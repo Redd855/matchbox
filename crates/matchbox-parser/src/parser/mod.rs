@@ -646,23 +646,15 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LeftBrace)?;
         let mut members = Vec::new();
         while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
-            if self.peek_is(TokenKind::Property) {
-                self.pos += 1; // property
-                let mut prop_name = self.expect_get(TokenKind::Identifier)?;
-                if prop_name.eq_ignore_ascii_case("name") && self.peek_is(TokenKind::Equal) {
-                    self.pos += 1;
-                    let name = self.expect_get(TokenKind::String)?;
-                    prop_name = name[1..name.len() - 1].to_string();
-                    if prop_name.is_empty() { return Err(self.error_current("property name cannot be empty").into()); }
-                }
-                members.push(ClassMember::Property(prop_name));
-                if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
+            let start = self.pos;
+            let member = if self.peek_is(TokenKind::Property) {
+                self.parse_property().map(ClassMember::Property)
             } else {
-                let start = self.pos;
-                match self.parse_statement() {
-                    Ok(statement) => members.push(ClassMember::Statement(statement)),
-                    Err(error) => self.recover_statement(error, start, true)?,
-                }
+                self.parse_statement().map(ClassMember::Statement)
+            };
+            match member {
+                Ok(member) => members.push(member),
+                Err(error) => self.recover_statement(error, start, true)?,
             }
         }
         self.close_block()?;
@@ -670,6 +662,39 @@ impl<'a> Parser<'a> {
             StatementKind::ClassDecl { name, attributes, modifiers, extends, accessors, implements, members },
             line,
         ))
+    }
+
+    fn parse_property(&mut self) -> Result<PropertyDeclaration> {
+        let start = self.pos;
+        self.expect(TokenKind::Property)?;
+        let mut annotations = Vec::new();
+        while matches!(self.peek_kind(), Some(TokenKind::Identifier | TokenKind::Default | TokenKind::Required)) {
+            let annotation_start = self.pos;
+            let mut key = self.advance_lexeme().unwrap();
+            while self.peek_is(TokenKind::Dot) {
+                self.pos += 1;
+                key.push('.');
+                key.push_str(&self.expect_get(TokenKind::Identifier)?);
+            }
+            let key_span = self.span_since(annotation_start);
+            let value = if self.peek_is(TokenKind::Equal) {
+                self.pos += 1;
+                Some(self.parse_expression()?)
+            } else { None };
+            annotations.push(PropertyAnnotation { key, key_span, value, span: self.span_since(annotation_start) });
+        }
+        let name = if let Some(annotation) = annotations.iter().find(|annotation| annotation.key.eq_ignore_ascii_case("name") && annotation.value.is_some()) {
+            match &annotation.value.as_ref().unwrap().kind {
+                ExpressionKind::Literal(Literal::String(parts)) => parts.iter().map(|part| match part {
+                    StringPart::Text(text) => Some(text.as_str()), _ => None,
+                }).collect::<Option<String>>(),
+                _ => None,
+            }
+        } else {
+            annotations.iter().rev().find(|annotation| annotation.value.is_none()).map(|annotation| annotation.key.clone())
+        }.filter(|name| !name.is_empty()).ok_or_else(|| self.error_current("property requires a nonempty literal name"))?;
+        if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
+        Ok(PropertyDeclaration { name, annotations, span: self.span_since(start) })
     }
 
     fn parse_interface(&mut self, line: u32) -> Result<Statement> {

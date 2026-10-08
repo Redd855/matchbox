@@ -148,3 +148,8 @@ lifetime; this removes quadratic prefix copying, not all metadata retention.
 `python3 tests/wide_struct.py /path/to/matchbox` checks source-free wide structs,
 ordering/deletion, case-sensitive keys, copies, GC and a Linux 256 MiB RSS ceiling.
 It adds no consumer startup download or native-provider ABI change.
+
+Positional native calls skip global-name recovery; named calls still resolve the
+BIF name for argument ordering. `python3 tests/native_call_scaling.py /path/to/matchbox`
+checks source-free positional/named/reference/callback behavior and rejects
+positional-call slowdown from 8,192 unrelated globals.

@@ -8097,8 +8097,8 @@ impl VM {
                         args.push(self.fibers[fiber_idx].stack.pop().unwrap());
                     }
                     args.reverse();
-                    let native_name = self.native_global_name(func_val);
                     if let Some(names) = names {
+                        let native_name = self.native_global_name(func_val);
                         args = self.reorder_native_arguments(args, names, native_name.as_deref());
                     }
                     self.fibers[fiber_idx].stack.pop(); // Pop the function object

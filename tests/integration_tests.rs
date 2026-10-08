@@ -197,6 +197,7 @@ script_test!(vm_string_bifs_batch2, "vm_string_bifs_batch2.bxs");
 script_test!(vm_string_bifs, "vm_string_bifs.bxs");
 script_test!(vm_val, "vm_val.bxs");
 script_test!(vm_functional_bif, "vm_functional_bif.bxs");
+script_test!(vm_native_calls, "vm_native_calls.bxs");
 script_test!(vm_spread, "vm_spread.bxs");
 script_test!(vm_destructuring, "vm_destructuring.bxs");
 script_test!(vm_math_datetime, "vm_math_datetime.bxs");

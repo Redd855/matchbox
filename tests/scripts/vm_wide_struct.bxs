@@ -15,6 +15,17 @@ function wideStructCheck() {
     assert structDelete(copied, "key0") && structKeyExists(ordered, "key0");
     structClear(copied); copied.fresh = 7;
     assert len(copied) == 1 && copied.fresh == 7 && !structKeyExists(copied, "key199");
+    // Canonical hits and folded misses must preserve Unicode and key presentation.
+    var folded = structNew("ordered"); folded["MiXeDFastPath"] = 1; folded["Élève中😀"] = 2;
+    for (i = 0; i < 200; i++) {
+        assert folded["mixedfastpath"] == 1 && folded["élève中😀"] == 2 && folded["ÉLÈVE中😀"] == 2;
+        folded["mixedfastpath"] = 1; folded["élève中😀"] = 2;
+    }
+    var foldedKeys = structKeyArray(folded);
+    assert foldedKeys[1] == "MiXeDFastPath" && foldedKeys[2] == "Élève中😀";
+    assert !structKeyExists(folded, "missingfastpath") && !structKeyExists(folded, "MissingFastPath");
+    var exactUnicode = structNew("caseSensitive"); exactUnicode["Élève中😀"] = 3; exactUnicode["élève中😀"] = 4;
+    assert len(exactUnicode) == 2 && exactUnicode["Élève中😀"] == 3 && exactUnicode["élève中😀"] == 4;
     var sensitive = structNew("caseSensitive"); sensitive.Name = 1; sensitive.name = 2;
     assert len(sensitive) == 2 && sensitive.Name == 1 && sensitive.name == 2;
     assert sensitive["Name"] == 1 && sensitive["name"] == 2;

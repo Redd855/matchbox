@@ -153,3 +153,9 @@ Positional native calls skip global-name recovery; named calls still resolve the
 BIF name for argument ordering. `python3 tests/native_call_scaling.py /path/to/matchbox`
 checks source-free positional/named/reference/callback behavior and rejects
 positional-call slowdown from 8,192 unrelated globals.
+
+Canonical interner hits borrow the existing map key before allocating a lowercase
+fallback. Mixed-case misses keep Unicode folding/presentation behavior; exact
+case-sensitive IDs remain separate. `cargo test -p matchbox_vm --test canonical_keys`
+checks allocation-free repeated ASCII/Unicode struct reads and writes through the
+public VM API; the wide-struct fixture also checks key spelling and exact Unicode keys.

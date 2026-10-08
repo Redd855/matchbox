@@ -20,6 +20,10 @@ impl StringInterner {
     /// Intern a string: preserve the first casing seen for presentation,
     /// but use its lowercase form for deduplication (case-insensitivity).
     pub fn intern(&mut self, s: &str) -> InternId {
+        // Direct hits are canonical lowercase keys and cannot upgrade presentation.
+        if let Some(&id) = self.lookup.get(s) {
+            return id;
+        }
         let lowered = s.to_lowercase();
         if let Some(&id) = self.lookup.get(&lowered) {
             if let Some(existing) = self.strings.get_mut(id as usize) {
@@ -56,8 +60,10 @@ impl StringInterner {
 
     /// Read-only lookup (no insert). Returns None if the string was never interned.
     pub fn get_id(&self, s: &str) -> Option<InternId> {
-        let lowered = s.to_lowercase();
-        self.lookup.get(&lowered).copied()
+        self.lookup
+            .get(s)
+            .copied()
+            .or_else(|| self.lookup.get(&s.to_lowercase()).copied())
     }
 
     pub fn get_exact_id(&self, s: &str) -> Option<InternId> {

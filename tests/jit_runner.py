@@ -25,8 +25,9 @@ with tempfile.TemporaryDirectory(prefix="matchbox-jit-runner-") as directory:
         assert result.returncode == 0, (command, result.stdout, result.stderr)
         assert result.stdout.splitlines() == [b"19900", b"199", b"Function JIT / defaults / named calls / guards / scopes / GC: OK"], result.stdout
         assert b"[JIT] compiled empty loop" in result.stderr, (command, "Cranelift never activated", result.stderr)
-        for name in ["add", "max_val", "weighted", "choose", "divide", "ready"]:
+        for name in ["add", "max_val", "weighted", "choose", "divide", "ready", "pairRecord"]:
             assert f"[JIT] compiled hot fn name={name} ".encode() in result.stderr, (command, "Real compiler function never compiled", result.stderr)
+            assert f"[JIT] executed hot fn name={name}".encode() in result.stderr, (command, "Compiled function never executed successfully", result.stderr)
         assert b"[JIT] deopt hot fn body (type guard)" in result.stderr, result.stderr
 
     check([str(cli), str(source)])

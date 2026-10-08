@@ -22,7 +22,7 @@ cargo build --no-default-features --features 'bif-io,bif-cli,bif-crypto,bif-http
 python3 tests/jit_runner.py target/lint-jit/debug/matchbox
 ```
 
-The process check removes source/module copies, verifies numeric results, and requires actual Cranelift compilation of compiler-generated `add`, `max_val`, default/named-argument and guarded leaf functions, plus an empty-loop control, in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr. Enabling the feature alone is not evidence that application functions compiled.
+The process check removes source/module copies, verifies numeric results, and requires actual Cranelift compilation of compiler-generated `add`, `max_val`, default/named-argument and guarded leaf functions, plus an empty-loop control, in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr; a first-successful-execution message distinguishes native execution from compilation followed only by deopts. Enabling the feature alone is not evidence that application functions compiled.
 
 ---
 
@@ -54,7 +54,7 @@ The array data pointer and length are passed directly to the compiled loop, bypa
 
 Compilation starts at the body immediately after `FUNCTION_ENTER`, not at the function's prologue. Ordinary VM frames still bind positional/named/default arguments, initialize scopes and run entry interception; compiled results use ordinary return/exit interception. All call paths that execute this marker are covered. Debugger stepping stays interpreted.
 
-The initial safe subset is readonly, nonallocating, forward-only leaves:
+The safe subset is readonly, forward-only leaves, plus bounded terminal record returns:
 
 | Category | Opcodes |
 | :--- | :--- |
@@ -66,8 +66,9 @@ The initial safe subset is readonly, nonallocating, forward-only leaves:
 | Control flow | `JUMP`, `JUMP_IF_FALSE` (forward jumps) |
 | Stack | `POP`, `DUP` |
 | Return | `RETURN` |
+| Literal records | Terminal `STRUCT; RETURN`, at most two literal string keys with parameter values |
 
-Arithmetic/comparison guards require non-NaN floats. Integers, coercions, non-Boolean truthiness, zero divisors and NaN-producing arithmetic safely **deopt to body entry**, without replaying defaults/interception or losing scope mutations. Writes, calls and allocation remain interpreted; the old direct compiled-callee path and relaxed coercion helpers were removed because they bypassed these semantics. Program ownership guards prevent stale function/address reuse across GC; JIT state remains VM-local.
+Arithmetic/comparison guards require non-NaN floats. Integers, coercions, non-Boolean truthiness, zero divisors and NaN-producing arithmetic safely **deopt to body entry**, without replaying defaults/interception or losing scope mutations. For small records, machine code loads parameter values into a fixed two-slot result buffer; the epilogue performs terminal allocation through the same `literal_struct` VM service as the interpreter. Key interning/presentation and shared object identity are preserved. Inputs remain rooted in live frame scopes; heap allocation does not collect, and ordinary return handling roots the result. No allocations or side effects precede a possible deopt. General writes, calls and allocation remain interpreted; the old direct compiled-callee path and relaxed coercion helpers were removed because they bypassed these semantics. Program ownership guards prevent stale function/address reuse across GC; JIT state remains VM-local.
 
 ---
 
@@ -77,7 +78,7 @@ The following categories cause a function to remain interpreted:
 
 - **Global variables** — `GET_GLOBAL`, `SET_GLOBAL`, `DEFINE_GLOBAL`, `GET_PRIVATE`, `SET_PRIVATE`
 - **I/O** — `PRINT`, `PRINTLN`
-- **Object / collection creation** — `NEW`, `ARRAY`, `STRUCT`
+- **Object / collection creation** — `NEW`, `ARRAY`, and `STRUCT` outside the bounded terminal-record pattern
 - **Property and index access** — `MEMBER`, `SET_MEMBER`, `INC_MEMBER`, `INDEX`, `SET_INDEX`
 - **Calls inside compiled bodies** — `CALL`, `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED`
 - **Local mutation/declarations** — `SET_LOCAL`, `SET_LOCAL_POP`, `BIND_LOCAL`
@@ -87,7 +88,7 @@ The following categories cause a function to remain interpreted:
 - **Multi-word compare-jumps** — `LOCAL_COMPARE_JUMP`, `GLOBAL_COMPARE_JUMP`, `COMPARE_JUMP`, `LOCAL_JUMP_IF_NE_CONST`
 - **Miscellaneous** — `INC`, `DEC`, `INC_LOCAL`, `INC_GLOBAL`, `SWAP`, `OVER`, `JUMP_IF_NULL`
 
-This bounded subset enables actual numeric parameter-only helpers, not general functions, recursion or analyzer acceleration by itself.
+This bounded subset enables numeric parameter-only helpers and helpers such as bx-lint's `bxPosition`/`bxRange`, not general functions or recursion. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
 
 ---
 

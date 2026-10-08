@@ -2179,6 +2179,18 @@ impl VM {
         }
     }
 
+    fn literal_struct(&mut self, pairs: &[(u32, BxValue)]) -> BxValue {
+        let mut shape_id = self.shapes.get_root();
+        let mut properties = Vec::with_capacity(pairs.len());
+        for &(key, value) in pairs {
+            shape_id = self.shapes.transition(shape_id, key);
+            properties.push(value);
+        }
+        BxValue::new_ptr(self.heap.alloc(GcObject::Struct(BxStruct {
+            shape_id, properties, case_sensitive: false, ordered: false,
+        })))
+    }
+
     fn numeric_value(&self, val: BxValue) -> Option<f64> {
         if val.is_number() {
             Some(val.as_number())
@@ -5296,9 +5308,6 @@ impl VM {
                 }
                 op::STRUCT => {
                     let count = op0;
-                    let mut shape_id = self.shapes.get_root();
-                    let mut props = Vec::with_capacity(count as usize);
-
                     let mut kv_pairs = Vec::with_capacity(count as usize);
                     for _ in 0..count {
                         let value = self.fibers[fiber_idx].stack.pop().unwrap();
@@ -5308,19 +5317,8 @@ impl VM {
                         kv_pairs.push((key_id, value));
                     }
                     kv_pairs.reverse();
-
-                    for (key_id, value) in kv_pairs {
-                        shape_id = self.shapes.transition(shape_id, key_id);
-                        props.push(value);
-                    }
-
-                    let id = self.heap.alloc(GcObject::Struct(BxStruct {
-                        shape_id,
-                        properties: props,
-                        case_sensitive: false,
-                        ordered: false,
-                    }));
-                    self.fibers[fiber_idx].stack.push(BxValue::new_ptr(id));
+                    let value = self.literal_struct(&kv_pairs);
+                    self.fibers[fiber_idx].stack.push(value);
                 }
                 op::INDEX | op::SAFE_INDEX => {
                     let index_val = self.fibers[fiber_idx].stack.pop().unwrap();

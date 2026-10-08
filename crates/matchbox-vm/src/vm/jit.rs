@@ -55,6 +55,13 @@ pub type HotFnFn = unsafe extern "C" fn(*mut u64, *const std::ffi::c_void, *mut 
 
 const JIT_FN_THRESHOLD: u64 = 100;
 
+#[derive(Clone)]
+pub struct CompiledFn {
+    call: HotFnFn,
+    record_keys: Option<Arc<[crate::types::box_string::BoxString]>>,
+    executed: bool,
+}
+
 pub unsafe extern "C" fn jit_ic_member_fallback(
     heap_ptr: *const std::ffi::c_void,
     gc_id: u64,
@@ -157,6 +164,7 @@ impl super::VM {
         }
         let frame = self.fibers[fiber].frames.last().unwrap();
         let program = Arc::clone(&frame.chunk.borrow().program);
+        let key = (Arc::as_ptr(&program) as usize, entry, frame.function.arity);
         let compiled = self.jit.as_mut()?.profile_fn(
             program,
             entry,
@@ -178,16 +186,43 @@ impl super::VM {
         // Eligibility bounds every GET_LOCAL and rejects writes/calls/allocations.
         // The VM stack cannot reallocate or collect during this native leaf.
         let locals = unsafe { self.fibers[fiber].stack.as_mut_ptr().add(base) as *mut u64 };
-        let mut result = 0u64;
+        // ponytail: at most two terminal record fields; wider/nested records
+        // need GC-rooted spills before enabling their bytecodes.
+        let mut results = [0u64; 2];
         let status = unsafe {
-            compiled(
+            (compiled.call)(
                 locals,
                 &self.heap as *const _ as *const std::ffi::c_void,
-                &mut result,
+                results.as_mut_ptr(),
             )
         };
         if status == 0 {
-            Some(unsafe { std::mem::transmute::<u64, crate::types::BxValue>(result) })
+            let jit = self.jit.as_mut().unwrap();
+            if jit.trace {
+                let cached = &mut jit.compiled_fns.get_mut(&key).unwrap().1;
+                if !cached.executed {
+                    cached.executed = true;
+                    eprintln!(
+                        "[JIT] executed hot fn name={}",
+                        self.fibers[fiber].frames.last().unwrap().function.name
+                    );
+                }
+            }
+            if let Some(keys) = compiled.record_keys {
+                let mut pairs = [(0, crate::types::BxValue::new_null()); 2];
+                // Match STRUCT's reverse key interning/presentation, then source order.
+                for (i, key) in keys.iter().enumerate().rev() {
+                    let mut key = key.clone();
+                    pairs[i] = (self.interner.intern(key.as_flat_str()), unsafe {
+                        std::mem::transmute::<u64, crate::types::BxValue>(results[i])
+                    });
+                }
+                // Inputs still belong to live frame scopes. Heap::alloc does not
+                // collect; ordinary return handling roots the constructed result.
+                Some(self.literal_struct(&pairs[..keys.len()]))
+            } else {
+                Some(unsafe { std::mem::transmute::<u64, crate::types::BxValue>(results[0]) })
+            }
         } else {
             if self.jit.as_ref().is_some_and(|jit| jit.trace) {
                 eprintln!("[JIT] deopt hot fn body (type guard)");
@@ -220,7 +255,7 @@ pub struct JitState {
 
     // Tier-4: hot function compilation
     fn_counts: HashMap<(usize, usize, u32), (Weak<ChunkProgram>, u64)>,
-    compiled_fns: HashMap<(usize, usize, u32), (Arc<ChunkProgram>, HotFnFn)>,
+    compiled_fns: HashMap<(usize, usize, u32), (Arc<ChunkProgram>, CompiledFn)>,
 
     // OSR: persistent per-site iteration counters keyed on (fn_id, ip_at_start).
     // Survive across run_fiber quanta so fiber-scheduled loops can cross time-slice
@@ -1375,11 +1410,11 @@ impl JitState {
         entry: usize,
         arity: u32,
         name: &str,
-    ) -> Option<HotFnFn> {
+    ) -> Option<CompiledFn> {
         let fn_id = Arc::as_ptr(&program) as usize;
         let key = (fn_id, entry, arity);
         if let Some((_, compiled)) = self.compiled_fns.get(&key) {
-            return Some(*compiled);
+            return Some(compiled.clone());
         }
         let (owner, count) = self
             .fn_counts
@@ -1396,7 +1431,8 @@ impl JitState {
         *count += 1;
         if *count == JIT_FN_THRESHOLD {
             let code = &program.code[entry..];
-            if !Self::fn_is_translatable(code, &program.constants, arity) {
+            let record_keys = Self::record_return(code, &program.constants, arity);
+            if record_keys.is_none() && !Self::fn_is_translatable(code, &program.constants, arity) {
                 if self.trace {
                     eprintln!("[JIT] skipped hot fn name={} (unsupported bytecode)", name);
                 }
@@ -1408,13 +1444,58 @@ impl JitState {
                         "[JIT] compiled hot fn name={} fn_id=0x{:x} entry={}",
                         name, fn_id, entry
                     );
-                    self.compiled_fns.insert(key, (program, compiled));
+                    let compiled = CompiledFn {
+                        call: compiled,
+                        record_keys: record_keys.map(Arc::from),
+                        executed: false,
+                    };
+                    self.compiled_fns.insert(key, (program, compiled.clone()));
                     return Some(compiled);
                 }
                 Err(e) => eprintln!("[JIT] hot fn compile failed: {}", e),
             }
         }
         None
+    }
+
+    /// Terminal small STRUCT literals whose values are parameters, not allocations.
+    fn record_return(
+        code: &[u32],
+        consts: &[crate::types::Constant],
+        arity: u32,
+    ) -> Option<Vec<crate::types::box_string::BoxString>> {
+        use crate::types::Constant;
+        let end = code
+            .iter()
+            .position(|word| (word & 0xFF) as u8 == op::STRUCT)?;
+        let count = (code[end] >> 8) as usize;
+        if count > 2 || end != count * 2 || code.get(end + 1).copied()? != op::RETURN as u32 {
+            return None;
+        }
+        let tail = &code[end + 2..];
+        if !tail.is_empty()
+            && !(tail.len() == 2
+                && (tail[0] & 0xFF) as u8 == op::CONSTANT
+                && matches!(consts.get((tail[0] >> 8) as usize), Some(Constant::Null))
+                && tail[1] == op::RETURN as u32)
+        {
+            return None;
+        }
+        code[..end]
+            .chunks_exact(2)
+            .map(|pair| {
+                if (pair[0] & 0xFF) as u8 != op::CONSTANT
+                    || (pair[1] & 0xFF) as u8 != op::GET_LOCAL
+                    || pair[1] >> 8 >= arity
+                {
+                    return None;
+                }
+                match consts.get((pair[0] >> 8) as usize)? {
+                    Constant::String(key) => Some(key.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     fn fn_is_translatable(code: &[u32], consts: &[crate::types::Constant], arity: u32) -> bool {
@@ -1534,6 +1615,7 @@ impl JitState {
                         break;
                     }
                     op::GET_LOCAL | op::CONSTANT | op::DUP => depth += 1,
+                    op::STRUCT => depth += 1 - 2 * op02 as i32,
                     op::SET_LOCAL_POP | op::POP => depth -= 1,
                     op::CALL => {
                         // pops (op02 + 1) values (args + func), pushes 1 → net -op02
@@ -1691,6 +1773,10 @@ impl JitState {
                                 crate::types::BxValue::new_bool(*b)
                             }
                             Some(crate::types::Constant::Null) => crate::types::BxValue::new_null(),
+                            // record_return validates these are only literal keys.
+                            Some(crate::types::Constant::String(_)) => {
+                                crate::types::BxValue::new_null()
+                            }
                             _ => {
                                 return Err(anyhow::anyhow!("unsupported constant at idx {}", idx));
                             }
@@ -1839,6 +1925,19 @@ impl JitState {
                         builder.ins().jump(tgt_block, &[]);
 
                         vstack.clear();
+                        block_terminated = true;
+                    }
+                    op::STRUCT => {
+                        for field in 0..op0 {
+                            builder.ins().store(
+                                MemFlags::new(),
+                                vstack[field * 2 + 1],
+                                out_val_ptr,
+                                (field * 8) as i32,
+                            );
+                        }
+                        // Terminal allocation uses the same VM service as STRUCT.
+                        builder.ins().jump(normal_exit, &[]);
                         block_terminated = true;
                     }
                     op::RETURN => {

@@ -121,6 +121,12 @@ fn main() {
         features.push("bif-cli");
     }
 
+    // Cranelift is desktop-only; do not forward it to WASM/WASI runners.
+    let mut native_features = features.clone();
+    if env::var("CARGO_FEATURE_JIT").is_ok() {
+        native_features.push("jit");
+    }
+
     // Helper closure to build and copy a stub
     let build_stub = |target: Option<&str>,
                       dest_name: &str,
@@ -130,9 +136,11 @@ fn main() {
                       enabled_features: &[&str]|
      -> bool {
         let dest_path = stub_dest_dir.join(dest_name);
+        let feature_path = stub_dest_dir.join(format!("{}.features", dest_name));
+        let feature_key = enabled_features.join(",");
 
-        // Determine whether we need (re)build: missing stub, zero-length stub,
-        // or any tracked source file is newer than the stub.
+        // Rebuild on source/feature changes; never reuse a non-JIT stub for a JIT build.
+        // ponytail: shared stub cache; serialize differing-feature builds until per-build stub paths are needed.
         let sources_to_watch = [
             Path::new(&root_dir).join("crates/matchbox-runner/src/main.rs"),
             Path::new(&root_dir).join("crates/matchbox-runner/Cargo.toml"),
@@ -144,14 +152,15 @@ fn main() {
             Path::new(&root_dir).join("build.rs"),
         ];
         let stub_mtime = dest_path.metadata().and_then(|m| m.modified()).ok();
-        let needs_rebuild = stub_mtime.map_or(true, |stub_time| {
-            fs::metadata(&dest_path)
-                .map(|m| m.len() == 0)
-                .unwrap_or(true)
-                || sources_to_watch
-                    .iter()
-                    .any(|src| path_is_newer_than(src, stub_time))
-        });
+        let needs_rebuild = fs::read_to_string(&feature_path).ok().as_deref() != Some(&feature_key)
+            || stub_mtime.map_or(true, |stub_time| {
+                fs::metadata(&dest_path)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(true)
+                    || sources_to_watch
+                        .iter()
+                        .any(|src| path_is_newer_than(src, stub_time))
+            });
 
         let mut use_stub = !needs_rebuild;
 
@@ -182,6 +191,8 @@ fn main() {
                     src_path = src_path.join("release").join(src_name);
 
                     if fs::copy(&src_path, &dest_path).is_ok() {
+                        fs::write(&feature_path, &feature_key)
+                            .expect("Failed to record runner features");
                         success = true;
                         use_stub = true;
                         println!(
@@ -225,7 +236,10 @@ fn main() {
             }
 
             if !success {
-                if target.is_some() && dest_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                if target.is_some()
+                    && fs::read_to_string(&feature_path).ok().as_deref() == Some(&feature_key)
+                    && dest_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                {
                     println!(
                         "cargo:warning=Failed to rebuild {}; using pre-existing stub at {}",
                         dest_name,
@@ -501,7 +515,7 @@ fn main() {
                 src,
                 target,
                 &mut stubs_rs_content,
-                &features,
+                &native_features,
             );
             if target == host {
                 if available {
@@ -530,7 +544,7 @@ fn main() {
             native_src_name,
             "host",
             &mut stubs_rs_content,
-            &features,
+            &native_features,
         );
         if available {
             stubs_rs_content.push_str(&format!(

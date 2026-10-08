@@ -775,6 +775,8 @@ pub fn run() -> Result<()> {
         if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
             let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
             let mut vm = vm::VM::new_with_args(std_env::args().collect());
+            #[cfg(feature = "jit")]
+            vm.enable_jit();
             application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
             return Ok(());
         }
@@ -1610,6 +1612,8 @@ fn process_file_with_args(
         if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
             let app = matchbox_vm::bundle::Application::from_executable(&bytes)?;
             let mut vm = vm::VM::new_with_args(cli_args);
+            #[cfg(feature = "jit")]
+            vm.enable_jit();
             app.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
             return Ok(());
         }

@@ -310,6 +310,7 @@ pub struct JitState {
     ctx: Context,
     func_ctx: FunctionBuilderContext,
     func_counter: u32,
+    trace: bool,
 
     // Tier-1: empty self-loops
     loop_counts: HashMap<(usize, usize), u64>,
@@ -366,12 +367,17 @@ impl JitState {
         builder.symbol("jit_fallback_mod", jit_fallback_mod as *const u8);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
+        let trace = std::env::var_os("MATCHBOX_JIT_TRACE").is_some();
+        if trace {
+            eprintln!("[JIT] Cranelift initialized");
+        }
 
         Ok(Self {
             module,
             ctx,
             func_ctx: FunctionBuilderContext::new(),
             func_counter: 0,
+            trace,
             loop_counts: HashMap::new(),
             compiled_loops: HashMap::new(),
             generic_counts: HashMap::new(),
@@ -1518,17 +1524,21 @@ impl JitState {
         code: &[u32],
         consts: &[crate::types::Constant],
         arity: u32,
+        name: &str,
     ) -> Option<HotFnFn> {
         let count = self.fn_counts.entry(fn_id).or_insert(0);
         *count += 1;
         if *count == JIT_FN_THRESHOLD {
             if !Self::fn_is_translatable(code) {
+                if self.trace {
+                    eprintln!("[JIT] skipped hot fn name={} (unsupported bytecode)", name);
+                }
                 return None;
             }
             let mode = *self.fn_recompile_mode.get(&fn_id).unwrap_or(&0);
             match self.compile_hot_fn(fn_id, gc_id, code, consts, arity, mode) {
                 Ok(_) => {
-                    eprintln!("[JIT] compiled hot fn fn_id=0x{:x} mode={}", fn_id, mode);
+                    eprintln!("[JIT] compiled hot fn name={} fn_id=0x{:x} mode={}", name, fn_id, mode);
                     return self.compiled_fns.get(&fn_id).copied();
                 }
                 Err(e) => eprintln!("[JIT] hot fn compile failed: {}", e),

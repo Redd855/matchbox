@@ -22,6 +22,7 @@ console_error_panic_hook = "0.1"
 
 [features]
 default = []
+jit = ["matchbox_vm/jit"]
 js = ["matchbox_vm/js"]
 bif-io = ["matchbox_vm/bif-io"]
 bif-http = ["matchbox_vm/bif-http"]

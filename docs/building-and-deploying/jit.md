@@ -9,11 +9,20 @@ MatchBox includes a multi-tier JIT compiler built on [Cranelift](https://craneli
 | Build target | JIT active? | Reason |
 | :--- | :---: | :--- |
 | Native CLI (`matchbox script.bxs`) | Yes | Enabled by default in the native CLI binary |
-| Native runner stubs (cross-deployed) | No | Stubs are built without the `jit` feature to keep their embedded size down |
+| Desktop native runner stubs | Opt-in | The CLI forwards its `jit` feature; runners initialize Cranelift before plain or module-envelope execution |
 | WASM (browser / container) | No | Cranelift does not target WASM; the browser's own JIT runs the WASM module |
 | ESP32 / embedded | No | The `matchbox-esp32-runner` crate is workspace-excluded and has no Cranelift dependency |
 
-The JIT is compiled in via the `jit` Cargo feature, which is included in the default feature set of the `matchbox` CLI crate. The `matchbox_vm` library crate keeps `jit` opt-in (default off) so that consumers — the ESP32 runner, WASM runner, and native runner stubs — remain lean unless they explicitly request it.
+The JIT is compiled in via the `jit` Cargo feature, which is included in the default feature set of the `matchbox` CLI crate. The `matchbox_vm` library and desktop runner keep `jit` opt-in (default off). JIT-enabled CLI builds forward the feature only to desktop runner stubs, never WASM/WASI/ESP32. Plain bytecode and module envelopes initialize the same JIT policy. Cached desktop stubs record their feature set so switching build flags cannot silently reuse a non-JIT stub.
+
+For a no-JNI JIT-enabled author build:
+
+```bash
+cargo build --no-default-features --features 'bif-io,bif-cli,bif-crypto,bif-http,jit' --target-dir target/lint-jit
+python3 tests/jit_runner.py target/lint-jit/debug/matchbox
+```
+
+The process check removes source/module copies, verifies numeric results, and requires actual Cranelift loop compilation in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr. Enabling the feature alone is not evidence that application functions compiled.
 
 ---
 
@@ -93,13 +102,11 @@ cargo build --release --no-default-features \
 
 ## Future Directions
 
-### JIT in native runner stubs
+### Measure eligibility, not just activation
 
-The `build.rs` feature-forwarding block (lines 58–64) explicitly lists which features are passed to `matchbox-runner` stub builds. Adding `"jit"` there would give deployed native runner stubs the same JIT benefits as the CLI's local interpreter. The trade-off is binary size: Cranelift adds roughly 10–20 MB per stub, which multiplies across targets in cross-compile mode. When that trade-off becomes acceptable, the change is a one-liner in `build.rs`:
+A bounded bx-lint LSP experiment initialized Cranelift and reached the hot-function threshold in 35 helpers, but compiled none: all observed candidates were rejected for unsupported bytecode. Opening a 200-function script remained about 1.7 seconds, with or without JIT. Even the current pure-math `jit_hot_fn.bxs` functions were rejected in that build; existing output-only tests do not prove Tier-4 activation. The separate runner check above uses a supported empty loop as its positive compilation control. These are build/workload observations, not a general JIT speed guarantee.
 
-```rust
-if env::var("CARGO_FEATURE_JIT").is_ok() { features.push("jit"); }
-```
+The tested Linux bx-lint standalone grew from 5,821,860 to 7,607,060 bytes; actual linked size depends on target, features and optimization. Do not assume a fixed Cranelift size penalty.
 
 ### Wider Tier-4 opcode coverage
 

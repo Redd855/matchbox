@@ -7999,7 +7999,7 @@ impl VM {
                                 let fn_id = Rc::as_ptr(&func) as usize;
                                 let code = func.chunk.code().as_slice();
                                 let consts = func.chunk.constants().as_slice();
-                                jit.profile_fn(fn_id, id, code, consts, func.arity)
+                                jit.profile_fn(fn_id, id, code, consts, func.arity, &func.name)
                             } else {
                                 None
                             }

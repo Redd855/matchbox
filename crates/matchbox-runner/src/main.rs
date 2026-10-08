@@ -172,13 +172,15 @@ fn main() {}
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn main() -> Result<()> {
     // Keep the OS default Ctrl+C action: VM polling cannot interrupt blocked native calls.
+    let mut vm = VM::new_with_args(std_env::args().collect());
+    #[cfg(feature = "jit")]
+    vm.enable_jit();
 
     #[cfg(not(target_family = "wasm"))]
     {
         let bytes = fs::read(std_env::current_exe()?)?;
         if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
             let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
-            let mut vm = VM::new_with_args(std_env::args().collect());
             application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
             return Ok(());
         }
@@ -194,7 +196,6 @@ fn main() -> Result<()> {
             #[cfg(not(target_family = "wasm"))]
             if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
                 let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
-                let mut vm = VM::new_with_args(std_env::args().collect());
                 application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
                 return Ok(());
             }
@@ -207,9 +208,6 @@ fn main() -> Result<()> {
         }
     };
 
-    // Collect CLI arguments (including the executable path as args[0])
-    let cli_args: Vec<String> = std_env::args().collect();
-    let mut vm = VM::new_with_args(cli_args);
     match vm.interpret(chunk) {
         Ok(_val) => {
             // println!("Result: {}", val);

@@ -140,3 +140,11 @@ matchbox --target esp32 --chip esp32s3 app.bxs --flash
 3. **VM**: Stack-based machine with a cooperative fiber scheduler.
 4. **BXM Transpiler**: Ahead-of-time markup transpilation for near-native template rendering.
 5. **Portability**: Native binaries are produced by appending bytecode to pre-compiled architecture-specific runner stubs.
+
+Struct/instance shape layouts use structurally shared HAMT field maps (`rpds`),
+not complete field-map copies for each insertion. Shape IDs/property indices
+remain immutable for member caches and JIT guards. Layouts still live for the VM
+lifetime; this removes quadratic prefix copying, not all metadata retention.
+`python3 tests/wide_struct.py /path/to/matchbox` checks source-free wide structs,
+ordering/deletion, case-sensitive keys, copies, GC and a Linux 256 MiB RSS ceiling.
+It adds no consumer startup download or native-provider ABI change.

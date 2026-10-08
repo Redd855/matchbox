@@ -22,7 +22,6 @@ impl StringInterner {
     pub fn intern(&mut self, s: &str) -> InternId {
         let lowered = s.to_lowercase();
         if let Some(&id) = self.lookup.get(&lowered) {
-            self.exact_lookup.entry(s.to_string()).or_insert(id);
             if let Some(existing) = self.strings.get_mut(id as usize) {
                 if existing == &lowered && s != lowered {
                     *existing = s.to_string();
@@ -33,12 +32,12 @@ impl StringInterner {
         let id = self.strings.len() as InternId;
         self.strings.push(s.to_string());
         self.lookup.insert(lowered, id);
-        self.exact_lookup.entry(s.to_string()).or_insert(id);
         id
     }
 
     /// Intern a key without case folding. Case-sensitive structs use this
-    /// path so distinct spellings can occupy distinct shape fields.
+    /// path so distinct spellings can occupy distinct shape fields. Exact IDs
+    /// must stay separate from folded IDs whose presentation can be upgraded.
     pub fn intern_case_sensitive(&mut self, s: &str) -> InternId {
         if let Some(&id) = self.exact_lookup.get(s) {
             return id;

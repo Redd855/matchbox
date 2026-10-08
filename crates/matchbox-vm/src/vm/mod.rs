@@ -1290,16 +1290,15 @@ impl BxVM for VM {
                 let current_shape = &self.shapes.shapes[s.shape_id as usize];
                 for (&fid, &fidx) in &current_shape.fields {
                     if fid != key_id {
-                        entries.push((fid, s.properties[fidx as usize]));
+                        entries.push((fidx, fid, s.properties[fidx as usize]));
                     }
                 }
 
-                // Sort by index to maintain some consistency if possible,
-                // but really we just want a shape that has these fields.
-                // For simplicity, we'll build a new shape chain from root.
+                // Hash-map iteration order is not insertion order. Preserve surviving slots.
+                entries.sort_unstable_by_key(|entry| entry.0);
                 let mut new_shape_id = self.shapes.get_root();
                 let mut new_properties = Vec::with_capacity(entries.len());
-                for (fid, val) in entries {
+                for (_, fid, val) in entries {
                     new_shape_id = self.shapes.transition(new_shape_id, fid);
                     new_properties.push(val);
                 }
@@ -1323,7 +1322,7 @@ impl BxVM for VM {
     fn struct_key_array(&self, id: usize) -> Vec<String> {
         if let GcObject::Struct(s) = self.heap.get(id) {
             let shape = &self.shapes.shapes[s.shape_id as usize];
-            let mut keys = vec![String::new(); shape.fields.len()];
+            let mut keys = vec![String::new(); shape.fields.size()];
             for (&fid, &fidx) in &shape.fields {
                 keys[fidx as usize] = self.interner.resolve(fid).to_string();
             }
@@ -5648,7 +5647,11 @@ impl VM {
                                     _ => {}
                                 }
 
-                                let key_name = self.interner.resolve(name_id).to_string();
+                                let key_name = if s.case_sensitive {
+                                    self.read_string_constant(fiber_idx, idx as usize)?
+                                } else {
+                                    self.interner.resolve(name_id).to_string()
+                                };
                                 if let Some(idx) = self.struct_key_lookup_id(id, &key_name)
                                     .and_then(|key_id| self.shapes.get_index(shape_id, key_id))
                                 {
@@ -5897,7 +5900,7 @@ impl VM {
                         }
 
                         let struct_name_id = if matches!(self.heap.get_opt(id), Some(GcObject::Struct(_))) {
-                            let name = self.interner.resolve(name_id).to_string();
+                            let name = self.read_string_constant(fiber_idx, idx as usize)?;
                             Some(self.struct_key_id(id, &name))
                         } else {
                             None
@@ -9252,7 +9255,7 @@ fn wasm_instance_keys(vm: &mut VM, base_val: BxValue) -> Vec<String> {
         GcObject::Struct(_) => vm.struct_key_array(id),
         GcObject::Instance(inst) => {
             let shape = &vm.shapes.shapes[inst.shape_id as usize];
-            let mut keys = vec![String::new(); shape.fields.len()];
+            let mut keys = vec![String::new(); shape.fields.size()];
             for (&fid, &fidx) in &shape.fields {
                 keys[fidx as usize] = vm.interner.resolve(fid).to_string();
             }

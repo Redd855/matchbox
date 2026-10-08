@@ -4426,6 +4426,13 @@ impl VM {
                     flush_ip!();
                     if let Err(error) = self.enter_function_events(fiber_idx) {
                         self.throw_error(fiber_idx, &error)?;
+                    } else {
+                        #[cfg(feature = "jit")]
+                        if let Some(result) = self.run_jit_fn_body(fiber_idx, ip) {
+                            if let Some(result) = self.handle_return(fiber_idx, result)? {
+                                return Ok(Some(result));
+                            }
+                        }
                     }
                     frame_changed = true;
                     continue 'quantum;
@@ -7989,73 +7996,6 @@ impl VM {
                     for arg in final_args {
                         self.fibers[fiber_idx].stack.push(arg);
                     }
-
-                    // ── Tier-4 hot function fast-path ─────────────────────────
-                    #[cfg(feature = "jit")]
-                    {
-                        let compiled_opt = if let Some(ref jit) = self.jit {
-                            let fn_id = Rc::as_ptr(&func) as usize;
-                            jit.get_compiled_fn(fn_id)
-                        } else {
-                            None
-                        };
-
-                        let compiled = if compiled_opt.is_none() {
-                            if let Some(ref mut jit) = self.jit {
-                                let fn_id = Rc::as_ptr(&func) as usize;
-                                let code = func.chunk.code().as_slice();
-                                let consts = func.chunk.constants().as_slice();
-                                jit.profile_fn(fn_id, id, code, consts, func.arity, &func.name)
-                            } else {
-                                None
-                            }
-                        } else {
-                            compiled_opt
-                        };
-
-                        // Set thread-local pointer so compiled callees can resolve other
-                        // compiled functions via jit_resolve_fn without passing extra state.
-                        if let Some(ref jit) = self.jit {
-                            crate::vm::jit::set_compiled_fns_ptr(
-                                &jit.compiled_fns_by_gcid as *const _,
-                            );
-                        }
-
-                        if let Some(compiled_fn) = compiled {
-                            let stack_base =
-                                self.fibers[fiber_idx].stack.len() - func.arity as usize;
-                            // Reserve extra space for additional locals the function may use
-                            self.fibers[fiber_idx].stack.reserve(64);
-                            let locals_raw = unsafe {
-                                self.fibers[fiber_idx].stack.as_mut_ptr().add(stack_base)
-                                    as *mut u64
-                            };
-                            let heap_raw = &self.heap as *const _ as *const std::ffi::c_void;
-                            let mut ret_bits: u64 = 0;
-
-                            let status =
-                                unsafe { compiled_fn(locals_raw, heap_raw, &mut ret_bits) };
-
-                            if status == 0 {
-                                // Success: remove the function object + args, push return value
-                                let func_slot = stack_base - 1;
-                                self.fibers[fiber_idx].stack.truncate(func_slot);
-                                self.fibers[fiber_idx]
-                                    .stack
-                                    .push(unsafe { std::mem::transmute::<u64, BxValue>(ret_bits) });
-                                return Ok(());
-                            }
-                            // status == 1 → deopt: fall through to normal frame creation
-                            eprintln!(
-                                "[JIT] Tier-4 deopt fn_id=0x{:x}",
-                                Rc::as_ptr(&func) as usize
-                            );
-                            if let Some(ref mut jit) = self.jit {
-                                jit.inc_fn_deopt(Rc::as_ptr(&func) as usize);
-                            }
-                        }
-                    }
-                    // ── End Tier-4 ────────────────────────────────────────────
 
                     let sub_chunk = func.chunk.execution_chunk();
                     let constant_count = sub_chunk.borrow().constants().len();

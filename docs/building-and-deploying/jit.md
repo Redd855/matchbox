@@ -22,7 +22,7 @@ cargo build --no-default-features --features 'bif-io,bif-cli,bif-crypto,bif-http
 python3 tests/jit_runner.py target/lint-jit/debug/matchbox
 ```
 
-The process check removes source/module copies, verifies numeric results, and requires actual Cranelift loop compilation in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr. Enabling the feature alone is not evidence that application functions compiled.
+The process check removes source/module copies, verifies numeric results, and requires actual Cranelift compilation of compiler-generated `add`, `max_val`, default/named-argument and guarded leaf functions, plus an empty-loop control, in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr. Enabling the feature alone is not evidence that application functions compiled.
 
 ---
 
@@ -52,22 +52,22 @@ The array data pointer and length are passed directly to the compiled loop, bypa
 
 **Trigger:** A function body that passes a translatability check, after ≥ 100 calls.
 
-The entire function body is compiled to a native `fn(locals_ptr, heap_ptr, out_val_ptr) -> status` function. Supported operations:
+Compilation starts at the body immediately after `FUNCTION_ENTER`, not at the function's prologue. Ordinary VM frames still bind positional/named/default arguments, initialize scopes and run entry interception; compiled results use ordinary return/exit interception. All call paths that execute this marker are covered. Debugger stepping stays interpreted.
+
+The initial safe subset is readonly, nonallocating, forward-only leaves:
 
 | Category | Opcodes |
 | :--- | :--- |
-| Locals | `GET_LOCAL`, `SET_LOCAL`, `SET_LOCAL_POP` |
-| Constants | Numeric literals |
-| Arithmetic | `ADD`, `SUB`, `MUL`, `DIV`, `MOD` (float and int variants) |
+| Parameters | `GET_LOCAL` within declared arity, including the arguments-scope slot |
+| Constants | Number, Boolean, null |
+| Arithmetic | `ADD`, `SUBTRACT`, `MULTIPLY`, `DIVIDE` and float variants |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` |
-| Boolean | `NOT` |
+| Boolean | `NOT`, Boolean-guarded conditions |
 | Control flow | `JUMP`, `JUMP_IF_FALSE` (forward jumps) |
 | Stack | `POP`, `DUP` |
-| Calls | `CALL` (direct calls to other JIT-compiled functions) |
-| Strings | `STRING_CONCAT` (`&` operator, via `jit_concat` runtime helper) |
 | Return | `RETURN` |
 
-If any unsupported opcode is present, the function is silently skipped — it continues running in the interpreter with no correctness impact. If a type guard fails at runtime (e.g. a variable expected to be numeric turns out to be a heap pointer), the compiled frame **deopts**: execution transfers back to the interpreter at the current bytecode position and the function is not recompiled.
+Arithmetic/comparison guards require non-NaN floats. Integers, coercions, non-Boolean truthiness, zero divisors and NaN-producing arithmetic safely **deopt to body entry**, without replaying defaults/interception or losing scope mutations. Writes, calls and allocation remain interpreted; the old direct compiled-callee path and relaxed coercion helpers were removed because they bypassed these semantics. Program ownership guards prevent stale function/address reuse across GC; JIT state remains VM-local.
 
 ---
 
@@ -79,13 +79,15 @@ The following categories cause a function to remain interpreted:
 - **I/O** — `PRINT`, `PRINTLN`
 - **Object / collection creation** — `NEW`, `ARRAY`, `STRUCT`
 - **Property and index access** — `MEMBER`, `SET_MEMBER`, `INC_MEMBER`, `INDEX`, `SET_INDEX`
-- **Dynamic calls** — `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED`
+- **Calls inside compiled bodies** — `CALL`, `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED`
+- **Local mutation/declarations** — `SET_LOCAL`, `SET_LOCAL_POP`, `BIND_LOCAL`
+- **Strings/remainder/integer specializations** — `STRING_CONCAT`, `MODULO`, `ADD_INT`, `SUB_INT`, `MUL_INT`
 - **Loops inside functions** — `FOR_LOOP_STEP`, `LOOP`, `ITER_NEXT`
 - **Exception handling** — `PUSH_HANDLER`, `POP_HANDLER`, `THROW`
 - **Multi-word compare-jumps** — `LOCAL_COMPARE_JUMP`, `GLOBAL_COMPARE_JUMP`, `COMPARE_JUMP`, `LOCAL_JUMP_IF_NE_CONST`
 - **Miscellaneous** — `INC`, `DEC`, `INC_LOCAL`, `INC_GLOBAL`, `SWAP`, `OVER`, `JUMP_IF_NULL`
 
-In practice, Tier 4 is most effective for pure computational functions: numeric kernels, string-building loops, recursive math, and hot helper functions that operate only on their arguments and local variables.
+This bounded subset enables actual numeric parameter-only helpers, not general functions, recursion or analyzer acceleration by itself.
 
 ---
 
@@ -104,17 +106,17 @@ cargo build --release --no-default-features \
 
 ### Measure eligibility, not just activation
 
-A bounded bx-lint LSP experiment initialized Cranelift and reached the hot-function threshold in 35 helpers, but compiled none: all observed candidates were rejected for unsupported bytecode. Opening a 200-function script remained about 1.7 seconds, with or without JIT. Even the current pure-math `jit_hot_fn.bxs` functions were rejected in that build; existing output-only tests do not prove Tier-4 activation. The separate runner check above uses a supported empty loop as its positive compilation control. These are build/workload observations, not a general JIT speed guarantee.
+A historical bounded bx-lint LSP experiment, before body-entry compilation, initialized Cranelift and reached the hot-function threshold in 35 helpers, but compiled none: all observed candidates were rejected for unsupported bytecode. Opening a 200-function script remained about 1.7 seconds, with or without JIT. Even the current pure-math `jit_hot_fn.bxs` functions were rejected in that build; existing output-only tests do not prove Tier-4 activation. The current runner check above additionally proves real compiler-function compilation after the body-entry fix. These are build/workload observations, not a general JIT speed guarantee.
 
 The tested Linux bx-lint standalone grew from 5,821,860 to 7,607,060 bytes; actual linked size depends on target, features and optimization. Do not assume a fixed Cranelift size penalty.
 
 ### Wider Tier-4 opcode coverage
 
-The most impactful missing opcodes for real-world functions are globals and property access. Both are achievable with runtime helpers following the same pattern as `jit_concat` and `jit_ic_member_fallback`. The main constraint is the deopt story: any operation that can throw or have side effects needs a clean deopt path back to the interpreter.
+The most impactful missing opcodes for real-world functions are globals and property access. Runtime helpers such as `jit_ic_member_fallback` illustrate guarded reads. The main constraint is the deopt story: any operation that can throw or have side effects needs a clean deopt path back to the interpreter.
 
 ### String constant support in Tier-4
 
-Currently, `CONSTANT` only accepts numeric literals in compiled functions. String constants require the GC heap at JIT-compile time, which isn't available. One path forward: a `jit_intern_const` helper that lazily allocates the string object on first call and caches its GC id, making string constants safe to use from compiled frames.
+General string values remain unsupported. Adding them requires GC-rooted VM values and safepoints; embedding unguarded GC IDs in machine code is not safe.
 
 ### Tier-4 for embedded loops
 

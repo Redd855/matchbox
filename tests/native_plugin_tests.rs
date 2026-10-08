@@ -2161,12 +2161,15 @@ fn function_interception_mutates_arguments_results_and_observes_errors() {
     let source = format!("{}\n{}", r#"function probe(value = 40) { return value; }
         function probeFailure() { throw "observed failure"; }
         if (probe(value=40) != 42 || probe() != 42) { throw "Function interception did not change default/named arguments and results"; }
+        for (var call=0; call<200; call++) { if (probe() != 42) { throw "Hot function skipped interception"; } }
         try { probeFailure(); } catch(any error) { if (!find("observed failure", error.message)) { throw error; } }
         println("function events OK");"#, include_str!("scripts/vm_execution_contexts.bxs"));
     fs::write(dir.path().join("app.bxs"), source).unwrap();
-    let expected = "function events OK\ncontext scopes OK\npre,post,pre,post,error:observed failure\n";
+    let expected = format!("function events OK\ncontext scopes OK\n{}error:observed failure\n", "pre,post,".repeat(202));
     let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
     success(&output);
+    #[cfg(feature = "jit")]
+    assert!(String::from_utf8_lossy(&output.stderr).contains("[JIT] compiled hot fn name=probe "), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
     success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));

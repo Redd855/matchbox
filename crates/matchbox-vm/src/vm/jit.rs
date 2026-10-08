@@ -1,3 +1,4 @@
+use super::chunk::ChunkProgram;
 /// JIT compilation of hot bytecode loops using Cranelift.
 ///
 /// Two tiers:
@@ -11,8 +12,8 @@
 ///     block-params (registers) throughout; only the final values are written
 ///     back to the VM's locals array on exit.  This eliminates interpreter
 ///     dispatch overhead without cheating on the iteration count.
-use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Weak};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -53,31 +54,6 @@ pub type ArrayIterJitFn = unsafe extern "C" fn(*mut u64, *const u64, u64) -> u64
 pub type HotFnFn = unsafe extern "C" fn(*mut u64, *const std::ffi::c_void, *mut u64) -> u64;
 
 const JIT_FN_THRESHOLD: u64 = 100;
-
-thread_local! {
-    static JIT_COMPILED_FNS_BY_GCID: Cell<*const HashMap<usize, HotFnFn>>
-        = Cell::new(std::ptr::null());
-}
-
-pub fn set_compiled_fns_ptr(ptr: *const HashMap<usize, HotFnFn>) {
-    JIT_COMPILED_FNS_BY_GCID.with(|p| p.set(ptr));
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_resolve_fn(gc_id: u64) -> u64 {
-    JIT_COMPILED_FNS_BY_GCID.with(|p| {
-        let map = p.get();
-        if map.is_null() {
-            return 0u64;
-        }
-        unsafe {
-            (*map)
-                .get(&(gc_id as usize))
-                .map(|&f| f as usize as u64)
-                .unwrap_or(0)
-        }
-    })
-}
 
 pub unsafe extern "C" fn jit_ic_member_fallback(
     heap_ptr: *const std::ffi::c_void,
@@ -166,142 +142,60 @@ pub unsafe extern "C" fn jit_load_prop_at(
     }
 }
 
-fn bx_val_to_box_string(
-    val_bits: u64,
-    heap: &crate::vm::gc::Heap,
-) -> Option<crate::types::box_string::BoxString> {
-    use crate::types::BxValue;
-    use crate::types::box_string::BoxString;
-    use crate::vm::gc::GcObject;
-
-    // Float: raw bits below the NaN-boxing threshold
-    if val_bits < 0xFFF8000000000000 {
-        return Some(BoxString::new(&f64::from_bits(val_bits).to_string()));
-    }
-
-    let tag = val_bits & !BxValue::PAYLOAD_MASK;
-    let payload = val_bits & BxValue::PAYLOAD_MASK;
-    let int_tag = BxValue::TAGGED_BASE | (BxValue::TAG_INT << BxValue::TAG_SHIFT);
-    let bool_tag = BxValue::TAGGED_BASE | (BxValue::TAG_BOOL << BxValue::TAG_SHIFT);
-    let null_tag = BxValue::TAGGED_BASE | (BxValue::TAG_NULL << BxValue::TAG_SHIFT);
-    let ptr_tag = BxValue::TAGGED_BASE | (BxValue::TAG_PTR << BxValue::TAG_SHIFT);
-
-    if tag == int_tag {
-        Some(BoxString::new(&(payload as u32 as i32).to_string()))
-    } else if tag == bool_tag {
-        Some(BoxString::new(if payload != 0 { "true" } else { "false" }))
-    } else if tag == null_tag {
-        Some(BoxString::new("null"))
-    } else if tag == ptr_tag {
-        let id = payload as usize;
-        if let Some(GcObject::String(s)) = heap.get_opt(id) {
-            Some(s.clone())
+impl super::VM {
+    /// Defaults/arguments/interception have already run in the ordinary frame.
+    /// A readonly, nonallocating body can safely deopt back to this entry.
+    pub(super) fn run_jit_fn_body(
+        &mut self,
+        fiber: usize,
+        entry: usize,
+    ) -> Option<crate::types::BxValue> {
+        self.jit.as_ref()?;
+        #[cfg(feature = "debugger")]
+        if self.debug_run.is_some() {
+            return None;
+        }
+        let frame = self.fibers[fiber].frames.last().unwrap();
+        let program = Arc::clone(&frame.chunk.borrow().program);
+        let compiled = self.jit.as_mut()?.profile_fn(
+            program,
+            entry,
+            frame.function.arity,
+            &frame.function.name,
+        )?;
+        let base = self.fibers[fiber].frames.last().unwrap().stack_base;
+        let parameters = self.fibers[fiber]
+            .frames
+            .last()
+            .unwrap()
+            .function
+            .params
+            .len();
+        for slot in 0..parameters {
+            let value = self.local_value(fiber, slot);
+            self.fibers[fiber].stack[base + slot] = value;
+        }
+        // Eligibility bounds every GET_LOCAL and rejects writes/calls/allocations.
+        // The VM stack cannot reallocate or collect during this native leaf.
+        let locals = unsafe { self.fibers[fiber].stack.as_mut_ptr().add(base) as *mut u64 };
+        let mut result = 0u64;
+        let status = unsafe {
+            compiled(
+                locals,
+                &self.heap as *const _ as *const std::ffi::c_void,
+                &mut result,
+            )
+        };
+        if status == 0 {
+            Some(unsafe { std::mem::transmute::<u64, crate::types::BxValue>(result) })
         } else {
-            None // non-string pointer → deopt
-        }
-    } else {
-        None
-    }
-}
-
-pub unsafe extern "C" fn jit_concat(
-    heap_ptr: *mut std::ffi::c_void,
-    val_a: u64,
-    val_b: u64,
-    out_val: *mut u64,
-) -> u64 {
-    let heap = unsafe { &mut *(heap_ptr as *mut crate::vm::gc::Heap) };
-    let a_s = match bx_val_to_box_string(val_a, heap) {
-        Some(s) => s,
-        None => return 1,
-    };
-    let b_s = match bx_val_to_box_string(val_b, heap) {
-        Some(s) => s,
-        None => return 1,
-    };
-    let res_id = heap.alloc(crate::vm::gc::GcObject::String(a_s.concat(&b_s)));
-    unsafe {
-        *out_val = crate::types::BxValue::new_ptr(res_id).to_bits();
-    }
-    0
-}
-
-macro_rules! jit_fallback_math {
-    ($name:ident, $op:tt) => {
-        pub unsafe extern "C" fn $name(
-            heap_ptr: *mut std::ffi::c_void,
-            val_a: u64,
-            val_b: u64,
-            out_val: *mut u64,
-        ) -> u64 {
-            let heap = unsafe { &mut *(heap_ptr as *mut crate::vm::gc::Heap) };
-            let a = unsafe { std::mem::transmute::<u64, crate::types::BxValue>(val_a) };
-            let b = unsafe { std::mem::transmute::<u64, crate::types::BxValue>(val_b) };
-
-            let a_num = if a.is_number() { Some(a.as_number()) } else {
-                bx_val_to_box_string(val_a, heap).and_then(|s| s.to_string().parse::<f64>().ok())
-            };
-            let b_num = if b.is_number() { Some(b.as_number()) } else {
-                bx_val_to_box_string(val_b, heap).and_then(|s| s.to_string().parse::<f64>().ok())
-            };
-
-            if let (Some(na), Some(nb)) = (a_num, b_num) {
-                unsafe { *out_val = crate::types::BxValue::new_number(na $op nb).to_bits(); }
-                0
-            } else {
-                1 // deopt
+            if self.jit.as_ref().is_some_and(|jit| jit.trace) {
+                eprintln!("[JIT] deopt hot fn body (type guard)");
             }
+            None
         }
-    };
-}
-
-pub unsafe extern "C" fn jit_fallback_add(
-    heap_ptr: *mut std::ffi::c_void,
-    val_a: u64,
-    val_b: u64,
-    out_val: *mut u64,
-) -> u64 {
-    let heap = unsafe { &mut *(heap_ptr as *mut crate::vm::gc::Heap) };
-    let a = unsafe { std::mem::transmute::<u64, crate::types::BxValue>(val_a) };
-    let b = unsafe { std::mem::transmute::<u64, crate::types::BxValue>(val_b) };
-
-    let a_num = if a.is_number() {
-        Some(a.as_number())
-    } else {
-        bx_val_to_box_string(val_a, heap).and_then(|s| s.to_string().parse::<f64>().ok())
-    };
-    let b_num = if b.is_number() {
-        Some(b.as_number())
-    } else {
-        bx_val_to_box_string(val_b, heap).and_then(|s| s.to_string().parse::<f64>().ok())
-    };
-
-    if let (Some(na), Some(nb)) = (a_num, b_num) {
-        unsafe {
-            *out_val = crate::types::BxValue::new_number(na + nb).to_bits();
-        }
-        0
-    } else {
-        let a_s = match bx_val_to_box_string(val_a, heap) {
-            Some(s) => s,
-            None => return 1,
-        };
-        let b_s = match bx_val_to_box_string(val_b, heap) {
-            Some(s) => s,
-            None => return 1,
-        };
-        let res_id = heap.alloc(crate::vm::gc::GcObject::String(a_s.concat(&b_s)));
-        unsafe {
-            *out_val = crate::types::BxValue::new_ptr(res_id).to_bits();
-        }
-        0
     }
 }
-
-jit_fallback_math!(jit_fallback_sub, -);
-jit_fallback_math!(jit_fallback_mul, *);
-jit_fallback_math!(jit_fallback_div, /);
-jit_fallback_math!(jit_fallback_mod, %);
 
 // ── JitState ──────────────────────────────────────────────────────────────────
 
@@ -325,11 +219,8 @@ pub struct JitState {
     compiled_iters: HashMap<(usize, usize), ArrayIterJitFn>,
 
     // Tier-4: hot function compilation
-    fn_counts: HashMap<usize, u64>, // key = Rc::as_ptr(func) as usize
-    compiled_fns: HashMap<usize, HotFnFn>, // same key → compiled function pointer
-    pub compiled_fns_by_gcid: HashMap<usize, HotFnFn>, // gc_id → compiled function pointer
-    pub fn_deopt_counts: HashMap<usize, u64>,
-    pub fn_recompile_mode: HashMap<usize, u8>,
+    fn_counts: HashMap<(usize, usize, u32), (Weak<ChunkProgram>, u64)>,
+    compiled_fns: HashMap<(usize, usize, u32), (Arc<ChunkProgram>, HotFnFn)>,
 
     // OSR: persistent per-site iteration counters keyed on (fn_id, ip_at_start).
     // Survive across run_fiber quanta so fiber-scheduled loops can cross time-slice
@@ -356,15 +247,8 @@ impl JitState {
             "jit_ic_member_fallback",
             jit_ic_member_fallback as *const u8,
         );
-        builder.symbol("jit_resolve_fn", jit_resolve_fn as *const u8);
         builder.symbol("jit_get_shape_id", jit_get_shape_id as *const u8);
         builder.symbol("jit_load_prop_at", jit_load_prop_at as *const u8);
-        builder.symbol("jit_concat", jit_concat as *const u8);
-        builder.symbol("jit_fallback_add", jit_fallback_add as *const u8);
-        builder.symbol("jit_fallback_sub", jit_fallback_sub as *const u8);
-        builder.symbol("jit_fallback_mul", jit_fallback_mul as *const u8);
-        builder.symbol("jit_fallback_div", jit_fallback_div as *const u8);
-        builder.symbol("jit_fallback_mod", jit_fallback_mod as *const u8);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
         let trace = std::env::var_os("MATCHBOX_JIT_TRACE").is_some();
@@ -386,9 +270,6 @@ impl JitState {
             compiled_iters: HashMap::new(),
             fn_counts: HashMap::new(),
             compiled_fns: HashMap::new(),
-            compiled_fns_by_gcid: HashMap::new(),
-            fn_deopt_counts: HashMap::new(),
-            fn_recompile_mode: HashMap::new(),
             loop_profiles: HashMap::new(),
             iter_profiles: HashMap::new(),
         })
@@ -1488,58 +1369,47 @@ impl JitState {
 
     // ── Tier-4: hot function compilation ─────────────────────────────────────
 
-    #[inline]
-    pub fn get_compiled_fn(&self, fn_id: usize) -> Option<HotFnFn> {
-        self.compiled_fns.get(&fn_id).copied()
-    }
-
-    pub fn inc_fn_deopt(&mut self, fn_id: usize) {
-        let count = self.fn_deopt_counts.entry(fn_id).or_insert(0);
-        *count += 1;
-
-        let mode = self.fn_recompile_mode.entry(fn_id).or_insert(0);
-        if *count == 5 && *mode == 0 {
-            eprintln!(
-                "[JIT] Tier-4 function 0x{:x} deopted 5 times. Upgrading to Mode 1 (Polymorphic).",
-                fn_id
-            );
-            *mode = 1;
-            self.compiled_fns.remove(&fn_id);
-            self.fn_counts.insert(fn_id, JIT_FN_THRESHOLD - 10);
-        } else if *count == 10 && *mode == 1 {
-            eprintln!(
-                "[JIT] Tier-4 function 0x{:x} deopted 10 times. Upgrading to Mode 2 (Relaxed).",
-                fn_id
-            );
-            *mode = 2;
-            self.compiled_fns.remove(&fn_id);
-            self.fn_counts.insert(fn_id, JIT_FN_THRESHOLD - 10);
-        }
-    }
-
     pub fn profile_fn(
         &mut self,
-        fn_id: usize,
-        gc_id: usize,
-        code: &[u32],
-        consts: &[crate::types::Constant],
+        program: Arc<ChunkProgram>,
+        entry: usize,
         arity: u32,
         name: &str,
     ) -> Option<HotFnFn> {
-        let count = self.fn_counts.entry(fn_id).or_insert(0);
+        let fn_id = Arc::as_ptr(&program) as usize;
+        let key = (fn_id, entry, arity);
+        if let Some((_, compiled)) = self.compiled_fns.get(&key) {
+            return Some(*compiled);
+        }
+        let (owner, count) = self
+            .fn_counts
+            .entry(key)
+            .or_insert_with(|| (Arc::downgrade(&program), 0));
+        // GC may recycle addresses of uncompiled programs; never inherit heat.
+        if !owner
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &program))
+        {
+            *owner = Arc::downgrade(&program);
+            *count = 0;
+        }
         *count += 1;
         if *count == JIT_FN_THRESHOLD {
-            if !Self::fn_is_translatable(code) {
+            let code = &program.code[entry..];
+            if !Self::fn_is_translatable(code, &program.constants, arity) {
                 if self.trace {
                     eprintln!("[JIT] skipped hot fn name={} (unsupported bytecode)", name);
                 }
                 return None;
             }
-            let mode = *self.fn_recompile_mode.get(&fn_id).unwrap_or(&0);
-            match self.compile_hot_fn(fn_id, gc_id, code, consts, arity, mode) {
-                Ok(_) => {
-                    eprintln!("[JIT] compiled hot fn name={} fn_id=0x{:x} mode={}", name, fn_id, mode);
-                    return self.compiled_fns.get(&fn_id).copied();
+            match self.compile_hot_fn(fn_id, code, &program.constants) {
+                Ok(compiled) => {
+                    eprintln!(
+                        "[JIT] compiled hot fn name={} fn_id=0x{:x} entry={}",
+                        name, fn_id, entry
+                    );
+                    self.compiled_fns.insert(key, (program, compiled));
+                    return Some(compiled);
                 }
                 Err(e) => eprintln!("[JIT] hot fn compile failed: {}", e),
             }
@@ -1547,90 +1417,31 @@ impl JitState {
         None
     }
 
-    fn fn_is_translatable(code: &[u32]) -> bool {
-        let mut ip = 0usize;
-        while ip < code.len() {
-            let word = code[ip];
+    fn fn_is_translatable(code: &[u32], consts: &[crate::types::Constant], arity: u32) -> bool {
+        // ponytail: readonly, forward-only leaves; add writes/calls only with
+        // resumable deopt and GC safepoints, not by extending this whitelist.
+        code.iter().enumerate().all(|(ip, &word)| {
             let opcode = (word & 0xFF) as u8;
-            let op0 = (word >> 8) as usize;
-
-            // Instruction widths for multi-word instructions
-            let width: usize = match opcode {
-                op::COMPARE_JUMP | op::CALL_NAMED | op::INVOKE => 2,
-                op::LOCAL_COMPARE_JUMP
-                | op::GLOBAL_COMPARE_JUMP
-                | op::INVOKE_NAMED
-                | op::ITER_NEXT
-                | op::LOCAL_JUMP_IF_NE_CONST
-                | op::FOR_LOOP_STEP => 3,
-                _ => 1,
-            };
-
+            let arg = word >> 8;
             match opcode {
-                // Rejected opcodes
-                op::CALL_NAMED
-                | op::INVOKE
-                | op::INVOKE_NAMED
-                | op::NEW
-                | op::ARRAY
-                | op::STRUCT
-                | op::INDEX
-                | op::SAFE_INDEX
-                | op::SET_INDEX
-                | op::MEMBER
-                | op::SET_MEMBER
-                | op::INC_MEMBER
-                | op::ITER_NEXT
-                | op::FOR_LOOP_STEP
-                | op::LOOP
-                | op::PUSH_HANDLER
-                | op::POP_HANDLER
-                | op::THROW
-                | op::PRINT
-                | op::PRINTLN
-                | op::GET_GLOBAL
-                | op::SET_GLOBAL
-                | op::SET_GLOBAL_POP
-                | op::DEFINE_GLOBAL
-                | op::GET_PRIVATE
-                | op::SET_PRIVATE
-                | op::LOCAL_COMPARE_JUMP
-                | op::GLOBAL_COMPARE_JUMP
-                | op::COMPARE_JUMP
-                | op::LOCAL_JUMP_IF_NE_CONST
-                | op::INC
-                | op::DEC
-                | op::INC_LOCAL
-                | op::INC_GLOBAL
-                | op::SWAP
-                | op::OVER
-                | op::JUMP_IF_NULL => return false,
-
-                op::JUMP | op::JUMP_IF_FALSE => {
-                    // Validate forward jump stays in-bounds
-                    let target = ip + 1 + op0;
-                    if target > code.len() {
-                        return false;
-                    }
-                }
-
-                // Accepted opcodes
-                op::GET_LOCAL
-                | op::SET_LOCAL
-                | op::SET_LOCAL_POP
-                | op::CONSTANT
-                | op::ADD
-                | op::ADD_INT
+                op::GET_LOCAL => arg < arity,
+                op::CONSTANT => matches!(
+                    consts.get(arg as usize),
+                    Some(
+                        crate::types::Constant::Number(_)
+                            | crate::types::Constant::Boolean(_)
+                            | crate::types::Constant::Null
+                    )
+                ),
+                op::JUMP | op::JUMP_IF_FALSE => ip + 1 + (arg as usize) < code.len(),
+                op::ADD
                 | op::ADD_FLOAT
                 | op::SUBTRACT
-                | op::SUB_INT
                 | op::SUB_FLOAT
                 | op::MULTIPLY
-                | op::MUL_INT
                 | op::MUL_FLOAT
                 | op::DIVIDE
                 | op::DIV_FLOAT
-                | op::MODULO
                 | op::EQUAL
                 | op::NOT_EQUAL
                 | op::LESS
@@ -1640,40 +1451,19 @@ impl JitState {
                 | op::NOT
                 | op::RETURN
                 | op::POP
-                | op::DUP
-                | op::CALL
-                | op::STRING_CONCAT => {}
-
-                _ => return false,
+                | op::DUP => true,
+                _ => false,
             }
-
-            ip += width;
-        }
-        true
+        })
     }
 
     fn compile_hot_fn(
         &mut self,
         fn_id: usize,
-        gc_id: usize,
         code: &[u32],
         consts: &[crate::types::Constant],
-        _arity: u32,
-        mode: u8,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<HotFnFn> {
         use cranelift_codegen::ir::{Block, StackSlot, StackSlotData, StackSlotKind};
-
-        // ── Pre-scan: max callee arg count for CALL instructions ──────────────
-        let max_callee_args = {
-            let mut max = 0usize;
-            for &w in code {
-                if (w & 0xFF) as u8 == op::CALL {
-                    max = max.max((w >> 8) as usize);
-                }
-            }
-            max
-        };
-        let has_calls = max_callee_args > 0 || code.iter().any(|&w| (w & 0xFF) as u8 == op::CALL);
 
         // ── Pass 1a: collect branch targets ──────────────────────────────────
         let mut branch_targets: BTreeSet<usize> = BTreeSet::new();
@@ -1819,104 +1609,7 @@ impl JitState {
             builder.seal_block(entry_block);
 
             let locals_ptr = builder.block_params(entry_block)[0];
-            let heap_ptr = builder.block_params(entry_block)[1];
             let out_val_ptr = builder.block_params(entry_block)[2];
-
-            // ── Callee-call infrastructure (only when function has CALL opcodes) ─
-            let callee_locals_slot: Option<StackSlot>;
-            let call_out_val_slot: Option<StackSlot>;
-            let resolve_sig_ref: Option<cranelift_codegen::ir::SigRef>;
-            let hotfn_sig_ref: Option<cranelift_codegen::ir::SigRef>;
-            let resolve_fn_addr_val: Option<cranelift_codegen::ir::Value>;
-
-            if has_calls {
-                let slot_size = (max_callee_args.max(1) + 64) * 8;
-                callee_locals_slot = Some(builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    slot_size as u32,
-                    3,
-                )));
-                call_out_val_slot = Some(builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    3,
-                )));
-
-                // Signature for jit_resolve_fn(gc_id: i64) -> i64
-                let mut resolve_sig = self.module.make_signature();
-                resolve_sig.params.push(AbiParam::new(I64));
-                resolve_sig.returns.push(AbiParam::new(I64));
-                resolve_sig_ref = Some(builder.import_signature(resolve_sig));
-
-                // Signature for HotFnFn(locals_ptr, heap_ptr, out_val_ptr) -> i64
-                let mut hotfn_sig = self.module.make_signature();
-                hotfn_sig.params.push(AbiParam::new(ptr_type)); // locals_ptr
-                hotfn_sig.params.push(AbiParam::new(ptr_type)); // heap_ptr
-                hotfn_sig.params.push(AbiParam::new(ptr_type)); // out_val_ptr
-                hotfn_sig.returns.push(AbiParam::new(I64)); // status
-                hotfn_sig_ref = Some(builder.import_signature(hotfn_sig));
-
-                // Embed jit_resolve_fn address as an immediate constant
-                let addr = jit_resolve_fn as *const () as usize as i64;
-                resolve_fn_addr_val = Some(builder.ins().iconst(ptr_type, addr));
-            } else {
-                callee_locals_slot = None;
-                call_out_val_slot = None;
-                resolve_sig_ref = None;
-                hotfn_sig_ref = None;
-                resolve_fn_addr_val = None;
-            }
-
-            // Declare jit_concat(heap_ptr, val_a, val_b, out_val_ptr) -> u64
-            let mut sig_concat = self.module.make_signature();
-            sig_concat.params.push(AbiParam::new(ptr_type)); // heap_ptr
-            sig_concat.params.push(AbiParam::new(I64)); // val_a
-            sig_concat.params.push(AbiParam::new(I64)); // val_b
-            sig_concat.params.push(AbiParam::new(ptr_type)); // out_val ptr
-            sig_concat.returns.push(AbiParam::new(I64)); // status
-            let concat_id = self
-                .module
-                .declare_function("jit_concat", Linkage::Import, &sig_concat)
-                .unwrap();
-            let concat_ref = self
-                .module
-                .declare_func_in_func(concat_id, &mut builder.func);
-
-            let fallback_add_id = self
-                .module
-                .declare_function("jit_fallback_add", Linkage::Import, &sig_concat)
-                .unwrap();
-            let fallback_add_ref = self
-                .module
-                .declare_func_in_func(fallback_add_id, &mut builder.func);
-            let fallback_sub_id = self
-                .module
-                .declare_function("jit_fallback_sub", Linkage::Import, &sig_concat)
-                .unwrap();
-            let fallback_sub_ref = self
-                .module
-                .declare_func_in_func(fallback_sub_id, &mut builder.func);
-            let fallback_mul_id = self
-                .module
-                .declare_function("jit_fallback_mul", Linkage::Import, &sig_concat)
-                .unwrap();
-            let fallback_mul_ref = self
-                .module
-                .declare_func_in_func(fallback_mul_id, &mut builder.func);
-            let fallback_div_id = self
-                .module
-                .declare_function("jit_fallback_div", Linkage::Import, &sig_concat)
-                .unwrap();
-            let fallback_div_ref = self
-                .module
-                .declare_func_in_func(fallback_div_id, &mut builder.func);
-            let fallback_mod_id = self
-                .module
-                .declare_function("jit_fallback_mod", Linkage::Import, &sig_concat)
-                .unwrap();
-            let fallback_mod_ref = self
-                .module
-                .declare_func_in_func(fallback_mod_id, &mut builder.func);
 
             // Allocate spill slots for expression stack (8 bytes each, 8-byte aligned)
             let spill_slots: Vec<StackSlot> = (0..max_stack.max(1))
@@ -1936,7 +1629,6 @@ impl JitState {
 
             // ── Per-instruction translation ───────────────────────────────────
             let mut vstack: Vec<cranelift_codegen::ir::Value> = Vec::new();
-            let mut slot_val: HashMap<u32, cranelift_codegen::ir::Value> = HashMap::new();
             let mut block_terminated = target_blocks.contains_key(&0);
 
             let mut ip = 0usize;
@@ -1959,7 +1651,6 @@ impl JitState {
                         let v = builder.ins().stack_load(I64, spill_slots[i], 0);
                         vstack.push(v);
                     }
-                    slot_val.clear(); // locals_ptr is authoritative after branch
                     block_terminated = false;
                 }
 
@@ -1983,42 +1674,28 @@ impl JitState {
 
                 match opcode {
                     op::GET_LOCAL => {
-                        let slot = op0 as u32;
-                        let v = if let Some(&cached) = slot_val.get(&slot) {
-                            cached
-                        } else {
-                            builder
-                                .ins()
-                                .load(I64, MemFlags::new(), locals_ptr, (slot * 8) as i32)
-                        };
-                        vstack.push(v);
-                    }
-                    op::SET_LOCAL_POP => {
-                        let slot = op0 as u32;
-                        let v = vstack.pop().unwrap();
-                        builder
-                            .ins()
-                            .store(MemFlags::new(), v, locals_ptr, (slot * 8) as i32);
-                        slot_val.insert(slot, v);
-                    }
-                    op::SET_LOCAL => {
-                        let slot = op0 as u32;
-                        let v = *vstack.last().unwrap();
-                        builder
-                            .ins()
-                            .store(MemFlags::new(), v, locals_ptr, (slot * 8) as i32);
-                        slot_val.insert(slot, v);
+                        vstack.push(builder.ins().load(
+                            I64,
+                            MemFlags::new(),
+                            locals_ptr,
+                            (op0 * 8) as i32,
+                        ));
                     }
                     op::CONSTANT => {
                         let idx = op0;
-                        match consts.get(idx) {
+                        let value = match consts.get(idx) {
                             Some(crate::types::Constant::Number(f)) => {
-                                let f_val = builder.ins().f64const(*f);
-                                let i_val = builder.ins().bitcast(I64, MemFlags::new(), f_val);
-                                vstack.push(i_val);
+                                crate::types::BxValue::new_number(*f)
                             }
-                            _ => return Err(anyhow::anyhow!("non-float constant at idx {}", idx)),
-                        }
+                            Some(crate::types::Constant::Boolean(b)) => {
+                                crate::types::BxValue::new_bool(*b)
+                            }
+                            Some(crate::types::Constant::Null) => crate::types::BxValue::new_null(),
+                            _ => {
+                                return Err(anyhow::anyhow!("unsupported constant at idx {}", idx));
+                            }
+                        };
+                        vstack.push(builder.ins().iconst(I64, value.to_bits() as i64));
                     }
                     op::ADD
                     | op::ADD_FLOAT
@@ -2032,157 +1709,38 @@ impl JitState {
                         let b_i64 = vstack.pop().unwrap();
                         let a_i64 = vstack.pop().unwrap();
 
-                        if mode == 2 {
-                            let helper_ref = match opcode {
-                                op::ADD | op::ADD_FLOAT => fallback_add_ref,
-                                op::SUBTRACT | op::SUB_FLOAT => fallback_sub_ref,
-                                op::MULTIPLY | op::MUL_FLOAT => fallback_mul_ref,
-                                op::DIVIDE | op::DIV_FLOAT => fallback_div_ref,
-                                op::MODULO => fallback_mod_ref,
-                                _ => unreachable!(),
-                            };
-                            let call_inst = builder
-                                .ins()
-                                .call(helper_ref, &[heap_ptr, a_i64, b_i64, out_val_ptr]);
-                            let status = builder.inst_results(call_inst)[0];
-                            let is_ok = builder.ins().icmp_imm(IntCC::Equal, status, 0);
-                            emit_deopt_brif!(is_ok);
-                            let res_val = builder.ins().load(I64, MemFlags::new(), out_val_ptr, 0);
-                            vstack.push(res_val);
-                        } else {
-                            let a_ok = builder.ins().icmp_imm(
-                                IntCC::UnsignedLessThan,
-                                a_i64,
-                                0xFFF8000000000000_u64 as i64,
-                            );
-                            let b_ok = builder.ins().icmp_imm(
-                                IntCC::UnsignedLessThan,
-                                b_i64,
-                                0xFFF8000000000000_u64 as i64,
-                            );
-                            let both = builder.ins().band(a_ok, b_ok);
-
-                            let ok_block = builder.create_block();
-                            if mode == 1 {
-                                let slow_block = builder.create_block();
-                                builder.ins().brif(both, ok_block, &[], slow_block, &[]);
-
-                                builder.switch_to_block(slow_block);
-                                builder.seal_block(slow_block);
-                                let helper_ref = match opcode {
-                                    op::ADD | op::ADD_FLOAT => fallback_add_ref,
-                                    op::SUBTRACT | op::SUB_FLOAT => fallback_sub_ref,
-                                    op::MULTIPLY | op::MUL_FLOAT => fallback_mul_ref,
-                                    op::DIVIDE | op::DIV_FLOAT => fallback_div_ref,
-                                    op::MODULO => fallback_mod_ref,
-                                    _ => unreachable!(),
-                                };
-                                let call_inst = builder
-                                    .ins()
-                                    .call(helper_ref, &[heap_ptr, a_i64, b_i64, out_val_ptr]);
-                                let status = builder.inst_results(call_inst)[0];
-                                let is_ok = builder.ins().icmp_imm(IntCC::Equal, status, 0);
-                                let post_slow_block = builder.create_block();
-                                builder
-                                    .ins()
-                                    .brif(is_ok, post_slow_block, &[], deopt_exit, &[]);
-                                builder.switch_to_block(post_slow_block);
-                                builder.seal_block(post_slow_block);
-                                let slow_res =
-                                    builder.ins().load(I64, MemFlags::new(), out_val_ptr, 0);
-                                let merge_block = builder.create_block();
-                                builder.append_block_param(merge_block, I64);
-                                builder.ins().jump(
-                                    merge_block,
-                                    &[cranelift_codegen::ir::BlockArg::from(slow_res)],
-                                );
-
-                                builder.switch_to_block(ok_block);
-                                builder.seal_block(ok_block);
-
-                                let a_f64 = builder.ins().bitcast(F64, MemFlags::new(), a_i64);
-                                let b_f64 = builder.ins().bitcast(F64, MemFlags::new(), b_i64);
-                                let res_f64 = match opcode {
-                                    op::ADD | op::ADD_FLOAT => builder.ins().fadd(a_f64, b_f64),
-                                    op::SUBTRACT | op::SUB_FLOAT => {
-                                        builder.ins().fsub(a_f64, b_f64)
-                                    }
-                                    op::MULTIPLY | op::MUL_FLOAT => {
-                                        builder.ins().fmul(a_f64, b_f64)
-                                    }
-                                    op::DIVIDE | op::DIV_FLOAT => builder.ins().fdiv(a_f64, b_f64),
-                                    op::MODULO => {
-                                        let div = builder.ins().fdiv(a_f64, b_f64);
-                                        let trunc = builder.ins().trunc(div);
-                                        let mul = builder.ins().fmul(trunc, b_f64);
-                                        builder.ins().fsub(a_f64, mul)
-                                    }
-                                    _ => unreachable!(),
-                                };
-                                let res_i64 = builder.ins().bitcast(I64, MemFlags::new(), res_f64);
-                                builder.ins().jump(
-                                    merge_block,
-                                    &[cranelift_codegen::ir::BlockArg::from(res_i64)],
-                                );
-
-                                builder.switch_to_block(merge_block);
-                                builder.seal_block(merge_block);
-                                let final_res = builder.block_params(merge_block)[0];
-                                vstack.push(final_res);
-                            } else {
-                                builder.ins().brif(both, ok_block, &[], deopt_exit, &[]);
-                                builder.switch_to_block(ok_block);
-                                builder.seal_block(ok_block);
-                                let a_f64 = builder.ins().bitcast(F64, MemFlags::new(), a_i64);
-                                let b_f64 = builder.ins().bitcast(F64, MemFlags::new(), b_i64);
-                                let res_f64 = match opcode {
-                                    op::ADD | op::ADD_FLOAT => builder.ins().fadd(a_f64, b_f64),
-                                    op::SUBTRACT | op::SUB_FLOAT => {
-                                        builder.ins().fsub(a_f64, b_f64)
-                                    }
-                                    op::MULTIPLY | op::MUL_FLOAT => {
-                                        builder.ins().fmul(a_f64, b_f64)
-                                    }
-                                    op::DIVIDE | op::DIV_FLOAT => builder.ins().fdiv(a_f64, b_f64),
-                                    op::MODULO => {
-                                        let div = builder.ins().fdiv(a_f64, b_f64);
-                                        let trunc = builder.ins().trunc(div);
-                                        let mul = builder.ins().fmul(trunc, b_f64);
-                                        builder.ins().fsub(a_f64, mul)
-                                    }
-                                    _ => unreachable!(),
-                                };
-                                let res_i64 = builder.ins().bitcast(I64, MemFlags::new(), res_f64);
-                                vstack.push(res_i64);
-                            }
-                        }
-                    }
-                    op::ADD_INT | op::SUB_INT | op::MUL_INT => {
-                        let b_i64 = vstack.pop().unwrap();
-                        let a_i64 = vstack.pop().unwrap();
-                        let mask_imm = 0xFFFF000000000000_u64 as i64;
-                        let target_imm = 0xFFF8000000000000_u64 as i64;
-                        let a_masked = builder.ins().band_imm(a_i64, mask_imm);
-                        let a_ok = builder.ins().icmp_imm(IntCC::Equal, a_masked, target_imm);
-                        let b_masked = builder.ins().band_imm(b_i64, mask_imm);
-                        let b_ok = builder.ins().icmp_imm(IntCC::Equal, b_masked, target_imm);
+                        let a_ok = builder.ins().icmp_imm(
+                            IntCC::UnsignedLessThan,
+                            a_i64,
+                            0xFFF8000000000000_u64 as i64,
+                        );
+                        let b_ok = builder.ins().icmp_imm(
+                            IntCC::UnsignedLessThan,
+                            b_i64,
+                            0xFFF8000000000000_u64 as i64,
+                        );
                         let both = builder.ins().band(a_ok, b_ok);
                         emit_deopt_brif!(both);
-                        let a_payload =
-                            builder.ins().band_imm(a_i64, 0x0000FFFFFFFFFFFF_u64 as i64);
-                        let a_32 = builder.ins().ireduce(I32, a_payload);
-                        let b_payload =
-                            builder.ins().band_imm(b_i64, 0x0000FFFFFFFFFFFF_u64 as i64);
-                        let b_32 = builder.ins().ireduce(I32, b_payload);
-                        let res_32 = match opcode {
-                            op::ADD_INT => builder.ins().iadd(a_32, b_32),
-                            op::SUB_INT => builder.ins().isub(a_32, b_32),
-                            op::MUL_INT => builder.ins().imul(a_32, b_32),
+                        let a_f64 = builder.ins().bitcast(F64, MemFlags::new(), a_i64);
+                        let b_f64 = builder.ins().bitcast(F64, MemFlags::new(), b_i64);
+                        let ordered = builder.ins().fcmp(FloatCC::Ordered, a_f64, b_f64);
+                        emit_deopt_brif!(ordered);
+                        if matches!(opcode, op::DIVIDE | op::DIV_FLOAT) {
+                            let zero = builder.ins().f64const(0.0);
+                            let nonzero = builder.ins().fcmp(FloatCC::NotEqual, b_f64, zero);
+                            emit_deopt_brif!(nonzero);
+                        }
+                        let res_f64 = match opcode {
+                            op::ADD | op::ADD_FLOAT => builder.ins().fadd(a_f64, b_f64),
+                            op::SUBTRACT | op::SUB_FLOAT => builder.ins().fsub(a_f64, b_f64),
+                            op::MULTIPLY | op::MUL_FLOAT => builder.ins().fmul(a_f64, b_f64),
+                            op::DIVIDE | op::DIV_FLOAT => builder.ins().fdiv(a_f64, b_f64),
                             _ => unreachable!(),
                         };
-                        let res_64 = builder.ins().uextend(I64, res_32);
-                        let res_tagged = builder.ins().bor_imm(res_64, target_imm);
-                        vstack.push(res_tagged);
+                        // Keep VM canonical NaN boxing and comparisons on the interpreter path.
+                        let ordered = builder.ins().fcmp(FloatCC::Ordered, res_f64, res_f64);
+                        emit_deopt_brif!(ordered);
+                        vstack.push(builder.ins().bitcast(I64, MemFlags::new(), res_f64));
                     }
                     op::EQUAL
                     | op::NOT_EQUAL
@@ -2206,6 +1764,8 @@ impl JitState {
                         emit_deopt_brif!(both);
                         let a_f64 = builder.ins().bitcast(F64, MemFlags::new(), a_i64);
                         let b_f64 = builder.ins().bitcast(F64, MemFlags::new(), b_i64);
+                        let ordered = builder.ins().fcmp(FloatCC::Ordered, a_f64, b_f64);
+                        emit_deopt_brif!(ordered);
                         let float_cc = match opcode {
                             op::EQUAL => FloatCC::Equal,
                             op::NOT_EQUAL => FloatCC::NotEqual,
@@ -2240,8 +1800,15 @@ impl JitState {
                         let target_ip = ip + 1 + offset;
                         let fallthru_ip = ip + 1;
 
-                        // PEEK condition (don't pop — matches interpreter behavior)
+                        // Non-Boolean truthiness belongs to the VM, not raw bit equality.
                         let cond = *vstack.last().unwrap();
+                        let tag = builder.ins().band_imm(cond, 0xFFFF000000000000_u64 as i64);
+                        let is_bool = builder.ins().icmp_imm(
+                            IntCC::Equal,
+                            tag,
+                            0xFFF9000000000000_u64 as i64,
+                        );
+                        emit_deopt_brif!(is_bool);
 
                         // Spill entire vstack to spill slots (condition included)
                         for (i, &v) in vstack.iter().enumerate() {
@@ -2257,7 +1824,6 @@ impl JitState {
                         builder.ins().brif(is_false, tgt_block, &[], fth_block, &[]);
 
                         vstack.clear();
-                        slot_val.clear();
                         block_terminated = true;
                     }
                     op::JUMP => {
@@ -2273,7 +1839,6 @@ impl JitState {
                         builder.ins().jump(tgt_block, &[]);
 
                         vstack.clear();
-                        slot_val.clear();
                         block_terminated = true;
                     }
                     op::RETURN => {
@@ -2290,93 +1855,6 @@ impl JitState {
                     op::DUP => {
                         let v = *vstack.last().unwrap();
                         vstack.push(v);
-                    }
-                    op::CALL => {
-                        let arg_count = op0;
-
-                        // Pop args from vstack (top = last arg)
-                        let mut arg_vals: Vec<_> =
-                            (0..arg_count).map(|_| vstack.pop().unwrap()).collect();
-                        arg_vals.reverse(); // arg_vals[0] = first arg
-
-                        // Pop function value
-                        let func_bits = vstack.pop().unwrap();
-
-                        // Unwrap callee infrastructure (guaranteed present by has_calls)
-                        let cls = callee_locals_slot.unwrap();
-                        let cov = call_out_val_slot.unwrap();
-                        let rsr = resolve_sig_ref.unwrap();
-                        let hsr = hotfn_sig_ref.unwrap();
-                        let rfa = resolve_fn_addr_val.unwrap();
-
-                        // Type guard: value must be TAG_PTR (tag bits == 0xFFFB000000000000)
-                        let tag_mask = 0xFFFF000000000000_u64 as i64;
-                        let ptr_tag = 0xFFFB000000000000_u64 as i64;
-                        let tag_bits = builder.ins().band_imm(func_bits, tag_mask);
-                        let is_ptr = builder.ins().icmp_imm(IntCC::Equal, tag_bits, ptr_tag);
-                        emit_deopt_brif!(is_ptr);
-
-                        // Extract gc_id from payload bits
-                        let gc_id_val = builder
-                            .ins()
-                            .band_imm(func_bits, 0x0000FFFFFFFFFFFF_u64 as i64);
-
-                        // Call jit_resolve_fn(gc_id) → compiled fn ptr or 0
-                        let inst = builder.ins().call_indirect(rsr, rfa, &[gc_id_val]);
-                        let compiled_ptr = builder.inst_results(inst)[0];
-
-                        // Guard: compiled_ptr != 0 (else deopt — callee not yet compiled)
-                        let is_compiled = builder.ins().icmp_imm(IntCC::NotEqual, compiled_ptr, 0);
-                        emit_deopt_brif!(is_compiled);
-
-                        // Store args into callee_locals_slot
-                        for (i, &arg) in arg_vals.iter().enumerate() {
-                            builder.ins().stack_store(arg, cls, (i * 8) as i32);
-                        }
-                        // Zero-fill remaining slots
-                        for i in arg_count..arg_count.max(1) + 64 {
-                            let zero = builder.ins().iconst(I64, 0);
-                            builder.ins().stack_store(zero, cls, (i * 8) as i32);
-                        }
-
-                        // Get pointers for callee call
-                        let callee_locals_ptr = builder.ins().stack_addr(ptr_type, cls, 0);
-                        let call_out_val_ptr = builder.ins().stack_addr(ptr_type, cov, 0);
-
-                        // Indirect call: compiled_callee(callee_locals_ptr, heap_ptr, out_val_ptr)
-                        let call_inst = builder.ins().call_indirect(
-                            hsr,
-                            compiled_ptr,
-                            &[callee_locals_ptr, heap_ptr, call_out_val_ptr],
-                        );
-                        let call_status = builder.inst_results(call_inst)[0];
-
-                        // Guard: status == 0 (else deopt)
-                        let call_ok = builder.ins().icmp_imm(IntCC::Equal, call_status, 0);
-                        emit_deopt_brif!(call_ok);
-
-                        // Load return value and push onto vstack
-                        let ret_bits = builder.ins().stack_load(I64, cov, 0);
-                        vstack.push(ret_bits);
-                    }
-                    op::STRING_CONCAT => {
-                        let val_b = vstack.pop().unwrap();
-                        let val_a = vstack.pop().unwrap();
-                        let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot,
-                            8,
-                            3,
-                        ));
-                        let out_ptr = builder.ins().stack_addr(ptr_type, out_slot, 0);
-                        let call = builder
-                            .ins()
-                            .call(concat_ref, &[heap_ptr, val_a, val_b, out_ptr]);
-                        let status = builder.inst_results(call)[0];
-                        let zero = builder.ins().iconst(I64, 0);
-                        let is_ok = builder.ins().icmp(IntCC::Equal, status, zero);
-                        emit_deopt_brif!(is_ok);
-                        let result = builder.ins().stack_load(I64, out_slot, 0);
-                        vstack.push(result);
                     }
                     _ => return Err(anyhow::anyhow!("unexpected opcode {} in hot fn", opcode)),
                 }
@@ -2405,8 +1883,6 @@ impl JitState {
         self.module.finalize_definitions()?;
         let fn_ptr: HotFnFn =
             unsafe { std::mem::transmute(self.module.get_finalized_function(func_id)) };
-        self.compiled_fns.insert(fn_id, fn_ptr);
-        self.compiled_fns_by_gcid.insert(gc_id, fn_ptr);
-        Ok(())
+        Ok(fn_ptr)
     }
 }

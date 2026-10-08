@@ -1975,7 +1975,8 @@ impl VM {
         Ok((args, names))
     }
 
-    pub fn interpret_sync(&mut self, mut chunk: Chunk) -> Result<BxValue> {
+    pub fn interpret_sync(&mut self, chunk: Chunk) -> Result<BxValue> {
+        let mut chunk = chunk.clone_without_runtime_caches();
         chunk.ensure_caches();
         let chunk_for_func = chunk.clone();
         let function = Rc::new(BxCompiledFunction {
@@ -2028,7 +2029,7 @@ impl VM {
             stack.push(BxValue::new_null());
         }
 
-        let chunk = Rc::new(RefCell::new(function.chunk.clone()));
+        let chunk = function.chunk.execution_chunk();
 
         let fiber = BxFiber {
             stack,
@@ -3039,9 +3040,10 @@ impl VM {
         }
     }
 
-    pub fn interpret(&mut self, mut chunk: Chunk) -> Result<BxValue> {
-        // Legacy consuming execution path. This still clones the chunk into a
-        // per-run Rc/RefCell wrapper and is kept as-is for existing callers.
+    pub fn interpret(&mut self, chunk: Chunk) -> Result<BxValue> {
+        // Script programs may be reused by independent VMs. Only functions
+        // already promoted into this VM share their invocation caches.
+        let mut chunk = chunk.clone_without_runtime_caches();
         chunk.ensure_caches();
         let chunk_for_func = chunk.clone();
         let chunk_rc = Rc::new(RefCell::new(chunk));
@@ -3281,7 +3283,8 @@ impl VM {
     }
 
     #[cfg(feature = "debugger")]
-    pub fn start_debug_chunk(&mut self, mut chunk: Chunk) -> Result<BxValue> {
+    pub fn start_debug_chunk(&mut self, chunk: Chunk) -> Result<BxValue> {
+        let mut chunk = chunk.clone_without_runtime_caches();
         chunk.ensure_caches();
         let chunk_for_func = chunk.clone();
         let chunk_rc = Rc::new(RefCell::new(chunk));
@@ -3540,7 +3543,7 @@ impl VM {
             stack.push(BxValue::new_null());
         }
 
-        let chunk = Rc::new(RefCell::new(func.chunk.clone()));
+        let chunk = func.chunk.execution_chunk();
         let fiber = BxFiber {
             stack,
             frames: vec![CallFrame {
@@ -6450,13 +6453,13 @@ impl VM {
                             self.fibers[fiber_idx].stack[class_idx] = instance_val;
 
                             let constructor = class.borrow().constructor.clone();
-                            let sub_chunk = constructor.chunk.clone();
-                            let constant_count = sub_chunk.constants().len();
+                            let sub_chunk = constructor.chunk.execution_chunk();
+                            let constant_count = sub_chunk.borrow().constants().len();
 
                             let frame = CallFrame {
                                 context: None,
                                 function: Rc::new(constructor),
-                                chunk: Rc::new(RefCell::new(sub_chunk)),
+                                chunk: sub_chunk,
                                 ip: 0,
                                 local_scope: None,
                                 local_names: HashMap::new(),
@@ -7445,8 +7448,8 @@ impl VM {
                 if let Some(func) = self.resolve_method(class, &method_name) {
                     let final_args = self.function_arguments(args, None, &func);
 
-                    let sub_chunk = func.chunk.clone();
-                    let constant_count = sub_chunk.constants().len();
+                    let sub_chunk = func.chunk.execution_chunk();
+                    let constant_count = sub_chunk.borrow().constants().len();
                     let future_id = self.future_new().as_gc_id().unwrap();
                     let fiber = BxFiber {
                         stack: {
@@ -7458,7 +7461,7 @@ impl VM {
                         frames: vec![CallFrame {
                             context: None,
                             function: func.clone(),
-                            chunk: Rc::new(RefCell::new(sub_chunk)),
+                            chunk: sub_chunk,
                             ip: 0,
                             local_scope: None,
                             local_names: HashMap::new(),
@@ -7569,8 +7572,8 @@ impl VM {
         if class.borrow().modifiers.is_abstract { bail!("Cannot instantiate abstract class {class_name}"); }
 
         let constructor = class.borrow().constructor.clone();
-        let sub_chunk = constructor.chunk.clone();
-        let constant_count = sub_chunk.constants().len();
+        let sub_chunk = constructor.chunk.execution_chunk();
+        let constant_count = sub_chunk.borrow().constants().len();
         let future_id = self.future_new().as_gc_id().unwrap();
         let fiber = BxFiber {
             stack: {
@@ -7582,7 +7585,7 @@ impl VM {
             frames: vec![CallFrame {
                 context: None,
                 function: Rc::new(constructor),
-                chunk: Rc::new(RefCell::new(sub_chunk)),
+                chunk: sub_chunk,
                 ip: 0,
                 local_scope: None,
                 local_names: HashMap::new(),
@@ -8054,12 +8057,12 @@ impl VM {
                     }
                     // ── End Tier-4 ────────────────────────────────────────────
 
-                    let sub_chunk = func.chunk.clone();
-                    let constant_count = sub_chunk.constants().len();
+                    let sub_chunk = func.chunk.execution_chunk();
+                    let constant_count = sub_chunk.borrow().constants().len();
                     let mut frame = CallFrame {
                         context: None,
                         function: Rc::clone(&func),
-                        chunk: Rc::new(RefCell::new(sub_chunk)),
+                        chunk: sub_chunk,
                         ip: 0,
                         local_scope: None,
                         local_names: HashMap::new(),
@@ -8323,13 +8326,13 @@ impl VM {
                             // nested method call does not remove the caller's function.
                             let final_args = self.function_arguments(args, names.as_deref(), &function);
                             self.fibers[fiber_idx].stack.extend(final_args);
-                            let sub_chunk = function.chunk.clone();
-                            let constant_count = sub_chunk.constants().len();
+                            let sub_chunk = function.chunk.execution_chunk();
+                            let constant_count = sub_chunk.borrow().constants().len();
                             let stack_base = self.fibers[fiber_idx].stack.len() - function.arity as usize;
                             self.fibers[fiber_idx].frames.push(CallFrame {
                                 context: None,
                                 function,
-                                chunk: Rc::new(RefCell::new(sub_chunk)),
+                                chunk: sub_chunk,
                                 ip: 0,
                                 local_scope: None,
                                 local_names: HashMap::new(),
@@ -8505,13 +8508,13 @@ impl VM {
                             self.fibers[fiber_idx].stack.push(arg);
                         }
 
-                        let sub_chunk = func.chunk.clone();
-                        let constant_count = sub_chunk.constants().len();
+                        let sub_chunk = func.chunk.execution_chunk();
+                        let constant_count = sub_chunk.borrow().constants().len();
                         let stack_base = self.fibers[fiber_idx].stack.len() - func.arity as usize;
                         let frame = CallFrame {
                             context: None,
                             function: func.clone(),
-                            chunk: Rc::new(RefCell::new(sub_chunk)),
+                            chunk: sub_chunk,
                             ip: 0,
                             local_scope: None,
                             local_names: HashMap::new(),
@@ -8539,14 +8542,14 @@ impl VM {
                         self.fibers[fiber_idx].stack.push(receiver_val);
                         self.fibers[fiber_idx].stack.extend(final_args);
 
-                        let sub_chunk = on_missing.chunk.clone();
-                        let constant_count = sub_chunk.constants().len();
+                        let sub_chunk = on_missing.chunk.execution_chunk();
+                        let constant_count = sub_chunk.borrow().constants().len();
                         let mut frame = CallFrame {
                             context: None,
                             local_scope: None,
                             local_names: HashMap::new(),
                             function: on_missing.clone(),
-                            chunk: Rc::new(RefCell::new(sub_chunk)),
+                            chunk: sub_chunk,
                             ip: 0,
                             stack_base: self.fibers[fiber_idx].stack.len() - 2,
                             receiver: Some(receiver_val),
@@ -8760,17 +8763,29 @@ impl VM {
             }
             Constant::CompiledFunction(f) => {
                 let mut f = f;
+                // Function metadata may originate in another VM; indices/shape
+                // guards belong to this VM, never to the reusable program.
+                f.chunk = f.chunk.clone_without_runtime_caches();
                 if f.kind != crate::types::FunctionKind::Lambda && f.captured_receiver.is_none() {
                     f.captured_receiver = self.current_receiver();
                 }
                 let id = self.gc_alloc(GcObject::CompiledFunction(Rc::new(f)))?;
                 Ok(BxValue::new_ptr(id))
             }
-            Constant::Class(c) => {
+            Constant::Class(mut c) => {
+                c.constructor.chunk = c.constructor.chunk.clone_without_runtime_caches();
+                for (_, function) in &mut c.methods {
+                    function.chunk = function.chunk.clone_without_runtime_caches();
+                }
                 let id = self.gc_alloc(GcObject::Class(Rc::new(RefCell::new(c))))?;
                 Ok(BxValue::new_ptr(id))
             }
-            Constant::Interface(i) => {
+            Constant::Interface(mut i) => {
+                for (_, function) in &mut i.methods {
+                    if let Some(function) = function {
+                        function.chunk = function.chunk.clone_without_runtime_caches();
+                    }
+                }
                 let id = self.gc_alloc(GcObject::Interface(Rc::new(RefCell::new(i))))?;
                 Ok(BxValue::new_ptr(id))
             }
@@ -8787,11 +8802,17 @@ impl VM {
         bail!("Constant at index {} is not a string: {:?}", idx, val)
     }
 
-    /// Read a string constant, intern it, and return the InternId.
-    /// Since InternId is Copy (u32), the borrow on self is released.
+    /// Identifier operands are immutable metadata, not per-frame GC values.
     fn read_intern_id(&mut self, fiber_idx: usize, idx: usize) -> Result<u32> {
-        let s = self.read_string_constant(fiber_idx, idx)?;
-        Ok(self.interner.intern(&s))
+        let mut name = {
+            let frame = self.fibers[fiber_idx].frames.last().unwrap();
+            let chunk = frame.chunk.borrow();
+            match &chunk.constants()[idx] {
+                Constant::String(name) => name.clone(),
+                other => bail!("Constant at index {} is not a string: {:?}", idx, other),
+            }
+        };
+        Ok(self.interner.intern(name.as_flat_str()))
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "js"))]

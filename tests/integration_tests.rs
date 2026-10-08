@@ -101,6 +101,7 @@ script_test!(
     "vm_throw_structured_exception.bxs"
 );
 script_test!(vm_functions, "vm_functions.bxs");
+script_test!(vm_function_execution, "vm_function_execution.bxs");
 script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");
 script_test!(vm_execution_contexts, "vm_execution_contexts.bxs");
 

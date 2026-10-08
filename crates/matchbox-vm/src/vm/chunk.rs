@@ -2,8 +2,8 @@ use super::opcode::op;
 use crate::types::Constant;
 use crate::types::box_string::BoxString;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 #[cfg(not(target_os = "espidf"))]
 pub type RuntimeCaches = Vec<Option<IcEntry>>;
@@ -85,22 +85,35 @@ impl ChunkProgram {
     }
 }
 
-/// Mutable runtime state associated with a single execution of a chunk.
+/// Mutable cache state, shared by calls to the same VM-owned function.
 ///
-/// Inline caches are stored here so that preloaded route programs can be
-/// shared while each request keeps its own independent (and race-free) cache
-/// state. On ESP32 the caches use a compact sparse representation.
-#[derive(Debug, Clone, PartialEq)]
+/// Script/route entry points and constant promotion create independent state.
+/// On ESP32 the caches use a compact sparse representation.
+#[derive(Debug, Clone)]
 pub struct ChunkRuntime {
-    pub caches: RuntimeCaches,
+    // ponytail: per-function cache mutex preserves Send/Sync program metadata;
+    // use a separate VM-owned lock-free holder if locking becomes a measured bottleneck.
+    pub caches: Arc<Mutex<RuntimeCaches>>,
     constant_map: HashMap<ConstantKey, u32>,
+    cache_program: Option<Weak<ChunkProgram>>,
+}
+
+impl PartialEq for ChunkRuntime {
+    fn eq(&self, other: &Self) -> bool {
+        let caches_equal = Arc::ptr_eq(&self.caches, &other.caches) || {
+            let caches = self.caches.lock().unwrap().clone();
+            caches == *other.caches.lock().unwrap()
+        };
+        caches_equal && self.constant_map == other.constant_map
+    }
 }
 
 impl Default for ChunkRuntime {
     fn default() -> Self {
         ChunkRuntime {
-            caches: Vec::new(),
+            caches: Arc::new(Mutex::new(Vec::new())),
             constant_map: HashMap::new(),
+            cache_program: None,
         }
     }
 }
@@ -109,49 +122,50 @@ impl ChunkRuntime {
     #[inline]
     fn emit_cache_slot(&mut self) {
         #[cfg(not(target_os = "espidf"))]
-        self.caches.push(None);
+        self.caches.lock().unwrap().push(None);
     }
 
     pub fn ensure_caches(&mut self, _code_len: usize) {
         #[cfg(not(target_os = "espidf"))]
-        if self.caches.len() < _code_len {
-            self.caches.resize(_code_len, None);
+        {
+            let mut caches = self.caches.lock().unwrap();
+            if caches.len() < _code_len {
+                caches.resize(_code_len, None);
+            }
         }
     }
 
     pub fn cache_get(&self, ip: usize) -> Option<IcEntry> {
+        let caches = self.caches.lock().unwrap();
         #[cfg(not(target_os = "espidf"))]
         {
-            self.caches.get(ip).and_then(|entry| entry.clone())
+            caches.get(ip).and_then(|entry| entry.clone())
         }
 
         #[cfg(target_os = "espidf")]
         {
-            self.caches
+            caches
                 .iter()
                 .find_map(|(cached_ip, entry)| (*cached_ip == ip).then(|| entry.clone()))
         }
     }
 
     pub fn cache_set(&mut self, ip: usize, entry: IcEntry) {
+        let mut caches = self.caches.lock().unwrap();
         #[cfg(not(target_os = "espidf"))]
         {
-            if self.caches.len() <= ip {
-                self.caches.resize(ip + 1, None);
+            if caches.len() <= ip {
+                caches.resize(ip + 1, None);
             }
-            self.caches[ip] = Some(entry);
+            caches[ip] = Some(entry);
         }
 
         #[cfg(target_os = "espidf")]
         {
-            if let Some((_, existing)) = self
-                .caches
-                .iter_mut()
-                .find(|(cached_ip, _)| *cached_ip == ip)
-            {
+            if let Some((_, existing)) = caches.iter_mut().find(|(cached_ip, _)| *cached_ip == ip) {
                 *existing = entry;
             } else {
-                self.caches.push((ip, entry));
+                caches.push((ip, entry));
             }
         }
     }
@@ -338,10 +352,34 @@ impl Chunk {
         self.runtime.cache_slice(start, len)
     }
 
+    /// Share VM-owned function cache state, not per-invocation scopes/constants.
+    pub(super) fn execution_chunk(&self) -> Rc<RefCell<Chunk>> {
+        let same_program = self.runtime.cache_program.as_ref().is_none_or(|program| {
+            program
+                .upgrade()
+                .is_some_and(|program| Arc::ptr_eq(&program, &self.program))
+        });
+        Rc::new(RefCell::new(Chunk {
+            program: Arc::clone(&self.program),
+            runtime: ChunkRuntime {
+                caches: if same_program {
+                    Arc::clone(&self.runtime.caches)
+                } else {
+                    Arc::new(Mutex::new(Vec::new()))
+                },
+                constant_map: HashMap::new(),
+                cache_program: Some(Arc::downgrade(&self.program)),
+            },
+        }))
+    }
+
     pub fn clone_without_runtime_caches(&self) -> Self {
         Chunk {
             program: Arc::clone(&self.program),
-            runtime: ChunkRuntime::default(),
+            runtime: ChunkRuntime {
+                cache_program: Some(Arc::downgrade(&self.program)),
+                ..ChunkRuntime::default()
+            },
         }
     }
 

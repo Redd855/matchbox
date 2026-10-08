@@ -159,3 +159,15 @@ fallback. Mixed-case misses keep Unicode folding/presentation behavior; exact
 case-sensitive IDs remain separate. `cargo test -p matchbox_vm --test canonical_keys`
 checks allocation-free repeated ASCII/Unicode struct reads and writes through the
 public VM API; the wide-struct fixture also checks key spelling and exact Unicode keys.
+
+VM-owned functions share guarded inline-cache buffers across calls instead of
+cloning instruction-sized arrays and compiler constant maps. Invocation scopes,
+arguments, receivers and promoted GC constants remain independent. Cache state
+is reset on script entry/constant promotion; immutable programs remain Send/Sync
+and serialized bytecode/native-provider ABI are unchanged. Cache buffers now live
+with their owning function: lower allocation traffic trades for retained cache
+memory, not a guaranteed RSS reduction. The same public allocation suite checks
+cold identifier sites (1/100 reads: 10/10 allocations) and ten warmed calls to
+small/padded functions (24,160/24,160 allocated bytes), plus VM identity and
+Unicode rope operands. `vm_function_execution.bxs` covers recursion, aliases,
+independent closures, changing layouts, case sensitivity and GC.

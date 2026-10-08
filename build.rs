@@ -122,6 +122,9 @@ fn main() {
         let dest_path = stub_dest_dir.join(dest_name);
         let feature_path = stub_dest_dir.join(format!("{}.features", dest_name));
         let feature_key = enabled_features.join(",");
+        // Another target-dir's build can replace this shared stub. Cargo must
+        // rerun feature validation before recompiling include_bytes! consumers.
+        println!("cargo:rerun-if-changed={}", feature_path.display());
 
         // Rebuild on source/feature changes; never reuse a non-JIT stub for a JIT build.
         // ponytail: shared stub cache; serialize differing-feature builds until per-build stub paths are needed.

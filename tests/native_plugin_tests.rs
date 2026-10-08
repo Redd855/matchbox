@@ -2148,28 +2148,38 @@ fn function_interception_mutates_arguments_results_and_observes_errors() {
     fs::write(module.join("ModuleConfig.bx"), r#"class {
         this.events = [];
         function preFunctionInvoke(data) {
-            if (data.name == "probe") {
+            if (data.name == "probe" || data.name == "probeLoop") {
                 if (data.context.getScopeNearby("arguments") != data.arguments || !isCustomFunction(data.function)) { throw "Function event context missing"; }
                 data.arguments.value += 1;
                 this.events.append("pre");
             }
         }
-        function postFunctionInvoke(data) { if (data.name == "probe") { this.events.append("post"); data.result += 1; } }
+        function postFunctionInvoke(data) {
+            if (data.name == "probe" || data.name == "probeLoop") {
+                if (data.name == "probeLoop" && data.context.getScopeNearby("local").counter != 41) { throw "JIT lost declaring scope"; }
+                this.events.append("post"); data.result += 1;
+            }
+        }
         function onFunctionException(data) { if (data.name == "probeFailure") { this.events.append("error:" & data.exception.message); } }
         function onUnload() { println(arrayToList(this.events)); }
     }"#).unwrap();
     let source = format!("{}\n{}", r#"function probe(value = 40) { return value; }
+        function probeLoop(value = 40) { var counter=0; while (counter < value) { counter=counter+1; } return value; }
         function probeFailure() { throw "observed failure"; }
         if (probe(value=40) != 42 || probe() != 42) { throw "Function interception did not change default/named arguments and results"; }
-        for (var call=0; call<200; call++) { if (probe() != 42) { throw "Hot function skipped interception"; } }
+        for (var call=0; call<200; call++) { if (probe() != 42 || probeLoop() != 42) { throw "Hot function skipped interception"; } }
         try { probeFailure(); } catch(any error) { if (!find("observed failure", error.message)) { throw error; } }
         println("function events OK");"#, include_str!("scripts/vm_execution_contexts.bxs"));
     fs::write(dir.path().join("app.bxs"), source).unwrap();
-    let expected = format!("function events OK\ncontext scopes OK\n{}error:observed failure\n", "pre,post,".repeat(202));
+    let expected = format!("function events OK\ncontext scopes OK\n{}error:observed failure\n", "pre,post,".repeat(402));
     let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
     success(&output);
     #[cfg(feature = "jit")]
-    assert!(String::from_utf8_lossy(&output.stderr).contains("[JIT] compiled hot fn name=probe "), "{}", String::from_utf8_lossy(&output.stderr));
+    {
+        let trace = String::from_utf8_lossy(&output.stderr);
+        assert!(trace.contains("[JIT] compiled hot fn name=probe "), "{trace}");
+        assert!(trace.contains("[JIT] compiled hot loop fn name=probeLoop "), "{trace}");
+    }
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
     success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));

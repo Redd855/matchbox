@@ -405,6 +405,8 @@ pub struct CallFrame {
     local_scope: Option<BxValue>,
     context: Option<BxValue>,
     local_names: HashMap<usize, String>,
+    #[cfg(feature = "jit")]
+    jit_loop_attempted: bool,
 }
 
 pub struct BxFiber {
@@ -1855,6 +1857,40 @@ impl BxVM for VM {
 }
 
 impl VM {
+    /// Shared GET_PRIVATE resolution; JIT intrinsic guards must respect the same scopes.
+    fn private_value(&mut self, fiber: usize, name: &str) -> Option<BxValue> {
+        let mut found = self.function_scope_value(fiber, name);
+        let lambda = self.fibers[fiber].frames.last().unwrap().function.kind == crate::types::FunctionKind::Lambda;
+        if let Some(receiver) = self.fibers[fiber].frames.last().unwrap()
+            .receiver.filter(|_| found.is_none() && !lambda)
+        {
+            if name == "this" {
+                found = Some(receiver);
+            } else if let Some(id) = self.receiver_instance_gc_id(receiver) {
+                if name == "variables" {
+                    if let GcObject::Instance(inst) = self.heap.get(id) {
+                        let proxy = VariablesScopeProxy { variables: Rc::clone(&inst.variables) };
+                        found = Some(BxValue::new_ptr(self.heap.alloc(
+                            GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
+                        )));
+                    }
+                } else if let GcObject::Instance(inst) = self.heap.get(id) {
+                    found = inst.variables.borrow().get(name).copied();
+                }
+            }
+        }
+        if found.is_none() && !lambda && name == "variables" {
+            let proxy = VariablesScopeProxy { variables: Rc::clone(&self.fibers[fiber].variables) };
+            found = Some(BxValue::new_ptr(self.heap.alloc(
+                GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
+            )));
+        }
+        if found.is_none() && (!lambda || self.has_global_function(name)) {
+            found = self.get_global(name);
+        }
+        found
+    }
+
     fn struct_key_id(&mut self, id: usize, key: &str) -> u32 {
         let case_sensitive = matches!(self.heap.get_opt(id), Some(GcObject::Struct(s)) if s.case_sensitive);
         if case_sensitive {
@@ -2034,6 +2070,8 @@ impl VM {
         let fiber = BxFiber {
             stack,
             frames: vec![CallFrame {
+                #[cfg(feature = "jit")]
+                jit_loop_attempted: false,
                 function,
                 chunk,
                 context: None,
@@ -3125,6 +3163,8 @@ impl VM {
                 local_scope: None,
                 local_names: HashMap::new(),
                 context: None,
+                #[cfg(feature = "jit")]
+                jit_loop_attempted: false,
             }],
 
             variables: Self::new_variables_scope(),
@@ -3180,6 +3220,8 @@ impl VM {
                 local_scope: None,
                 local_names: HashMap::new(),
                 context: None,
+                #[cfg(feature = "jit")]
+                jit_loop_attempted: false,
             }],
 
             variables: Self::new_variables_scope(),
@@ -3334,6 +3376,8 @@ impl VM {
                 local_scope: None,
                 local_names: HashMap::new(),
                 context: None,
+                #[cfg(feature = "jit")]
+                jit_loop_attempted: false,
             }],
             variables: Self::new_variables_scope(),
             future_id,
@@ -3559,6 +3603,8 @@ impl VM {
         let fiber = BxFiber {
             stack,
             frames: vec![CallFrame {
+                #[cfg(feature = "jit")]
+                jit_loop_attempted: false,
                 function: func,
                 chunk,
                 context: None,
@@ -4947,6 +4993,21 @@ impl VM {
                 op::LOOP => {
                     let offset = op0;
                     ip -= offset as usize;
+                    #[cfg(feature = "jit")]
+                    {
+                        flush_ip!();
+                        match self.run_jit_fn_loop(fiber_idx, ip) {
+                            Some(jit::FnJitOutcome::Return(result)) => {
+                                if let Some(result) = self.handle_return(fiber_idx, result)? {
+                                    return Ok(Some(result));
+                                }
+                                frame_changed = true;
+                                continue 'quantum;
+                            }
+                            Some(jit::FnJitOutcome::Yield) => break 'quantum,
+                            None => {}
+                        }
+                    }
                     // Safe point: yield to scheduler if timeslice expired.
                     // Skipped entirely (None fast-path) when only one fiber is running.
                     // Throttled to every 1024 backward branches when active.
@@ -5099,45 +5160,7 @@ impl VM {
                     let idx = op0;
                     let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
                     let name = self.interner.resolve(name_id).to_string().to_lowercase();
-                    let val = {
-                        let mut found = self.function_scope_value(fiber_idx, &name);
-                        let lambda = self.fibers[fiber_idx].frames.last().unwrap().function.kind == crate::types::FunctionKind::Lambda;
-                        if let Some(receiver) = self.fibers[fiber_idx].frames.last().unwrap()
-                            .receiver.filter(|_| found.is_none() && !lambda)
-                        {
-                            if name == "this" {
-                                found = Some(receiver);
-                            } else if let Some(id) = self.receiver_instance_gc_id(receiver) {
-                                if name == "variables" {
-                                    if let GcObject::Instance(inst) = self.heap.get(id) {
-                                        let proxy = VariablesScopeProxy {
-                                            variables: Rc::clone(&inst.variables),
-                                        };
-                                        found = Some(BxValue::new_ptr(self.heap.alloc(
-                                            GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
-                                        )));
-                                    }
-                                } else if let GcObject::Instance(inst) = self.heap.get(id) {
-                                    found = inst.variables.borrow().get(&name).copied();
-                                }
-                            }
-                        }
-
-                        if found.is_none() && !lambda && name == "variables" {
-                            let proxy = VariablesScopeProxy {
-                                variables: Rc::clone(&self.fibers[fiber_idx].variables),
-                            };
-                            found = Some(BxValue::new_ptr(
-                                self.heap
-                                    .alloc(GcObject::NativeObject(Rc::new(RefCell::new(proxy)))),
-                            ));
-                        }
-
-                        if found.is_none() && (!lambda || self.has_global_function(&name)) {
-                            found = self.get_global(&name);
-                        }
-                        found
-                    };
+                    let val = self.private_value(fiber_idx, &name);
 
                     if let Some(v) = val {
                         self.fibers[fiber_idx].stack.push(v);
@@ -6462,6 +6485,8 @@ impl VM {
                             let constant_count = sub_chunk.borrow().constants().len();
 
                             let frame = CallFrame {
+                                #[cfg(feature = "jit")]
+                                jit_loop_attempted: false,
                                 context: None,
                                 function: Rc::new(constructor),
                                 chunk: sub_chunk,
@@ -7464,6 +7489,8 @@ impl VM {
                             stack
                         },
                         frames: vec![CallFrame {
+                            #[cfg(feature = "jit")]
+                            jit_loop_attempted: false,
                             context: None,
                             function: func.clone(),
                             chunk: sub_chunk,
@@ -7588,6 +7615,8 @@ impl VM {
                 stack
             },
             frames: vec![CallFrame {
+                #[cfg(feature = "jit")]
+                jit_loop_attempted: false,
                 context: None,
                 function: Rc::new(constructor),
                 chunk: sub_chunk,
@@ -7998,6 +8027,8 @@ impl VM {
                     let sub_chunk = func.chunk.execution_chunk();
                     let constant_count = sub_chunk.borrow().constants().len();
                     let mut frame = CallFrame {
+                        #[cfg(feature = "jit")]
+                        jit_loop_attempted: false,
                         context: None,
                         function: Rc::clone(&func),
                         chunk: sub_chunk,
@@ -8268,6 +8299,8 @@ impl VM {
                             let constant_count = sub_chunk.borrow().constants().len();
                             let stack_base = self.fibers[fiber_idx].stack.len() - function.arity as usize;
                             self.fibers[fiber_idx].frames.push(CallFrame {
+                                #[cfg(feature = "jit")]
+                                jit_loop_attempted: false,
                                 context: None,
                                 function,
                                 chunk: sub_chunk,
@@ -8450,6 +8483,8 @@ impl VM {
                         let constant_count = sub_chunk.borrow().constants().len();
                         let stack_base = self.fibers[fiber_idx].stack.len() - func.arity as usize;
                         let frame = CallFrame {
+                            #[cfg(feature = "jit")]
+                            jit_loop_attempted: false,
                             context: None,
                             function: func.clone(),
                             chunk: sub_chunk,
@@ -8483,6 +8518,8 @@ impl VM {
                         let sub_chunk = on_missing.chunk.execution_chunk();
                         let constant_count = sub_chunk.borrow().constants().len();
                         let mut frame = CallFrame {
+                            #[cfg(feature = "jit")]
+                            jit_loop_attempted: false,
                             context: None,
                             local_scope: None,
                             local_names: HashMap::new(),

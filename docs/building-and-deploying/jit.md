@@ -13,7 +13,7 @@ MatchBox includes a multi-tier JIT compiler built on [Cranelift](https://craneli
 | WASM (browser / container) | No | Cranelift does not target WASM; the browser's own JIT runs the WASM module |
 | ESP32 / embedded | No | The `matchbox-esp32-runner` crate is workspace-excluded and has no Cranelift dependency |
 
-The JIT is compiled in via the `jit` Cargo feature, which is included in the default feature set of the `matchbox` CLI crate. The `matchbox_vm` library and desktop runner keep `jit` opt-in (default off). JIT-enabled CLI builds forward the feature only to desktop runner stubs, never WASM/WASI/ESP32. Plain bytecode and module envelopes initialize the same JIT policy. Cached desktop stubs record their feature set so switching build flags cannot silently reuse a non-JIT stub.
+The JIT is compiled in via the `jit` Cargo feature, which is included in the default feature set of the `matchbox` CLI crate. The `matchbox_vm` library and desktop runner keep `jit` opt-in (default off). JIT-enabled CLI builds forward the feature only to desktop runner stubs, never WASM/WASI/ESP32. Plain bytecode and module envelopes initialize the same JIT policy. Cached desktop stubs record their feature set; Cargo watches these shared feature sidecars so switching target directories reruns validation before embedding a stub. Builds with differing feature sets must still be serialized. `python3 tests/stub_features.py` checks JIT→non-JIT→JIT builds and successful source-free native function/loop execution.
 
 For a no-JNI JIT-enabled author build:
 
@@ -22,7 +22,7 @@ cargo build --no-default-features --features 'bif-io,bif-cli,bif-crypto,bif-http
 python3 tests/jit_runner.py target/lint-jit/debug/matchbox
 ```
 
-The process check removes source/module copies, verifies numeric results, and requires actual Cranelift compilation of compiler-generated `add`, `max_val`, default/named-argument and guarded leaf functions, plus an empty-loop control, in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr; a first-successful-execution message distinguishes native execution from compilation followed only by deopts. Enabling the feature alone is not evidence that application functions compiled.
+The process check removes source/module copies, verifies numeric results, and requires actual Cranelift compilation/execution of compiler-generated numeric/default/named-argument leaves, binary-search/counting function loops, and an empty-loop control, in source, plain/module `.bxb`, and standalone paths. Set `MATCHBOX_JIT_TRACE=1` to log initialization and hot functions rejected by the translatability check; compiled-function messages include names. Trace output goes to stderr; a first-successful-execution message distinguishes native execution from compilation followed only by deopts. Enabling the feature alone is not evidence that application functions compiled.
 
 ---
 
@@ -54,7 +54,7 @@ The array data pointer and length are passed directly to the compiled loop, bypa
 
 Compilation starts at the body immediately after `FUNCTION_ENTER`, not at the function's prologue. Ordinary VM frames still bind positional/named/default arguments, initialize scopes and run entry interception; compiled results use ordinary return/exit interception. All call paths that execute this marker are covered. Debugger stepping stays interpreted.
 
-The safe subset is readonly, forward-only leaves, plus bounded terminal record returns:
+The body-entry subset is readonly, forward-only leaves, plus bounded terminal record returns:
 
 | Category | Opcodes |
 | :--- | :--- |
@@ -70,25 +70,68 @@ The safe subset is readonly, forward-only leaves, plus bounded terminal record r
 
 Arithmetic/comparison guards require non-NaN floats. Integers, coercions, non-Boolean truthiness, zero divisors and NaN-producing arithmetic safely **deopt to body entry**, without replaying defaults/interception or losing scope mutations. For small records, machine code loads parameter values into a fixed two-slot result buffer; the epilogue performs terminal allocation through the same `literal_struct` VM service as the interpreter. Key interning/presentation and shared object identity are preserved. Inputs remain rooted in live frame scopes; heap allocation does not collect, and ordinary return handling roots the result. No allocations or side effects precede a possible deopt. General writes, calls and allocation remain interpreted; the old direct compiled-callee path and relaxed coercion helpers were removed because they bypassed these semantics. Program ownership guards prevent stale function/address reuse across GC; JIT state remains VM-local.
 
+### Bounded function-loop regions
+
+A second entry point operates at the **first ordinary `LOOP` backedge** after
+VM declarations and one interpreted iteration. It shares the function compiler;
+it does not recognize/reimplement a particular BoxLang helper. After 100 such
+invocations, it can compile the remaining region with:
+
+- Numeric `SET_LOCAL`/`SET_LOCAL_POP` to already-bound named locals, not parameters.
+- Guarded `INDEX` reads from arrays and `MEMBER` reads from plain structs.
+  Member source names must already be lowercase, so compilation of an untaken
+  branch cannot upgrade key presentation. Folded/exact IDs handle case-sensitive
+  records; missing keys, instances and proxies deopt.
+- `GET_PRIVATE int; ...; CALL 1` proven within an expression block. Each native
+  entry uses the **same private-scope resolver as the VM** and requires the core
+  native function's identity. Captured/rebound/custom callees stay interpreted;
+  native truncation preserves the current MatchBox BIF, not claimed full JVM
+  negative-number/BigDecimal parity.
+- Backedges to region entry, forward branches and numeric returns. Nested loop
+  targets, multiword compare-jumps and general calls remain unsupported.
+
+A fixed **32-slot** checkpoint stages numeric writes in the VM stack, with no
+heap writes, calls or collection during the kernel. Guards discard the entire
+attempt and resume the OSR entry, without replaying earlier declarations/events
+or the first interpreted iteration. Reading this frame's declaring scope through
+an alias deopts: its dictionary must not observe uncommitted stack writes.
+Completion commits named locals and uses ordinary return/exit interception.
+After **1024 native backedges**, progress is committed and control returns to the
+VM scheduler/GC before resuming at region entry. Parameters, captures and frame
+roots stay intact. Debugger execution stays interpreted.
+
+Only one profiling/guard attempt is made per invocation, except after budget
+yields; unsupported loops do not pay profiling on every interpreted iteration.
+Cache keys include the immutable program owner, region entry, slot count and
+writable mask. Interner IDs/machine code remain VM-local. Public checks cover
+scope aliases, late guard rollback/errors, shadowed intrinsics, defaults/named
+calls, GC, scheduler chunks, cross-VM copied metadata and 402 pre/post event pairs.
+
+This enables bx-lint's actual `bxAstTokenIndex` binary-search body. In a bounded
+Linux standalone probe, 10,000 parser-token searches improved **254→87ms**, while
+the no-loop control stayed **50ms**. Whole-LSP open/edit medians moved only
+**768→750ms / 759→748ms**, with overlapping ranges and slower completion; this is
+not a general analyzer speed guarantee or justification for arbitrary expansion.
+
 ---
 
 ## What Is Not Supported in Tier 4
 
 The following categories cause a function to remain interpreted:
 
-- **Global variables** — `GET_GLOBAL`, `SET_GLOBAL`, `DEFINE_GLOBAL`, `GET_PRIVATE`, `SET_PRIVATE`
+- **Global variables** — `GET_GLOBAL`, `SET_GLOBAL`, `DEFINE_GLOBAL`, `SET_PRIVATE`, and `GET_PRIVATE` except the guarded core `int` intrinsic
 - **I/O** — `PRINT`, `PRINTLN`
 - **Object / collection creation** — `NEW`, `ARRAY`, and `STRUCT` outside the bounded terminal-record pattern
-- **Property and index access** — `MEMBER`, `SET_MEMBER`, `INC_MEMBER`, `INDEX`, `SET_INDEX`
-- **Calls inside compiled bodies** — `CALL`, `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED`
-- **Local mutation/declarations** — `SET_LOCAL`, `SET_LOCAL_POP`, `BIND_LOCAL`
+- **General property/index operations** — writes, instances/proxies/dynamic keys; readonly array/plain-struct reads are limited to the loop region above
+- **General calls** — all except proven core `int`; `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED` remain interpreted
+- **Declarations/parameter mutation** — `BIND_LOCAL` and writes outside the staged named-local subset
 - **Strings/remainder/integer specializations** — `STRING_CONCAT`, `MODULO`, `ADD_INT`, `SUB_INT`, `MUL_INT`
-- **Loops inside functions** — `FOR_LOOP_STEP`, `LOOP`, `ITER_NEXT`
+- **General function loops** — `FOR_LOOP_STEP`, `ITER_NEXT`, nested `LOOP` targets
 - **Exception handling** — `PUSH_HANDLER`, `POP_HANDLER`, `THROW`
 - **Multi-word compare-jumps** — `LOCAL_COMPARE_JUMP`, `GLOBAL_COMPARE_JUMP`, `COMPARE_JUMP`, `LOCAL_JUMP_IF_NE_CONST`
 - **Miscellaneous** — `INC`, `DEC`, `INC_LOCAL`, `INC_GLOBAL`, `SWAP`, `OVER`, `JUMP_IF_NULL`
 
-This bounded subset enables numeric parameter-only helpers and helpers such as bx-lint's `bxPosition`/`bxRange`, not general functions or recursion. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
+This bounded subset enables numeric parameter-only helpers, bx-lint's `bxPosition`/`bxRange` and its nonallocating binary-search loop, not general functions or recursion. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
 
 ---
 

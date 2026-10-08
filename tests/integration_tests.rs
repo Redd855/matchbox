@@ -103,8 +103,36 @@ script_test!(
 script_test!(vm_functions, "vm_functions.bxs");
 script_test!(vm_function_execution, "vm_function_execution.bxs");
 script_test!(jit_function_contract, "jit_function_contract.bxs");
+script_test!(jit_loop_contract, "jit_loop_contract.bxs");
 script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");
 script_test!(vm_execution_contexts, "vm_execution_contexts.bxs");
+
+#[cfg(feature = "jit")]
+#[test]
+fn compiled_loop_metadata_keeps_member_ids_vm_local() {
+    use matchbox_vm::{types::{BxVM, BxValue, Constant}, vm::{VM, chunk::Chunk, gc::GcObject, opcode::op}};
+    let source = "function read(record, limit) { var count=0; var total=0; while(count<limit) { total=total+record.start; count=count+1; } return total; } return read;";
+    let ast = matchbox_compiler::parser::parse(source, Some("shared-loop.bxs")).unwrap();
+    let script = matchbox_compiler::compiler::Compiler::new("shared-loop.bxs").compile(&ast, source).unwrap();
+    let mut first = VM::new(); first.enable_jit();
+    let function = first.interpret(script).unwrap();
+    let record = first.struct_new(); first.struct_set(record, "start", BxValue::new_number(3.0));
+    for _ in 0..200 {
+        assert_eq!(first.call_function_value(function, vec![BxValue::new_ptr(record), BxValue::new_number(6.0)], None).unwrap().as_number(), 18.0);
+    }
+    let GcObject::CompiledFunction(function) = first.heap.get(function.as_gc_id().unwrap()) else { panic!("Expected function"); };
+    let mut transferred = Chunk::new("shared-loop-copy.bxs");
+    let slot = transferred.add_constant(Constant::CompiledFunction((**function).clone()));
+    transferred.emit1(op::CONSTANT, slot, 1); transferred.emit0(op::RETURN, 1);
+    let mut second = VM::new(); second.enable_jit();
+    let record = second.struct_new();
+    for index in 0..256 { second.struct_set(record, &format!("padding{index}"), BxValue::new_number(-1.0)); }
+    second.struct_set(record, "start", BxValue::new_number(7.0));
+    let function = second.interpret(transferred).unwrap();
+    for _ in 0..200 {
+        assert_eq!(second.call_function_value(function, vec![BxValue::new_ptr(record), BxValue::new_number(6.0)], None).unwrap().as_number(), 42.0);
+    }
+}
 
 #[test]
 fn vm_locals_survive_stack_reallocation() {

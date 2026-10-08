@@ -2739,7 +2739,7 @@ fn floor_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     }
 }
 
-fn int_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn int_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() != 1 {
         return Err("int() expects exactly 1 argument".to_string());
     }

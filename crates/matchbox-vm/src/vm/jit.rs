@@ -47,9 +47,9 @@ pub type GenericJitLoopFn = unsafe extern "C" fn(*mut u64, *const std::ffi::c_vo
 pub type ArrayIterJitFn = unsafe extern "C" fn(*mut u64, *const u64, u64) -> u64;
 
 /// Tier-4 (hot function): compiles an entire function body to native code.
-/// fn(locals_ptr, heap_ptr, out_val) -> u64   (0 = ok, 1 = deopt)
+/// fn(locals_ptr, environment, out_val) -> u64   (0 = ok, 1 = deopt, 2 = yield)
 /// - locals_ptr: function's local slots (args at [0..arity], rest are additional locals)
-/// - heap_ptr:   pointer to the GC heap (for future MEMBER support)
+/// - environment: readonly heap/VM access for nonallocating guarded reads
 /// - out_val:    write the NaN-boxed return BxValue here on success
 pub type HotFnFn = unsafe extern "C" fn(*mut u64, *const std::ffi::c_void, *mut u64) -> u64;
 
@@ -60,6 +60,82 @@ pub struct CompiledFn {
     call: HotFnFn,
     record_keys: Option<Arc<[crate::types::box_string::BoxString]>>,
     executed: bool,
+    uses_int: bool,
+}
+
+pub(super) enum FnJitOutcome {
+    Return(crate::types::BxValue),
+    Yield,
+}
+
+struct FnReadEnv {
+    vm: *const super::VM,
+    local_scope: Option<usize>,
+}
+
+// Read-only guards: no methods/proxies, coercion, allocation or collection here.
+unsafe extern "C" fn jit_read_array(
+    env: *const FnReadEnv,
+    value: u64,
+    index: u64,
+    out: *mut u64,
+) -> u64 {
+    use crate::types::BxValue;
+    let env = unsafe { &*env };
+    let vm = unsafe { &*env.vm };
+    let value: BxValue = unsafe { std::mem::transmute(value) };
+    let index: BxValue = unsafe { std::mem::transmute(index) };
+    if !index.is_number() {
+        return 1;
+    }
+    let index = index.as_number();
+    if !index.is_finite() || index < 1.0 || index != index.trunc() {
+        return 1;
+    }
+    let Some(id) = value.as_gc_id() else {
+        return 1;
+    };
+    let Some(super::gc::GcObject::Array(values)) = vm.heap.get_opt(id) else {
+        return 1;
+    };
+    if index > values.len() as f64 {
+        return 1;
+    }
+    unsafe {
+        *out = values[index as usize - 1].to_bits();
+    }
+    0
+}
+
+unsafe extern "C" fn jit_read_member(
+    env: *const FnReadEnv,
+    value: u64,
+    folded: u32,
+    exact: u32,
+    out: *mut u64,
+) -> u64 {
+    let env = unsafe { &*env };
+    let vm = unsafe { &*env.vm };
+    let value: crate::types::BxValue = unsafe { std::mem::transmute(value) };
+    let Some(id) = value.as_gc_id() else {
+        return 1;
+    };
+    // A retained execution context can expose this frame's locals through
+    // parameters. Its dictionary must not observe staged numeric stack writes.
+    if env.local_scope == Some(id) {
+        return 1;
+    }
+    let Some(super::gc::GcObject::Struct(record)) = vm.heap.get_opt(id) else {
+        return 1;
+    };
+    let key = if record.case_sensitive { exact } else { folded };
+    let Some(index) = vm.shapes.get_index(record.shape_id, key) else {
+        return 1;
+    };
+    unsafe {
+        *out = record.properties[index as usize].to_bits();
+    }
+    0
 }
 
 pub unsafe extern "C" fn jit_ic_member_fallback(
@@ -164,12 +240,19 @@ impl super::VM {
         }
         let frame = self.fibers[fiber].frames.last().unwrap();
         let program = Arc::clone(&frame.chunk.borrow().program);
-        let key = (Arc::as_ptr(&program) as usize, entry, frame.function.arity);
+        let key = (
+            Arc::as_ptr(&program) as usize,
+            entry,
+            frame.function.arity,
+            0,
+        );
         let compiled = self.jit.as_mut()?.profile_fn(
             program,
             entry,
             frame.function.arity,
+            0,
             &frame.function.name,
+            &mut self.interner,
         )?;
         let base = self.fibers[fiber].frames.last().unwrap().stack_base;
         let parameters = self.fibers[fiber]
@@ -232,6 +315,136 @@ impl super::VM {
     }
 }
 
+impl super::VM {
+    /// OSR after ordinary declarations and at least one interpreted iteration.
+    /// Only numeric named-local writes are staged; heap/parameters stay readonly.
+    pub(super) fn run_jit_fn_loop(&mut self, fiber: usize, entry: usize) -> Option<FnJitOutcome> {
+        use crate::types::BxValue;
+        self.jit.as_ref()?;
+        #[cfg(feature = "debugger")]
+        if self.debug_run.is_some() {
+            return None;
+        }
+        // One feasibility/profiling/guard attempt per invocation, not per
+        // interpreted iteration of unsupported loops. Yields reopen the gate.
+        let frame = self.fibers[fiber].frames.last_mut().unwrap();
+        if frame.jit_loop_attempted {
+            return None;
+        }
+        frame.jit_loop_attempted = true;
+        let frame = self.fibers[fiber].frames.last().unwrap();
+        let base = frame.stack_base;
+        let slots = frame.local_names.keys().max().map(|slot| slot + 1)?;
+        // ponytail: fixed 32-slot rollback checkpoint; add dynamically rooted
+        // spills only if a measured workload needs larger nonallocating kernels.
+        if slots > 32 || self.fibers[fiber].stack.len() != base + slots {
+            return None;
+        }
+        let writable = frame
+            .local_names
+            .keys()
+            .fold(0u32, |mask, slot| mask | (1 << slot));
+        let program = Arc::clone(&frame.chunk.borrow().program);
+        let key = (
+            Arc::as_ptr(&program) as usize,
+            entry,
+            slots as u32,
+            writable,
+        );
+        let compiled = self.jit.as_mut()?.profile_fn(
+            program,
+            entry,
+            slots as u32,
+            writable,
+            &frame.function.name,
+            &mut self.interner,
+        )?;
+        if compiled.uses_int {
+            if self.fibers[fiber]
+                .frames
+                .last()
+                .unwrap()
+                .local_names
+                .values()
+                .any(|name| name.eq_ignore_ascii_case("int"))
+            {
+                return None; // A staged local write could change the callee binding.
+            }
+            let value = self.private_value(fiber, "int")?;
+            let id = value.as_gc_id()?;
+            let super::gc::GcObject::NativeFunction(function) = self.heap.get(id) else {
+                return None;
+            };
+            if !std::ptr::fn_addr_eq(
+                *function,
+                crate::bifs::int_bif as crate::types::BxNativeFunction,
+            ) {
+                return None;
+            }
+        }
+        self.sync_jit_locals(fiber, false);
+        let mut saved = [BxValue::new_null(); 32];
+        saved[..slots].copy_from_slice(&self.fibers[fiber].stack[base..base + slots]);
+        let locals = unsafe { self.fibers[fiber].stack.as_mut_ptr().add(base) as *mut u64 };
+        let mut result = 0u64;
+        // No calls/effects/GC in this kernel. Array/record inputs stay rooted by
+        // the unchanged frame; numeric writes cannot introduce unrooted objects.
+        let env = FnReadEnv {
+            vm: self as *const _,
+            local_scope: self.fibers[fiber]
+                .frames
+                .last()
+                .unwrap()
+                .local_scope
+                .and_then(|scope| scope.as_gc_id()),
+        };
+        let status = unsafe {
+            (compiled.call)(
+                locals,
+                &env as *const _ as *const std::ffi::c_void,
+                &mut result,
+            )
+        };
+        if status == 1 {
+            // Discard the entire attempt, including completed iterations. Since
+            // scopes/heap were untouched, replay from this OSR entry is safe.
+            self.fibers[fiber].stack[base..base + slots].copy_from_slice(&saved[..slots]);
+            if self.jit.as_ref().unwrap().trace {
+                eprintln!("[JIT] deopt hot loop fn (guard)");
+            }
+            return None;
+        }
+        // Commit only named locals, never parameters/arguments aliases.
+        for slot in 0..slots {
+            if writable & (1 << slot) != 0 {
+                self.set_local_value(fiber, slot, self.fibers[fiber].stack[base + slot]);
+            }
+        }
+        if status == 2 {
+            self.fibers[fiber]
+                .frames
+                .last_mut()
+                .unwrap()
+                .jit_loop_attempted = false;
+            return Some(FnJitOutcome::Yield);
+        }
+        let jit = self.jit.as_mut().unwrap();
+        if jit.trace {
+            let cached = &mut jit.compiled_fns.get_mut(&key).unwrap().1;
+            if !cached.executed {
+                cached.executed = true;
+                eprintln!(
+                    "[JIT] executed hot loop fn name={}",
+                    self.fibers[fiber].frames.last().unwrap().function.name
+                );
+            }
+        }
+        Some(FnJitOutcome::Return(unsafe {
+            std::mem::transmute::<u64, BxValue>(result)
+        }))
+    }
+}
+
 // ── JitState ──────────────────────────────────────────────────────────────────
 
 pub struct JitState {
@@ -254,8 +467,8 @@ pub struct JitState {
     compiled_iters: HashMap<(usize, usize), ArrayIterJitFn>,
 
     // Tier-4: hot function compilation
-    fn_counts: HashMap<(usize, usize, u32), (Weak<ChunkProgram>, u64)>,
-    compiled_fns: HashMap<(usize, usize, u32), (Arc<ChunkProgram>, CompiledFn)>,
+    fn_counts: HashMap<(usize, usize, u32, u32), (Weak<ChunkProgram>, u64)>,
+    compiled_fns: HashMap<(usize, usize, u32, u32), (Arc<ChunkProgram>, CompiledFn)>,
 
     // OSR: persistent per-site iteration counters keyed on (fn_id, ip_at_start).
     // Survive across run_fiber quanta so fiber-scheduled loops can cross time-slice
@@ -284,6 +497,8 @@ impl JitState {
         );
         builder.symbol("jit_get_shape_id", jit_get_shape_id as *const u8);
         builder.symbol("jit_load_prop_at", jit_load_prop_at as *const u8);
+        builder.symbol("jit_read_array", jit_read_array as *const u8);
+        builder.symbol("jit_read_member", jit_read_member as *const u8);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
         let trace = std::env::var_os("MATCHBOX_JIT_TRACE").is_some();
@@ -1409,10 +1624,12 @@ impl JitState {
         program: Arc<ChunkProgram>,
         entry: usize,
         arity: u32,
+        writable: u32,
         name: &str,
+        interner: &mut super::intern::StringInterner,
     ) -> Option<CompiledFn> {
         let fn_id = Arc::as_ptr(&program) as usize;
-        let key = (fn_id, entry, arity);
+        let key = (fn_id, entry, arity, writable);
         if let Some((_, compiled)) = self.compiled_fns.get(&key) {
             return Some(compiled.clone());
         }
@@ -1431,28 +1648,61 @@ impl JitState {
         *count += 1;
         if *count == JIT_FN_THRESHOLD {
             let code = &program.code[entry..];
-            let record_keys = Self::record_return(code, &program.constants, arity);
-            if record_keys.is_none() && !Self::fn_is_translatable(code, &program.constants, arity) {
+            let record_keys = (writable == 0)
+                .then(|| Self::record_return(code, &program.constants, arity))
+                .flatten();
+            if record_keys.is_none()
+                && !Self::fn_is_translatable(code, &program.constants, arity, writable)
+            {
                 if self.trace {
                     eprintln!("[JIT] skipped hot fn name={} (unsupported bytecode)", name);
                 }
                 return None;
             }
-            match self.compile_hot_fn(fn_id, code, &program.constants) {
+            let mut members = HashMap::new();
+            let mut uses_int = false;
+            for &word in code {
+                let opcode = (word & 0xFF) as u8;
+                if opcode == op::GET_PRIVATE {
+                    uses_int = true;
+                }
+                if opcode == op::MEMBER {
+                    let constant = (word >> 8) as usize;
+                    let crate::types::Constant::String(mut name) =
+                        program.constants[constant].clone()
+                    else {
+                        unreachable!()
+                    };
+                    let text = name.as_flat_str();
+                    members.insert(
+                        constant,
+                        (interner.intern(text), interner.intern_case_sensitive(text)),
+                    );
+                }
+            }
+            match self.compile_hot_fn(fn_id, code, &program.constants, writable, &members) {
                 Ok(compiled) => {
                     eprintln!(
-                        "[JIT] compiled hot fn name={} fn_id=0x{:x} entry={}",
-                        name, fn_id, entry
+                        "[JIT] compiled hot {}fn name={} fn_id=0x{:x} entry={}",
+                        if writable != 0 { "loop " } else { "" },
+                        name,
+                        fn_id,
+                        entry
                     );
                     let compiled = CompiledFn {
                         call: compiled,
                         record_keys: record_keys.map(Arc::from),
                         executed: false,
+                        uses_int,
                     };
                     self.compiled_fns.insert(key, (program, compiled.clone()));
                     return Some(compiled);
                 }
-                Err(e) => eprintln!("[JIT] hot fn compile failed: {}", e),
+                Err(e) => {
+                    eprintln!("[JIT] hot fn compile failed: {}", e);
+                    self.module.clear_context(&mut self.ctx);
+                    self.func_ctx = FunctionBuilderContext::new();
+                }
             }
         }
         None
@@ -1498,14 +1748,26 @@ impl JitState {
             .collect()
     }
 
-    fn fn_is_translatable(code: &[u32], consts: &[crate::types::Constant], arity: u32) -> bool {
-        // ponytail: readonly, forward-only leaves; add writes/calls only with
-        // resumable deopt and GC safepoints, not by extending this whitelist.
+    fn fn_is_translatable(
+        code: &[u32],
+        consts: &[crate::types::Constant],
+        arity: u32,
+        writable: u32,
+    ) -> bool {
+        // Loops stage numeric named-local writes, rollback on guards, and yield
+        // every 1024 backedges. No heap writes/general calls/allocations.
         code.iter().enumerate().all(|(ip, &word)| {
             let opcode = (word & 0xFF) as u8;
             let arg = word >> 8;
             match opcode {
                 op::GET_LOCAL => arg < arity,
+                op::SET_LOCAL | op::SET_LOCAL_POP => arg < 32 && writable & (1 << arg) != 0,
+                op::LOOP => writable != 0 && (arg as usize) == ip + 1,
+                op::INDEX => writable != 0,
+                // Compiling an untaken read must not upgrade key presentation.
+                op::MEMBER => writable != 0 && matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if { let mut name=name.clone(); let text=name.as_flat_str(); text==text.to_lowercase() }),
+                op::GET_PRIVATE => writable != 0 && matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if name.clone().as_flat_str().eq_ignore_ascii_case("int")),
+                op::CALL => writable != 0 && arg == 1 && Self::int_call(code, ip),
                 op::CONSTANT => matches!(
                     consts.get(arg as usize),
                     Some(
@@ -1538,11 +1800,46 @@ impl JitState {
         })
     }
 
+    /// Prove the callee within one expression block before touching Cranelift.
+    fn int_call(code: &[u32], ip: usize) -> bool {
+        let mut needed = 1i32; // the single argument expression
+        for &word in code[..ip].iter().rev() {
+            let opcode = (word & 0xFF) as u8;
+            if needed == 0 {
+                return opcode == op::GET_PRIVATE;
+            }
+            needed += match opcode {
+                op::GET_LOCAL | op::GET_PRIVATE | op::CONSTANT => -1,
+                op::ADD
+                | op::ADD_FLOAT
+                | op::SUBTRACT
+                | op::SUB_FLOAT
+                | op::MULTIPLY
+                | op::MUL_FLOAT
+                | op::DIVIDE
+                | op::DIV_FLOAT
+                | op::EQUAL
+                | op::NOT_EQUAL
+                | op::LESS
+                | op::LESS_EQUAL
+                | op::GREATER
+                | op::GREATER_EQUAL
+                | op::INDEX
+                | op::CALL => 1,
+                op::NOT | op::MEMBER => 0,
+                _ => return false, // calls across branches/stores stay interpreted
+            };
+        }
+        false
+    }
+
     fn compile_hot_fn(
         &mut self,
         fn_id: usize,
         code: &[u32],
         consts: &[crate::types::Constant],
+        writable: u32,
+        members: &HashMap<usize, (u32, u32)>,
     ) -> anyhow::Result<HotFnFn> {
         use cranelift_codegen::ir::{Block, StackSlot, StackSlotData, StackSlotKind};
 
@@ -1561,6 +1858,9 @@ impl JitState {
                     }
                     op::JUMP => {
                         branch_targets.insert(ip + 1 + op0);
+                    }
+                    op::LOOP => {
+                        branch_targets.insert(ip + 1 - op0);
                     }
                     _ => {}
                 }
@@ -1603,8 +1903,17 @@ impl JitState {
                         }
                         break;
                     }
-                    op::JUMP => {
-                        let target = ip2 + 1 + op02;
+                    op::JUMP | op::LOOP => {
+                        let target = if opcode2 == op::LOOP {
+                            ip2 + 1 - op02
+                        } else {
+                            ip2 + 1 + op02
+                        };
+                        if opcode2 == op::LOOP && depth != 0 {
+                            return Err(anyhow::anyhow!(
+                                "loop OSR requires an empty expression stack"
+                            ));
+                        }
                         if !stack_depth_at.contains_key(&target) {
                             stack_depth_at.insert(target, depth);
                             worklist.push(target);
@@ -1614,7 +1923,8 @@ impl JitState {
                     op::RETURN => {
                         break;
                     }
-                    op::GET_LOCAL | op::CONSTANT | op::DUP => depth += 1,
+                    op::GET_LOCAL | op::GET_PRIVATE | op::CONSTANT | op::DUP => depth += 1,
+                    op::INDEX => depth -= 1,
                     op::STRUCT => depth += 1 - 2 * op02 as i32,
                     op::SET_LOCAL_POP | op::POP => depth -= 1,
                     op::CALL => {
@@ -1656,7 +1966,7 @@ impl JitState {
         sig.params.push(AbiParam::new(ptr_type)); // locals_ptr
         sig.params.push(AbiParam::new(ptr_type)); // heap_ptr
         sig.params.push(AbiParam::new(ptr_type)); // out_val_ptr
-        sig.returns.push(AbiParam::new(I64)); // status (0=ok, 1=deopt)
+        sig.returns.push(AbiParam::new(I64)); // status (0=ok, 1=rollback, 2=yield)
 
         let func_name = format!("jit_hotfn_x{:x}_v{}", fn_id, self.func_counter);
         let func_id = self
@@ -1666,6 +1976,37 @@ impl JitState {
         self.ctx.func.name = UserFuncName::user(0, self.func_counter);
         self.func_counter += 1;
         self.ctx.func.signature = sig;
+
+        let readers = if writable != 0 {
+            let mut sig = self.module.make_signature();
+            sig.params.extend([
+                AbiParam::new(ptr_type),
+                AbiParam::new(I64),
+                AbiParam::new(I64),
+                AbiParam::new(ptr_type),
+            ]);
+            sig.returns.push(AbiParam::new(I64));
+            let array = self
+                .module
+                .declare_function("jit_read_array", Linkage::Import, &sig)?;
+            let array = self.module.declare_func_in_func(array, &mut self.ctx.func);
+            let mut sig = self.module.make_signature();
+            sig.params.extend([
+                AbiParam::new(ptr_type),
+                AbiParam::new(I64),
+                AbiParam::new(I32),
+                AbiParam::new(I32),
+                AbiParam::new(ptr_type),
+            ]);
+            sig.returns.push(AbiParam::new(I64));
+            let member = self
+                .module
+                .declare_function("jit_read_member", Linkage::Import, &sig)?;
+            let member = self.module.declare_func_in_func(member, &mut self.ctx.func);
+            Some((array, member))
+        } else {
+            None
+        };
 
         {
             let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx);
@@ -1691,7 +2032,16 @@ impl JitState {
             builder.seal_block(entry_block);
 
             let locals_ptr = builder.block_params(entry_block)[0];
+            let vm_ptr = builder.block_params(entry_block)[1];
             let out_val_ptr = builder.block_params(entry_block)[2];
+            let yield_exit = builder.create_block();
+            let budget_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let budget = builder.ins().iconst(I64, 1024);
+            builder.ins().stack_store(budget, budget_slot, 0);
 
             // Allocate spill slots for expression stack (8 bytes each, 8-byte aligned)
             let spill_slots: Vec<StackSlot> = (0..max_stack.max(1))
@@ -1711,6 +2061,9 @@ impl JitState {
 
             // ── Per-instruction translation ───────────────────────────────────
             let mut vstack: Vec<cranelift_codegen::ir::Value> = Vec::new();
+            // Proven GET_PRIVATE int SSA values, not a forgeable boxed-value tag.
+            // Calls across control-flow/spill boundaries remain interpreted.
+            let mut int_functions = BTreeSet::new();
             let mut block_terminated = target_blocks.contains_key(&0);
 
             let mut ip = 0usize;
@@ -1754,6 +2107,22 @@ impl JitState {
                     }};
                 }
 
+                macro_rules! require_float {
+                    ($value:expr) => {{
+                        let value = $value;
+                        let valid = builder.ins().icmp_imm(
+                            IntCC::UnsignedLessThan,
+                            value,
+                            0xFFF8000000000000_u64 as i64,
+                        );
+                        emit_deopt_brif!(valid);
+                        let float = builder.ins().bitcast(F64, MemFlags::new(), value);
+                        let ordered = builder.ins().fcmp(FloatCC::Ordered, float, float);
+                        emit_deopt_brif!(ordered);
+                        float
+                    }};
+                }
+
                 match opcode {
                     op::GET_LOCAL => {
                         vstack.push(builder.ins().load(
@@ -1762,6 +2131,55 @@ impl JitState {
                             locals_ptr,
                             (op0 * 8) as i32,
                         ));
+                    }
+                    op::SET_LOCAL | op::SET_LOCAL_POP => {
+                        let value = *vstack.last().unwrap();
+                        require_float!(value);
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), value, locals_ptr, (op0 * 8) as i32);
+                        if opcode == op::SET_LOCAL_POP {
+                            vstack.pop();
+                        }
+                    }
+                    op::GET_PRIVATE => {
+                        let value = builder
+                            .ins()
+                            .iconst(I64, crate::types::BxValue::new_null().to_bits() as i64);
+                        int_functions.insert(value);
+                        vstack.push(value);
+                    }
+                    op::CALL => {
+                        let argument = vstack.pop().unwrap();
+                        let function = vstack.pop().unwrap();
+                        if !int_functions.contains(&function) {
+                            return Err(anyhow::anyhow!("only proven core int calls are eligible"));
+                        }
+                        let float = require_float!(argument);
+                        let result = builder.ins().trunc(float);
+                        vstack.push(builder.ins().bitcast(I64, MemFlags::new(), result));
+                    }
+                    op::INDEX | op::MEMBER => {
+                        let out = builder.ins().stack_addr(ptr_type, spill_slots[0], 0);
+                        let call = if opcode == op::INDEX {
+                            let index = vstack.pop().unwrap();
+                            let value = vstack.pop().unwrap();
+                            builder
+                                .ins()
+                                .call(readers.unwrap().0, &[vm_ptr, value, index, out])
+                        } else {
+                            let value = vstack.pop().unwrap();
+                            let (folded, exact) = members[&op0];
+                            let folded = builder.ins().iconst(I32, folded as i64);
+                            let exact = builder.ins().iconst(I32, exact as i64);
+                            builder
+                                .ins()
+                                .call(readers.unwrap().1, &[vm_ptr, value, folded, exact, out])
+                        };
+                        let status = builder.inst_results(call)[0];
+                        let success = builder.ins().icmp_imm(IntCC::Equal, status, 0);
+                        emit_deopt_brif!(success);
+                        vstack.push(builder.ins().stack_load(I64, spill_slots[0], 0));
                     }
                     op::CONSTANT => {
                         let idx = op0;
@@ -1912,9 +2330,24 @@ impl JitState {
                         vstack.clear();
                         block_terminated = true;
                     }
-                    op::JUMP => {
-                        let offset = op0;
-                        let target_ip = ip + 1 + offset;
+                    op::JUMP | op::LOOP => {
+                        let target_ip = if opcode == op::LOOP {
+                            ip + 1 - op0
+                        } else {
+                            ip + 1 + op0
+                        };
+                        if opcode == op::LOOP {
+                            // Bound native execution without collecting under raw pointers.
+                            let left = builder.ins().stack_load(I64, budget_slot, 0);
+                            let left = builder.ins().iadd_imm(left, -1);
+                            builder.ins().stack_store(left, budget_slot, 0);
+                            let remaining =
+                                builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, left, 0);
+                            let resume = builder.create_block();
+                            builder.ins().brif(remaining, resume, &[], yield_exit, &[]);
+                            builder.switch_to_block(resume);
+                            builder.seal_block(resume);
+                        }
 
                         // Spill vstack before unconditional jump
                         for (i, &v) in vstack.iter().enumerate() {
@@ -1942,6 +2375,9 @@ impl JitState {
                     }
                     op::RETURN => {
                         let ret_val = vstack.pop().unwrap();
+                        if writable != 0 {
+                            require_float!(ret_val);
+                        }
                         builder
                             .ins()
                             .store(MemFlags::new(), ret_val, out_val_ptr, 0);
@@ -1965,6 +2401,10 @@ impl JitState {
             builder.switch_to_block(normal_exit);
             let ret_0 = builder.ins().iconst(I64, 0);
             builder.ins().return_(&[ret_0]);
+
+            builder.switch_to_block(yield_exit);
+            let yielded = builder.ins().iconst(I64, 2);
+            builder.ins().return_(&[yielded]);
 
             // ── deopt_exit ────────────────────────────────────────────────────
             builder.switch_to_block(deopt_exit);

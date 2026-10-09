@@ -111,6 +111,14 @@ fn main() {
         native_features.push("jit");
     }
 
+    // ZIP's native C codecs require a C sysroot and are not available in
+    // WASM/WASI runners. Enabling desktop ZIP must not remove the web runner.
+    let wasm_features: Vec<_> = features
+        .iter()
+        .copied()
+        .filter(|feature| *feature != "bif-zip")
+        .collect();
+
     // Helper closure to build and copy a stub
     let build_stub = |target: Option<&str>,
                       dest_name: &str,
@@ -271,11 +279,11 @@ fn main() {
         "matchbox_runner.wasm",
         "wasi",
         &mut stubs_rs_content,
-        &features,
+        &wasm_features,
     );
 
     // Always build web WASM if possible (requires wasm32-unknown-unknown target + js feature)
-    let mut web_features = features.clone();
+    let mut web_features = wasm_features.clone();
     web_features.push("js");
     build_stub(
         Some("wasm32-unknown-unknown"),

@@ -126,6 +126,9 @@ MatchBox is fully compatible with the WebAssembly System Interface (WASI). Compi
 matchbox --target wasm my_app.bxs   # Produces a standalone WASM/WASI binary
 matchbox --target js   my_lib.bxs   # Produces an ES Module wrapper
 ```
+Desktop `bif-zip` is not forwarded to WASM/WASI runners: its C codecs require
+an additional C sysroot. Native runners retain ZIP support; enabling it on the
+CLI must not prevent packaging web code that does not use ZIP.
 
 ### ESP32 Embedded
 MatchBox can flash BoxLang bytecode directly to ESP32 microcontrollers, enabling high-level language features on low-power hardware.

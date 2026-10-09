@@ -1,5 +1,8 @@
 use matchbox_vm::{
-    types::{BxCompiledFunction, BxVM, BxValue, Constant, FunctionKind, box_string::BoxString},
+    types::{
+        BxCompiledFunction, BxVM, BxValue, Constant, FunctionKind, FutureStatus, NativeFutureValue,
+        box_string::BoxString,
+    },
     vm::{
         VM,
         chunk::{Chunk, ChunkProgram},
@@ -62,6 +65,39 @@ fn existing_canonical_struct_reads_do_not_allocate_temporary_keys() {
 }
 
 #[test]
+fn missing_canonical_ascii_lookups_do_not_allocate_temporary_keys() {
+    let mut vm = VM::new();
+    let data = vm.struct_new();
+    let shape = vm.get_root_shape();
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    for _ in 0..100 {
+        for key in ["missing", "__mb_interceptor_states", "absent_2!?"] {
+            assert!(vm.struct_get(data, key).is_null());
+            assert!(!vm.struct_key_exists(data, key));
+            assert_eq!(vm.get_global(key), None);
+            assert_eq!(vm.get_shape_index(shape, key), None);
+        }
+    }
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert_eq!(
+        allocations, 0,
+        "Missing canonical ASCII lookups allocate: {allocations}"
+    );
+    // A miss must not insert a folded ID or change later presentation/case behavior.
+    for (spelling, folded) in [
+        ("MiSsInG", "missing"),
+        ("ÉLÈVE中😀", "élève中😀"),
+        ("İ", "i\u{307}"),
+    ] {
+        vm.struct_set(data, spelling, BxValue::new_int(42));
+        assert_eq!(vm.struct_get(data, folded), BxValue::new_int(42));
+        assert_eq!(vm.struct_get(data, spelling), BxValue::new_int(42));
+    }
+    assert!(vm.struct_get(data, "NOT_DEFINED").is_null());
+    assert!(vm.struct_get(data, "ÉLÈVE_ABSENT").is_null());
+}
+
+#[test]
 fn existing_canonical_struct_writes_do_not_allocate_temporary_keys() {
     let mut vm = VM::new();
     let data = vm.struct_new();
@@ -81,6 +117,100 @@ fn existing_canonical_struct_writes_do_not_allocate_temporary_keys() {
         allocations, 0,
         "Existing canonical writes should not allocate temporary keys"
     );
+}
+
+#[test]
+fn completion_delivery_preserves_idle_pending_gc_and_scheduled_work() {
+    let mut vm = VM::new();
+    let mut script = Chunk::new("completion-delivery.bxs");
+    let answer = script.add_constant(Constant::Number(42.0));
+    script.emit1(op::CONSTANT, answer, 1);
+    script.emit0(op::RETURN, 1);
+    assert_eq!(
+        vm.interpret_chunk_borrowed(&script).unwrap().as_number(),
+        42.0
+    );
+
+    let resolved_handle = vm.native_future_new();
+    let resolved = resolved_handle.future();
+    let rejected_handle = vm.native_future_new();
+    let rejected = rejected_handle.future();
+    let abandoned_handle = vm.native_future_new();
+    let abandoned = abandoned_handle.future();
+    let abandoned_root = vm.retain_value(abandoned).unwrap();
+    // Empty polls with live senders must keep futures rooted and pending.
+    vm.pump_until_blocked().unwrap();
+    vm.collect_garbage_now();
+    assert!(matches!(
+        vm.future_status(resolved),
+        Some(FutureStatus::Pending)
+    ));
+    assert!(matches!(
+        vm.future_status(rejected),
+        Some(FutureStatus::Pending)
+    ));
+    std::thread::spawn(move || {
+        resolved_handle
+            .resolve(NativeFutureValue::String("é中😀".into()))
+            .unwrap();
+        rejected_handle
+            .reject(NativeFutureValue::Error {
+                message: "observed failure".into(),
+            })
+            .unwrap();
+        drop(abandoned_handle);
+    })
+    .join()
+    .unwrap();
+    // Queued channel payloads are still protected by their pending-future roots.
+    vm.collect_garbage_now();
+    assert_eq!(
+        vm.interpret_chunk_borrowed(&script).unwrap().as_number(),
+        42.0
+    );
+    assert!(matches!(
+        vm.future_status(resolved),
+        Some(FutureStatus::Completed)
+    ));
+    assert_eq!(vm.to_string(vm.future_value(resolved).unwrap()), "é中😀");
+    let Some(FutureStatus::Failed(error)) = vm.future_status(rejected) else {
+        panic!("Expected rejection");
+    };
+    assert_eq!(
+        vm.to_string(vm.struct_get(error.as_gc_id().unwrap(), "message")),
+        "observed failure"
+    );
+    assert!(matches!(
+        vm.future_status(vm.read_retained_value(&abandoned_root).unwrap()),
+        Some(FutureStatus::Pending)
+    ));
+
+    // The VM-local scheduled queue is independent of native sender registration.
+    let scheduled = vm.future_new();
+    let scheduled_error = vm.future_new();
+    let value = BxValue::new_ptr(vm.string_new("scheduled é😀".into()));
+    vm.future_schedule_resolve(scheduled, value).unwrap();
+    vm.future_schedule_reject(scheduled_error, BxValue::new_int(7))
+        .unwrap();
+    vm.collect_garbage_now();
+    vm.pump_until_blocked().unwrap();
+    assert_eq!(
+        vm.to_string(vm.future_value(scheduled).unwrap()),
+        "scheduled é😀"
+    );
+    assert!(
+        matches!(vm.future_status(scheduled_error), Some(FutureStatus::Failed(value)) if value == BxValue::new_int(7))
+    );
+    // Once both queues are drained, later registrations must resume delivery.
+    assert_eq!(
+        vm.interpret_chunk_borrowed(&script).unwrap().as_number(),
+        42.0
+    );
+    let later = vm.native_future_new();
+    let future = later.future();
+    later.resolve(NativeFutureValue::Int(64)).unwrap();
+    vm.pump_until_blocked().unwrap();
+    assert_eq!(vm.future_value(future), Some(BxValue::new_int(64)));
 }
 
 #[test]

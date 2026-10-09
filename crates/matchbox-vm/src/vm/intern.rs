@@ -60,10 +60,13 @@ impl StringInterner {
 
     /// Read-only lookup (no insert). Returns None if the string was never interned.
     pub fn get_id(&self, s: &str) -> Option<InternId> {
-        self.lookup
-            .get(s)
-            .copied()
-            .or_else(|| self.lookup.get(&s.to_lowercase()).copied())
+        self.lookup.get(s).copied().or_else(|| {
+            // Already-folded ASCII misses cannot match a different lowercase key.
+            if s.bytes().all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase()) {
+                return None;
+            }
+            self.lookup.get(&s.to_lowercase()).copied()
+        })
     }
 
     pub fn get_exact_id(&self, s: &str) -> Option<InternId> {

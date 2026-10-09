@@ -2126,6 +2126,10 @@ impl VM {
     }
 
     fn drain_native_completions(&mut self) {
+        // Native senders remain counted/rooted until their terminal message is drained.
+        if self.pending_native_futures.is_empty() && self.native_completions.is_empty() {
+            return;
+        }
         while let Ok(message) = self.native_future_rx.try_recv() {
             match message {
                 NativeFutureMessage::Resolve { future, value } => {

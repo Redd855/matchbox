@@ -3964,7 +3964,7 @@ impl VM {
             }
 
             #[cfg(feature = "debugger")]
-            {
+            if self.debug_run.is_some() {
                 let loc = self.debug_location_at_ip(fiber_idx, ip);
                 let mut pause_reason = None;
                 if let Some(state) = self.debug_run.as_mut() {

@@ -123,18 +123,17 @@ impl VM {
         if name == "arguments" {
             return self.arguments_scope(fiber);
         }
-        self.function_scope_for(fiber, name)
-            .and_then(|scope| self.scope_value(scope, name))
+        self.function_scope_entry(fiber, name).map(|(_, value)| value)
     }
 
-    fn function_scope_for(&self, fiber: usize, name: &str) -> Option<BxValue> {
+    fn function_scope_entry(&self, fiber: usize, name: &str) -> Option<(BxValue, BxValue)> {
         let frame = self.fibers[fiber].frames.last().unwrap();
         frame
             .local_scope
             .into_iter()
             .chain(self.arguments_scope(fiber))
             .chain(frame.function.captured_scopes.iter().copied())
-            .find(|scope| self.scope_value(*scope, name).is_some())
+            .find_map(|scope| self.scope_value(scope, name).map(|value| (scope, value)))
     }
 
     pub(super) fn assign_function_scope(
@@ -143,7 +142,7 @@ impl VM {
         name: &str,
         value: BxValue,
     ) -> bool {
-        if let Some(scope) = self.function_scope_for(fiber, name) {
+        if let Some((scope, _)) = self.function_scope_entry(fiber, name) {
             self.struct_set(scope.as_gc_id().unwrap(), name, value);
             return true;
         }

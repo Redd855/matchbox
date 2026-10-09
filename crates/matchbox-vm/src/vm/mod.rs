@@ -5682,12 +5682,13 @@ impl VM {
                                     _ => {}
                                 }
 
-                                let key_name = if s.case_sensitive {
-                                    self.read_string_constant(fiber_idx, idx as usize)?
+                                let key_id = if s.case_sensitive {
+                                    let name = self.read_string_constant(fiber_idx, idx as usize)?;
+                                    self.interner.get_exact_id(&name)
                                 } else {
-                                    self.interner.resolve(name_id).to_string()
+                                    Some(name_id)
                                 };
-                                if let Some(idx) = self.struct_key_lookup_id(id, &key_name)
+                                if let Some(idx) = key_id
                                     .and_then(|key_id| self.shapes.get_index(shape_id, key_id))
                                 {
                                     {

@@ -214,6 +214,37 @@ fn completion_delivery_preserves_idle_pending_gc_and_scheduled_work() {
 }
 
 #[test]
+fn cold_ordinary_members_do_not_allocate_name_roundtrips() {
+    let mut allocations = Vec::new();
+    for repeats in [1, 100] {
+        let mut vm = VM::new();
+        let record = vm.struct_new();
+        vm.struct_set(record, "value", BxValue::new_int(42));
+        vm.insert_global("record".into(), BxValue::new_ptr(record));
+        let mut script = Chunk::new("cold-members.bxs");
+        let record = script.add_constant(Constant::String(BoxString::new("record")));
+        let field = script.add_constant(Constant::String(BoxString::new("value")));
+        for repeat in 0..repeats {
+            script.emit1(op::GET_GLOBAL, record, 1);
+            script.emit1(op::MEMBER, field, 1);
+            if repeat + 1 < repeats {
+                script.emit0(op::POP, 1);
+            }
+        }
+        script.emit0(op::RETURN, 1);
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        let result = vm.interpret_chunk_borrowed(&script).unwrap();
+        allocations.push(ALLOCATIONS.with(|count| count.replace(None).unwrap()));
+        assert_eq!(result, BxValue::new_int(42));
+    }
+    eprintln!("Cold member allocations, 1/100 sites: {allocations:?}");
+    assert!(
+        allocations[1] <= allocations[0] + 8,
+        "Member name roundtrips allocate: {allocations:?}"
+    );
+}
+
+#[test]
 fn identifier_bytecode_reads_do_not_allocate_per_instruction() {
     let mut allocations = Vec::new();
     for repeats in [1, 100] {

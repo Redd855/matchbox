@@ -53,7 +53,9 @@ js-sys = "0.3.77"
 [features]
 default = ["bif-io", "bif-jni", "bif-crypto", "bif-cli", "bif-http", "jit", "server"]
 cross-compile = []
-server = ["matchbox_server", "tokio"]
+# Keep CLI feature flags (including embedded runner builds) aligned with the
+# capabilities that matchbox_server already enables on the shared VM.
+server = ["matchbox_server", "tokio", "bif-io", "bif-http", "bif-zip", "bif-crypto", "bif-cli", "bif-jni", "bif-datasource", "jit"]
 jit = ["matchbox_vm/jit"]
 debugger = ["matchbox_vm/debugger"]
 bif-io = ["matchbox_vm/bif-io"]

@@ -800,6 +800,7 @@ fn test_bytecode_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "bif-jni"), ignore = "requires feature bif-jni")]
 fn test_java_import() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

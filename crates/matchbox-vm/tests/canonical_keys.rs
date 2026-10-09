@@ -299,6 +299,104 @@ fn warmed_members_do_not_renormalize_operand_names() {
 }
 
 #[test]
+fn repeated_parameter_writes_do_not_allocate_binding_names() {
+    let mut allocations = Vec::new();
+    for repeats in [1, 100] {
+        let mut vm = VM::new();
+        let mut body = Chunk::new("parameter-writes.bxs");
+        let answer = body.add_constant(Constant::Number(42.0));
+        for _ in 0..repeats {
+            body.emit1(op::CONSTANT, answer, 1);
+            body.emit1(op::SET_LOCAL_POP, 0, 1);
+        }
+        body.emit1(op::GET_LOCAL, 0, 1);
+        body.emit0(op::RETURN, 1);
+        let function = BxCompiledFunction {
+            name: "writeParameter".into(),
+            kind: FunctionKind::Udf,
+            arity: 2,
+            min_arity: 1,
+            params: vec!["VaLuE".into()],
+            bif: None,
+            modifiers: Default::default(),
+            captured_receiver: None,
+            captured_scopes: Vec::new(),
+            chunk: body,
+        };
+        let mut script = Chunk::new("parameter-writes-owner.bxs");
+        let slot = script.add_constant(Constant::CompiledFunction(function));
+        script.emit1(op::CONSTANT, slot, 1);
+        script.emit0(op::RETURN, 1);
+        let function = vm.interpret(script).unwrap();
+        let args = vec![BxValue::new_int(1)];
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        let result = vm.call_function_value(function, args, None).unwrap();
+        allocations.push(ALLOCATIONS.with(|count| count.replace(None).unwrap()));
+        assert_eq!(result.as_number(), 42.0);
+    }
+    eprintln!("Parameter write allocations, 1/100 stores: {allocations:?}");
+    assert!(
+        allocations[1] <= allocations[0] + 8,
+        "Parameter writes allocate names: {allocations:?}"
+    );
+}
+
+#[test]
+fn numeric_parameter_bindings_preserve_read_and_first_write_spelling() {
+    for (spelling, incoming) in [
+        ("SpellingProbe", "spellingprobe"),
+        ("Élève中😀", "élève中😀"),
+    ] {
+        for write in [false, true] {
+            let mut vm = VM::new();
+            let mut body = Chunk::new("parameter-spelling.bxs");
+            body.emit1(op::GET_LOCAL, 0, 1);
+            body.emit0(op::POP, 1);
+            if write {
+                let answer = body.add_constant(Constant::Number(42.0));
+                body.emit1(op::CONSTANT, answer, 1);
+                body.emit1(op::SET_LOCAL_POP, 0, 1);
+            }
+            body.emit1(op::GET_LOCAL, 1, 1);
+            body.emit0(op::RETURN, 1);
+            let function = BxCompiledFunction {
+                name: "parameterSpelling".into(),
+                kind: FunctionKind::Udf,
+                arity: 2,
+                min_arity: 1,
+                params: vec![spelling.into()],
+                bif: None,
+                modifiers: Default::default(),
+                captured_receiver: None,
+                captured_scopes: Vec::new(),
+                chunk: body,
+            };
+            let mut script = Chunk::new("parameter-spelling-owner.bxs");
+            let slot = script.add_constant(Constant::CompiledFunction(function));
+            script.emit1(op::CONSTANT, slot, 1);
+            script.emit0(op::RETURN, 1);
+            let function = vm.interpret(script).unwrap();
+            let scope = vm
+                .call_function_value_named(
+                    function,
+                    vec![BxValue::new_int(7)],
+                    Some(vec![incoming.into()]),
+                )
+                .unwrap();
+            let scope = scope.as_gc_id().unwrap();
+            assert_eq!(
+                vm.struct_key_array(scope),
+                [if write { spelling } else { incoming }]
+            );
+            assert_eq!(
+                vm.struct_get(scope, incoming).as_number(),
+                if write { 42.0 } else { 7.0 }
+            );
+        }
+    }
+}
+
+#[test]
 fn identifier_bytecode_reads_do_not_allocate_per_instruction() {
     let mut allocations = Vec::new();
     for repeats in [1, 100] {

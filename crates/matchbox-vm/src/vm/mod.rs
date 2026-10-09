@@ -404,7 +404,8 @@ pub struct CallFrame {
     pub promoted_constants: Vec<Option<BxValue>>,
     local_scope: Option<BxValue>,
     context: Option<BxValue>,
-    local_names: HashMap<usize, String>,
+    // Invocation-local numeric scope bindings; no GC values or shared-program IDs.
+    local_names: HashMap<usize, scopes::ScopeBinding>,
     #[cfg(feature = "jit")]
     jit_loop_attempted: bool,
 }

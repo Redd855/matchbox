@@ -334,7 +334,9 @@ impl super::VM {
         frame.jit_loop_attempted = true;
         let frame = self.fibers[fiber].frames.last().unwrap();
         let base = frame.stack_base;
-        let slots = frame.local_names.keys().max().map(|slot| slot + 1)?;
+        let slots = frame.local_names.iter()
+            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
+            .max().map(|slot| slot + 1)?;
         // ponytail: fixed 32-slot rollback checkpoint; add dynamically rooted
         // spills only if a measured workload needs larger nonallocating kernels.
         if slots > 32 || self.fibers[fiber].stack.len() != base + slots {
@@ -342,7 +344,8 @@ impl super::VM {
         }
         let writable = frame
             .local_names
-            .keys()
+            .iter()
+            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
             .fold(0u32, |mask, slot| mask | (1 << slot));
         let program = Arc::clone(&frame.chunk.borrow().program);
         let key = (
@@ -366,7 +369,7 @@ impl super::VM {
                 .unwrap()
                 .local_names
                 .values()
-                .any(|name| name.eq_ignore_ascii_case("int"))
+                .any(|binding| binding.local && self.interner.resolve(binding.key).eq_ignore_ascii_case("int"))
             {
                 return None; // A staged local write could change the callee binding.
             }

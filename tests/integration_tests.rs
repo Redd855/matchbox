@@ -102,6 +102,7 @@ script_test!(
 );
 script_test!(vm_functions, "vm_functions.bxs");
 script_test!(vm_function_execution, "vm_function_execution.bxs");
+script_test!(vm_scope_bindings, "vm_scope_bindings.bxs");
 script_test!(jit_function_contract, "jit_function_contract.bxs");
 script_test!(jit_loop_contract, "jit_loop_contract.bxs");
 script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");

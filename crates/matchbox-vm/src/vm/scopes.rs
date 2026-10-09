@@ -2,6 +2,27 @@
 use super::{VM, gc::GcObject};
 use crate::types::{BxVM, BxValue};
 
+#[derive(Clone, Copy)]
+pub(super) struct ScopeBinding {
+    pub(super) key: u32,
+    pub(super) local: bool,
+    shape: Option<u32>,
+    index: Option<u32>,
+    write_ready: bool,
+}
+
+impl ScopeBinding {
+    fn new(key: u32, local: bool) -> Self {
+        Self {
+            key,
+            local,
+            shape: None,
+            index: None,
+            write_ready: local,
+        }
+    }
+}
+
 impl VM {
     pub(super) fn arguments_scope(&self, fiber: usize) -> Option<BxValue> {
         let frame = self.fibers[fiber].frames.last()?;
@@ -30,24 +51,67 @@ impl VM {
         let value = self.fibers[fiber].stack[frame.stack_base + slot];
         let scope = self.local_scope(fiber).as_gc_id().unwrap();
         self.struct_set(scope, &name, value);
+        let key = self.struct_key_lookup_id(scope, &name).unwrap();
         self.fibers[fiber]
             .frames
             .last_mut()
             .unwrap()
             .local_names
-            .insert(slot, name);
+            .insert(slot, ScopeBinding::new(key, true));
     }
 
-    fn slot_scope(&self, fiber: usize, slot: usize) -> Option<(usize, &str)> {
+    fn slot_binding(&mut self, fiber: usize, slot: usize) -> Option<(usize, ScopeBinding)> {
         let frame = self.fibers[fiber].frames.last().unwrap();
-        if let Some(name) = frame.local_names.get(&slot) {
-            return Some((frame.local_scope?.as_gc_id()?, name));
+        if let Some(binding) = frame.local_names.get(&slot).copied() {
+            let scope = if binding.local {
+                frame.local_scope?
+            } else {
+                self.arguments_scope(fiber)?
+            };
+            return Some((scope.as_gc_id()?, binding));
         }
         let name = frame.function.params.get(slot)?;
-        Some((self.arguments_scope(fiber)?.as_gc_id()?, name))
+        let scope = self.arguments_scope(fiber)?.as_gc_id()?;
+        // Read misses must not intern a name or upgrade its visible spelling.
+        let key = self.struct_key_lookup_id(scope, name)?;
+        let binding = ScopeBinding::new(key, false);
+        self.fibers[fiber]
+            .frames
+            .last_mut()
+            .unwrap()
+            .local_names
+            .insert(slot, binding);
+        Some((scope, binding))
     }
 
-    pub(super) fn local_value(&self, fiber: usize, slot: usize) -> BxValue {
+    fn binding_index(
+        &mut self,
+        fiber: usize,
+        slot: usize,
+        scope: usize,
+        binding: ScopeBinding,
+    ) -> Option<u32> {
+        let GcObject::Struct(record) = self.heap.get(scope) else {
+            return None;
+        };
+        if binding.shape == Some(record.shape_id) {
+            return binding.index;
+        }
+        let shape = record.shape_id;
+        let index = self.shapes.get_index(shape, binding.key);
+        let cached = self.fibers[fiber]
+            .frames
+            .last_mut()
+            .unwrap()
+            .local_names
+            .get_mut(&slot)
+            .unwrap();
+        cached.shape = Some(shape);
+        cached.index = index;
+        index
+    }
+
+    pub(super) fn local_value(&mut self, fiber: usize, slot: usize) -> BxValue {
         let frame = self.fibers[fiber].frames.last().unwrap();
         if frame.function.kind == crate::types::FunctionKind::ComponentBody
             && slot == frame.function.params.len()
@@ -55,9 +119,13 @@ impl VM {
         {
             return arguments;
         }
-        let value = self
-            .slot_scope(fiber, slot)
-            .and_then(|(scope, name)| self.scope_value(BxValue::new_ptr(scope), name));
+        let value = self.slot_binding(fiber, slot).and_then(|(scope, binding)| {
+            let index = self.binding_index(fiber, slot, scope, binding)?;
+            let GcObject::Struct(record) = self.heap.get(scope) else {
+                return None;
+            };
+            record.properties.get(index as usize).copied()
+        });
         if let Some(value) = value {
             return value;
         }
@@ -66,9 +134,55 @@ impl VM {
     }
 
     pub(super) fn set_local_value(&mut self, fiber: usize, slot: usize, value: BxValue) {
-        if let Some((scope, name)) = self.slot_scope(fiber, slot) {
-            let name = name.to_owned();
-            self.struct_set(scope, &name, value);
+        let binding = self.slot_binding(fiber, slot).or_else(|| {
+            let name = self.fibers[fiber]
+                .frames
+                .last()?
+                .function
+                .params
+                .get(slot)?
+                .clone();
+            let scope = self.arguments_scope(fiber)?.as_gc_id()?;
+            let key = self.struct_key_id(scope, &name);
+            let mut binding = ScopeBinding::new(key, false);
+            binding.write_ready = true;
+            self.fibers[fiber]
+                .frames
+                .last_mut()?
+                .local_names
+                .insert(slot, binding);
+            Some((scope, binding))
+        });
+        if let Some((scope, mut binding)) = binding {
+            if !binding.write_ready {
+                let name = self.fibers[fiber].frames.last().unwrap().function.params[slot].clone();
+                binding.key = self.struct_key_id(scope, &name);
+                binding.write_ready = true;
+                *self.fibers[fiber]
+                    .frames
+                    .last_mut()
+                    .unwrap()
+                    .local_names
+                    .get_mut(&slot)
+                    .unwrap() = binding;
+            }
+            if let Some(index) = self.binding_index(fiber, slot, scope, binding) {
+                // get_mut retains the ordinary GC write barrier; never cache values.
+                if let GcObject::Struct(record) = self.heap.get_mut(scope) {
+                    record.properties[index as usize] = value;
+                }
+            } else {
+                let name = self.interner.resolve(binding.key).to_owned();
+                self.struct_set(scope, &name, value);
+                self.fibers[fiber]
+                    .frames
+                    .last_mut()
+                    .unwrap()
+                    .local_names
+                    .get_mut(&slot)
+                    .unwrap()
+                    .shape = None;
+            }
         }
         let base = self.fibers[fiber].frames.last().unwrap().stack_base;
         self.fibers[fiber].stack[base + slot] = value;
@@ -80,8 +194,8 @@ impl VM {
         let base = frame.stack_base;
         let mut slots: Vec<_> = frame
             .local_names
-            .keys()
-            .copied()
+            .iter()
+            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
             .chain(0..frame.function.params.len())
             .filter(|slot| base + slot < self.fibers[fiber].stack.len())
             .collect();
@@ -123,7 +237,8 @@ impl VM {
         if name == "arguments" {
             return self.arguments_scope(fiber);
         }
-        self.function_scope_entry(fiber, name).map(|(_, value)| value)
+        self.function_scope_entry(fiber, name)
+            .map(|(_, value)| value)
     }
 
     fn function_scope_entry(&self, fiber: usize, name: &str) -> Option<(BxValue, BxValue)> {

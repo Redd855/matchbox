@@ -5571,6 +5571,12 @@ impl VM {
                 }
                 op::MEMBER => {
                     let idx = op0;
+                    let base = *self.fibers[fiber_idx].stack.last().unwrap();
+                    if let Some(value) = self.cached_member_value(fiber_idx, ip_at_start, base) {
+                        *self.fibers[fiber_idx].stack.last_mut().unwrap() = value;
+                        flush_ip!();
+                        continue 'quantum;
+                    }
                     let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
                     let base_val = self.fibers[fiber_idx].stack.pop().unwrap();
                     if self.class_reference_target(base_val).is_some() {
@@ -5650,38 +5656,6 @@ impl VM {
                                 let shape_id = s.shape_id;
                                 let properties_ptr = &s.properties as *const Vec<BxValue>;
 
-                                let ic = {
-                                    let fiber = &self.fibers[fiber_idx];
-                                    let frame = fiber.frames.last().unwrap();
-                                    let chunk = frame.chunk.borrow();
-                                    chunk.cache_get(ip_at_start)
-                                };
-
-                                match ic {
-                                    Some(IcEntry::Monomorphic {
-                                        shape_id: cached_shape,
-                                        index,
-                                    }) => {
-                                        if cached_shape == shape_id as usize {
-                                            let val = unsafe { &*properties_ptr }[index as usize];
-                                            self.fibers[fiber_idx].stack.push(val);
-                                            flush_ip!();
-                                            continue 'quantum;
-                                        }
-                                    }
-                                    Some(IcEntry::Polymorphic { entries, count }) => {
-                                        for i in 0..count {
-                                            if entries[i].0 == shape_id as usize {
-                                                let val = unsafe { &*properties_ptr }[entries[i].1];
-                                                self.fibers[fiber_idx].stack.push(val);
-                                                flush_ip!();
-                                                continue 'quantum;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-
                                 let key_id = if s.case_sensitive {
                                     let name = self.read_string_constant(fiber_idx, idx as usize)?;
                                     self.interner.get_exact_id(&name)
@@ -5709,38 +5683,6 @@ impl VM {
                             GcObject::Instance(inst) => {
                                 let shape_id = inst.shape_id;
                                 let properties_ptr = &inst.properties as *const Vec<BxValue>;
-
-                                let ic = {
-                                    let fiber = &self.fibers[fiber_idx];
-                                    let frame = fiber.frames.last().unwrap();
-                                    let chunk = frame.chunk.borrow();
-                                    chunk.cache_get(ip_at_start)
-                                };
-
-                                match ic {
-                                    Some(IcEntry::Monomorphic {
-                                        shape_id: cached_shape,
-                                        index,
-                                    }) => {
-                                        if cached_shape == shape_id as usize {
-                                            let val = unsafe { &*properties_ptr }[index as usize];
-                                            self.fibers[fiber_idx].stack.push(val);
-                                            flush_ip!();
-                                            continue 'quantum;
-                                        }
-                                    }
-                                    Some(IcEntry::Polymorphic { entries, count }) => {
-                                        for i in 0..count {
-                                            if entries[i].0 == shape_id as usize {
-                                                let val = unsafe { &*properties_ptr }[entries[i].1];
-                                                self.fibers[fiber_idx].stack.push(val);
-                                                flush_ip!();
-                                                continue 'quantum;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
 
                                 if let Some(idx) = self.shapes.get_index(shape_id, name_id) {
                                     {
@@ -8780,6 +8722,24 @@ impl VM {
             }
         }
         bail!("Constant at index {} is not a string: {:?}", idx, val)
+    }
+
+    /// Only ordinary field storage can use the existing shape/index cache.
+    fn cached_member_value(&self, fiber: usize, ip: usize, base: BxValue) -> Option<BxValue> {
+        let (shape, properties) = match self.heap.get_opt(base.as_gc_id()?)? {
+            GcObject::Struct(record) => (record.shape_id, &record.properties),
+            GcObject::Instance(instance) => (instance.shape_id, &instance.properties),
+            _ => return None,
+        };
+        let frame = self.fibers[fiber].frames.last()?;
+        let entry = frame.chunk.borrow().cache_get(ip)?;
+        let index = match entry {
+            IcEntry::Monomorphic { shape_id, index } if shape_id == shape as usize => index,
+            IcEntry::Polymorphic { entries, count } => entries[..count].iter()
+                .find_map(|&(shape_id, index)| (shape_id == shape as usize).then_some(index))?,
+            _ => return None,
+        };
+        properties.get(index).copied()
     }
 
     /// Identifier operands are immutable metadata, not per-frame GC values.

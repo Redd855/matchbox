@@ -245,6 +245,60 @@ fn cold_ordinary_members_do_not_allocate_name_roundtrips() {
 }
 
 #[test]
+fn warmed_members_do_not_renormalize_operand_names() {
+    let mut allocations = Vec::new();
+    for repeats in [1, 100] {
+        let mut vm = VM::new();
+        let record = vm.struct_new();
+        vm.struct_set(record, "value", BxValue::new_int(42));
+        let _root = vm.retain_value(BxValue::new_ptr(record)).unwrap();
+        let mut body = Chunk::new("warm-members.bxs");
+        let field = body.add_constant(Constant::String(BoxString::new("VaLuE")));
+        for repeat in 0..repeats {
+            body.emit1(op::GET_LOCAL, 0, 1);
+            body.emit1(op::MEMBER, field, 1);
+            if repeat + 1 < repeats {
+                body.emit0(op::POP, 1);
+            }
+        }
+        body.emit0(op::RETURN, 1);
+        let function = BxCompiledFunction {
+            name: "readMembers".into(),
+            kind: FunctionKind::Udf,
+            arity: 1,
+            min_arity: 1,
+            params: vec!["record".into()],
+            bif: None,
+            modifiers: Default::default(),
+            captured_receiver: None,
+            captured_scopes: Vec::new(),
+            chunk: body,
+        };
+        let mut script = Chunk::new("warm-members-owner.bxs");
+        let slot = script.add_constant(Constant::CompiledFunction(function));
+        script.emit1(op::CONSTANT, slot, 1);
+        script.emit0(op::RETURN, 1);
+        let function = vm.interpret(script).unwrap();
+        let args = vec![BxValue::new_ptr(record)];
+        assert_eq!(
+            vm.call_function_value(function, args.clone(), None)
+                .unwrap(),
+            BxValue::new_int(42)
+        );
+        assert_eq!(vm.struct_key_array(record), ["VaLuE"]);
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        let result = vm.call_function_value(function, args, None).unwrap();
+        allocations.push(ALLOCATIONS.with(|count| count.replace(None).unwrap()));
+        assert_eq!(result, BxValue::new_int(42));
+    }
+    eprintln!("Warm member allocations, 1/100 sites: {allocations:?}");
+    assert!(
+        allocations[1] <= allocations[0] + 8,
+        "Cached members renormalize names: {allocations:?}"
+    );
+}
+
+#[test]
 fn identifier_bytecode_reads_do_not_allocate_per_instruction() {
     let mut allocations = Vec::new();
     for repeats in [1, 100] {

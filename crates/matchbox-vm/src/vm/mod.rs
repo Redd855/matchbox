@@ -408,6 +408,8 @@ pub struct CallFrame {
     local_names: HashMap<usize, scopes::ScopeBinding>,
     #[cfg(feature = "jit")]
     jit_loop_attempted: bool,
+    #[cfg(feature = "jit")]
+    jit_construct_unsupported: Option<usize>,
 }
 
 pub struct BxFiber {
@@ -2073,6 +2075,8 @@ impl VM {
             frames: vec![CallFrame {
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
+                #[cfg(feature = "jit")]
+                jit_construct_unsupported: None,
                 function,
                 chunk,
                 context: None,
@@ -3170,6 +3174,8 @@ impl VM {
                 context: None,
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
+                #[cfg(feature = "jit")]
+                jit_construct_unsupported: None,
             }],
 
             variables: Self::new_variables_scope(),
@@ -3227,6 +3233,8 @@ impl VM {
                 context: None,
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
+                #[cfg(feature = "jit")]
+                jit_construct_unsupported: None,
             }],
 
             variables: Self::new_variables_scope(),
@@ -3383,6 +3391,8 @@ impl VM {
                 context: None,
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
+                #[cfg(feature = "jit")]
+                jit_construct_unsupported: None,
             }],
             variables: Self::new_variables_scope(),
             future_id,
@@ -3610,6 +3620,8 @@ impl VM {
             frames: vec![CallFrame {
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
+                #[cfg(feature = "jit")]
+                jit_construct_unsupported: None,
                 function: func,
                 chunk,
                 context: None,
@@ -5001,7 +5013,7 @@ impl VM {
                     #[cfg(feature = "jit")]
                     {
                         flush_ip!();
-                        match self.run_jit_fn_loop(fiber_idx, ip) {
+                        match self.run_jit_construct_loop(fiber_idx, ip).or_else(||self.run_jit_fn_loop(fiber_idx, ip)) {
                             Some(jit::FnJitOutcome::Return(result)) => {
                                 if let Some(result) = self.handle_return(fiber_idx, result)? {
                                     return Ok(Some(result));
@@ -5010,6 +5022,7 @@ impl VM {
                                 continue 'quantum;
                             }
                             Some(jit::FnJitOutcome::Yield) => break 'quantum,
+                            Some(jit::FnJitOutcome::Resume(resume)) => { ip=resume; }
                             None => {}
                         }
                     }
@@ -6435,6 +6448,8 @@ impl VM {
                             let frame = CallFrame {
                                 #[cfg(feature = "jit")]
                                 jit_loop_attempted: false,
+                                #[cfg(feature = "jit")]
+                                jit_construct_unsupported: None,
                                 context: None,
                                 function: Rc::new(constructor),
                                 chunk: sub_chunk,
@@ -7439,6 +7454,8 @@ impl VM {
                         frames: vec![CallFrame {
                             #[cfg(feature = "jit")]
                             jit_loop_attempted: false,
+                            #[cfg(feature = "jit")]
+                            jit_construct_unsupported: None,
                             context: None,
                             function: func.clone(),
                             chunk: sub_chunk,
@@ -7565,6 +7582,8 @@ impl VM {
             frames: vec![CallFrame {
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
+                #[cfg(feature = "jit")]
+                jit_construct_unsupported: None,
                 context: None,
                 function: Rc::new(constructor),
                 chunk: sub_chunk,
@@ -7977,6 +7996,8 @@ impl VM {
                     let mut frame = CallFrame {
                         #[cfg(feature = "jit")]
                         jit_loop_attempted: false,
+                        #[cfg(feature = "jit")]
+                        jit_construct_unsupported: None,
                         context: None,
                         function: Rc::clone(&func),
                         chunk: sub_chunk,
@@ -8249,6 +8270,8 @@ impl VM {
                             self.fibers[fiber_idx].frames.push(CallFrame {
                                 #[cfg(feature = "jit")]
                                 jit_loop_attempted: false,
+                                #[cfg(feature = "jit")]
+                                jit_construct_unsupported: None,
                                 context: None,
                                 function,
                                 chunk: sub_chunk,
@@ -8433,6 +8456,8 @@ impl VM {
                         let frame = CallFrame {
                             #[cfg(feature = "jit")]
                             jit_loop_attempted: false,
+                            #[cfg(feature = "jit")]
+                            jit_construct_unsupported: None,
                             context: None,
                             function: func.clone(),
                             chunk: sub_chunk,
@@ -8468,6 +8493,8 @@ impl VM {
                         let mut frame = CallFrame {
                             #[cfg(feature = "jit")]
                             jit_loop_attempted: false,
+                            #[cfg(feature = "jit")]
+                            jit_construct_unsupported: None,
                             context: None,
                             local_scope: None,
                             local_names: HashMap::new(),

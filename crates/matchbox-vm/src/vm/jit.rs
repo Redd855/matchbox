@@ -55,6 +55,7 @@ pub type ArrayIterJitFn = unsafe extern "C" fn(*mut u64, *const u64, u64) -> u64
 pub type HotFnFn = unsafe extern "C" fn(*mut u64, *const std::ffi::c_void, *mut u64) -> u64;
 
 const JIT_FN_THRESHOLD: u64 = 100;
+mod construct;
 
 #[derive(Clone)]
 pub struct CompiledFn {
@@ -67,8 +68,10 @@ pub struct CompiledFn {
 pub(super) enum FnJitOutcome {
     Return(crate::types::BxValue),
     Yield,
+    Resume(usize),
 }
 
+#[repr(C)]
 struct FnReadEnv {
     vm: *const super::VM,
     local_scope: Option<usize>,
@@ -521,6 +524,7 @@ pub struct JitState {
     // Tier-4: hot function compilation
     fn_counts: HashMap<(usize, usize, u32, u32), (Weak<ChunkProgram>, u64)>,
     compiled_fns: HashMap<(usize, usize, u32, u32), (Arc<ChunkProgram>, CompiledFn)>,
+    construct_regions: HashMap<(usize, usize, u32, u32), (Weak<ChunkProgram>, Option<construct::Region>)>,
 
     // OSR: persistent per-site iteration counters keyed on (fn_id, ip_at_start).
     // Survive across run_fiber quanta so fiber-scheduled loops can cross time-slice
@@ -552,6 +556,7 @@ impl JitState {
         builder.symbol("jit_read_index", jit_read_index as *const u8);
         builder.symbol("jit_core_read", jit_core_read as *const u8);
         builder.symbol("jit_parameter_kind", jit_parameter_kind as *const u8);
+        builder.symbol("jit_construct_call", construct::call as *const u8);
         builder.symbol("jit_read_member", jit_read_member as *const u8);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
@@ -574,6 +579,7 @@ impl JitState {
             compiled_iters: HashMap::new(),
             fn_counts: HashMap::new(),
             compiled_fns: HashMap::new(),
+            construct_regions: HashMap::new(),
             loop_profiles: HashMap::new(),
             iter_profiles: HashMap::new(),
         })
@@ -1737,7 +1743,7 @@ impl JitState {
             }
             let hints = Self::parameter_hints(&program);
             if hints.len() > arity as usize { return None; }
-            match self.compile_hot_fn(fn_id, code, &program.constants, writable, &members, hints) {
+            match self.compile_hot_fn(fn_id, code, &program.constants, writable, &members, hints, None) {
                 Ok(compiled) => {
                     eprintln!(
                         "[JIT] compiled hot {}fn name={} fn_id=0x{:x} entry={} type_hints={}",
@@ -1836,11 +1842,18 @@ impl JitState {
         arity: u32,
         writable: u32,
     ) -> bool {
+        Self::fn_is_translatable_with_calls(code,consts,arity,writable,None)
+    }
+
+    fn fn_is_translatable_with_calls(code:&[u32],consts:&[crate::types::Constant],arity:u32,writable:u32,calls:Option<&HashMap<usize,(u64,u32)>>)->bool {
         // Every intrinsic reference must be consumed by a proven call within
         // one expression block; references cannot escape through branch spills.
         let callees: BTreeSet<usize> = code.iter().enumerate()
             .filter(|(_, word)| (**word & 0xff) as u8 == op::CALL)
-            .filter_map(|(ip, _)| Self::intrinsic_call(code, consts, ip)).collect();
+            .filter_map(|(ip, _)| if let Some(calls)=calls {
+                let origin=Self::call_origin(code,ip)?;
+                calls.get(&((code[origin]>>8) as usize)).filter(|(_,arity)|*arity==code[ip]>>8).map(|_|origin)
+            } else {Self::intrinsic_call(code,consts,ip)}).collect();
         // Loops stage numeric named-local writes, rollback on guards, and yield
         // every 1024 backedges. No heap writes/general calls/allocations.
         code.iter().enumerate().all(|(ip, &word)| {
@@ -1849,12 +1862,13 @@ impl JitState {
             match opcode {
                 op::GET_LOCAL => arg < arity,
                 op::SET_LOCAL | op::SET_LOCAL_POP => arg < 32 && writable & (1 << arg) != 0,
+                op::INC_LOCAL => calls.is_some() && arg < 32 && writable & (1 << arg) != 0,
                 op::LOOP => writable != 0 && (arg as usize) == ip + 1,
                 op::INDEX => true,
                 // Compiling an untaken read must not upgrade key presentation.
                 op::MEMBER => matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if { let mut name=name.clone(); let text=name.as_flat_str(); text==text.to_lowercase() }),
                 op::GET_PRIVATE => callees.contains(&ip),
-                op::CALL => Self::intrinsic_call(code, consts, ip).is_some(),
+                op::CALL => Self::call_origin(code,ip).is_some_and(|origin|callees.contains(&origin)),
                 op::CONSTANT => matches!(
                     consts.get(arg as usize),
                     Some(
@@ -1889,13 +1903,16 @@ impl JitState {
 
     /// Prove the callee within one expression block before touching Cranelift.
     fn intrinsic_call(code: &[u32], consts: &[crate::types::Constant], ip: usize) -> Option<usize> {
-        let arity = code[ip] >> 8;
-        let mut needed = arity as i32;
+        let origin=Self::call_origin(code,ip)?;
+        matches!(consts.get((code[origin]>>8) as usize),Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some_and(|(_,count,_)|count==code[ip]>>8)).then_some(origin)
+    }
+
+    fn call_origin(code:&[u32],ip:usize)->Option<usize> {
+        let mut needed = (code[ip]>>8) as i32;
         for (distance, &word) in code[..ip].iter().rev().enumerate() {
             let opcode = (word & 0xFF) as u8;
             if needed == 0 {
-                return (opcode == op::GET_PRIVATE && matches!(consts.get((word >> 8) as usize),
-                    Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some_and(|(_, count, _)| count == arity))).then_some(ip - distance - 1);
+                return (opcode==op::GET_PRIVATE).then_some(ip-distance-1);
             }
             needed += match opcode {
                 op::GET_LOCAL | op::GET_PRIVATE | op::CONSTANT => -1,
@@ -1930,6 +1947,7 @@ impl JitState {
         writable: u32,
         members: &HashMap<usize, (u32, u32)>,
         hints: &[String],
+        calls: Option<&HashMap<usize,(u64,u32)>>,
     ) -> anyhow::Result<HotFnFn> {
         use cranelift_codegen::ir::{Block, StackSlot, StackSlotData, StackSlotKind};
 
@@ -2103,6 +2121,8 @@ impl JitState {
         read_sig.returns.push(AbiParam::new(I64));
         let core_read = self.module.declare_function("jit_core_read", Linkage::Import, &read_sig)?;
         let core_read = self.module.declare_func_in_func(core_read, &mut self.ctx.func);
+        let construct_call=self.module.declare_function("jit_construct_call",Linkage::Import,&read_sig)?;
+        let construct_call=self.module.declare_func_in_func(construct_call,&mut self.ctx.func);
         let mut kind_sig = self.module.make_signature();
         kind_sig.params.extend([AbiParam::new(ptr_type), AbiParam::new(I64), AbiParam::new(I64)]);
         kind_sig.returns.push(AbiParam::new(I64));
@@ -2269,12 +2289,21 @@ impl JitState {
                             vstack.pop();
                         }
                     }
+                    op::INC_LOCAL => {
+                        let value=builder.ins().load(I64,MemFlags::new(),locals_ptr,(op0*8) as i32);
+                        let float=require_float!(value);
+                        let one=builder.ins().f64const(1.0);
+                        let next=builder.ins().fadd(float,one);
+                        let raw=builder.ins().bitcast(I64,MemFlags::new(),next);
+                        builder.ins().store(MemFlags::new(),raw,locals_ptr,(op0*8) as i32);
+                    }
                     op::GET_PRIVATE => {
                         let value = builder
                             .ins()
                             .iconst(I64, crate::types::BxValue::new_null().to_bits() as i64);
                         let crate::types::Constant::String(mut name) = consts[op0].clone() else { unreachable!() };
-                        functions.insert(value, intrinsic(name.as_flat_str()).unwrap().0);
+                        let kind=if let Some(calls)=calls {calls[&op0].0} else {intrinsic(name.as_flat_str()).unwrap().0 as u64};
+                        functions.insert(value,kind);
                         vstack.push(value);
                     }
                     op::CALL => {
@@ -2291,7 +2320,8 @@ impl JitState {
                         } else {
                             let out = builder.ins().stack_addr(ptr_type, spill_slots[0], 0);
                             let kind = builder.ins().iconst(I64, kind as i64);
-                            let call = builder.ins().call(core_read, &[vm_ptr, kind, first, second, out]);
+                            let helper=if calls.is_some() && functions[&function]>=8 {construct_call} else {core_read};
+                            let call = builder.ins().call(helper, &[vm_ptr, kind, first, second, out]);
                             let status = builder.inst_results(call)[0];
                             let success = builder.ins().icmp_imm(IntCC::Equal, status, 0);
                             emit_deopt_brif!(success);

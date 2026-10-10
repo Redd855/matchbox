@@ -1459,7 +1459,7 @@ fn string_starts_with_no_case_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result
     Ok(BxValue::new_bool(input.starts_with(&prefix)))
 }
 
-fn ascii_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn ascii_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() != 1 {
         return Err("ascii() expects exactly 1 argument".to_string());
     }
@@ -3085,7 +3085,7 @@ fn get_system_setting(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, St
 
 // --- Array BIFs ---
 
-fn array_append(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn array_append(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() != 2 {
         return Err("arrayAppend() expects exactly 2 arguments".to_string());
     }

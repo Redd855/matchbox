@@ -115,6 +115,46 @@ the no-loop control stayed **50ms**. Whole-LSP open/edit medians moved only
 **768→750ms / 759→748ms**, with overlapping ranges and slower completion; this is
 not a general analyzer speed guarantee or justification for arbitrary expansion.
 
+### Append-only construction loops
+
+A separate bounded loop entry compiles **the actual compiler-generated loop**,
+including its branches, indexed reads, `ascii` calls, `arrayAppend` operations and
+calls to proven parameter-only record constructors. There is no native analyzer
+or text-mapping BIF. It shares the Tier-4 SSA compiler and activates after 10,000
+cumulative backedges. Fused `LOCAL_JUMP_IF_NE_CONST` branches are lowered with
+rebased targets; named numeric `INC_LOCAL` is supported. An invocation-owned
+negative feasibility latch skips repeated scans of the last unsupported loop;
+it stores only an instruction offset, never GC values or shared-program IDs.
+
+Construction calls require fresh ordinary callee resolution on every native
+entry. Core BIF identity and immutable record-body ownership are guarded. Record
+constructors have at most two parameters/fields, lowercase literal keys and
+non-NaN float arguments; null/defaults, custom callees and unsupported values
+remain interpreted. Function interception and debugger stepping disable this
+entry. Early returns, nonlocal exits, nested loops, general calls, arbitrary heap
+writes and collection constructors remain unsupported.
+
+Array appends use the normal VM write barrier. Each transaction checkpoints at
+most 32 append targets and 32 named slots. A late guard failure truncates the
+appended tails and restores staged locals before interpreter replay; it never
+repeats previously committed chunks. Record allocation uses `literal_struct`;
+allocation does not collect or invoke callbacks, and output arrays/frame values
+root results before the next VM safepoint. No borrowed object/array pointer is
+retained across allocation. After 1024 backedges, progress is committed and the
+ordinary scheduler/GC runs before re-entry. No GC IDs enter shared program or
+compiled call metadata.
+
+```bash
+python3 tests/jit_construct.py target/lint-jit/debug/matchbox ../bx-lint
+```
+
+This actual-process check extracts the real BoxLang `bxTextMap` loop and requires
+native execution in source, source-free bytecode and standalone paths. It checks
+supplementary Unicode, UTF-8 continuation slots, UTF-16 positions, CRLF, EOF,
+independent output, late append rollback/errors, null/default replay, early
+returns, dynamic intrinsic/helper rebinding and named arguments. It is a bounded
+construction subset, not whole-program compilation.
+
 ---
 
 ## Optional Parameter Type Hints
@@ -156,7 +196,7 @@ The following categories cause a function to remain interpreted:
 - **Multi-word compare-jumps** — `LOCAL_COMPARE_JUMP`, `GLOBAL_COMPARE_JUMP`, `COMPARE_JUMP`, `LOCAL_JUMP_IF_NE_CONST`
 - **Miscellaneous** — `INC`, `DEC`, `INC_LOCAL`, `INC_GLOBAL`, `SWAP`, `OVER`, `JUMP_IF_NULL`
 
-This bounded subset enables numeric parameter-only helpers, bx-lint's `bxPosition`/`bxRange` and its nonallocating binary-search loop and readonly `bxGet`, not general functions or recursion. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
+This bounded subset enables numeric parameter-only helpers, bx-lint's `bxPosition`/`bxRange` and its nonallocating binary-search loop and readonly `bxGet`, not general functions or recursion. The append-only entry additionally enables bx-lint's `bxTextMap` construction loop. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
 
 ---
 

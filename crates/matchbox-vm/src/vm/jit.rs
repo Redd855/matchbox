@@ -158,6 +158,19 @@ fn intrinsic(name: &str) -> Option<(u8, u32, crate::types::BxNativeFunction)> {
     else { None }
 }
 
+unsafe extern "C" fn jit_parameter_kind(env: *const FnReadEnv, value: u64, kind: u64) -> u64 {
+    let env = unsafe { &*env };
+    let vm = unsafe { &*env.vm };
+    let value: crate::types::BxValue = unsafe { std::mem::transmute(value) };
+    let object = value.as_gc_id().and_then(|id| vm.heap.get_opt(id));
+    match (kind, object) {
+        (3, Some(super::gc::GcObject::Array(_)))
+        | (4, Some(super::gc::GcObject::Struct(_)))
+        | (5, Some(super::gc::GcObject::String(_))) => 1,
+        _ => 0,
+    }
+}
+
 unsafe extern "C" fn jit_core_read(env: *const FnReadEnv, kind: u64, first: u64, second: u64, out: *mut u64) -> u64 {
     use crate::types::BxValue;
     let env = unsafe { &*env };
@@ -538,6 +551,7 @@ impl JitState {
         builder.symbol("jit_load_prop_at", jit_load_prop_at as *const u8);
         builder.symbol("jit_read_index", jit_read_index as *const u8);
         builder.symbol("jit_core_read", jit_core_read as *const u8);
+        builder.symbol("jit_parameter_kind", jit_parameter_kind as *const u8);
         builder.symbol("jit_read_member", jit_read_member as *const u8);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
@@ -1721,14 +1735,17 @@ impl JitState {
                     );
                 }
             }
-            match self.compile_hot_fn(fn_id, code, &program.constants, writable, &members) {
+            let hints = Self::parameter_hints(&program);
+            if hints.len() > arity as usize { return None; }
+            match self.compile_hot_fn(fn_id, code, &program.constants, writable, &members, hints) {
                 Ok(compiled) => {
                     eprintln!(
-                        "[JIT] compiled hot {}fn name={} fn_id=0x{:x} entry={}",
+                        "[JIT] compiled hot {}fn name={} fn_id=0x{:x} entry={} type_hints={}",
                         if writable != 0 { "loop " } else { "" },
                         name,
                         fn_id,
-                        entry
+                        entry,
+                        hints.iter().filter(|hint| Self::hint_kind(hint).is_some()).count()
                     );
                     let compiled = CompiledFn {
                         call: compiled,
@@ -1747,6 +1764,30 @@ impl JitState {
             }
         }
         None
+    }
+
+    fn hint_kind(name: &str) -> Option<u64> {
+        match name { "numeric" | "number" => Some(1), "boolean" | "bool" => Some(2), "array" => Some(3), "struct" => Some(4), "string" => Some(5), _ => None }
+    }
+
+    fn parameter_hints(program: &ChunkProgram) -> &[String] {
+        let mut ip = 0;
+        while let Some(&word) = program.code.get(ip) {
+            let opcode = (word & 0xff) as u8;
+            if opcode == op::FUNCTION_ENTER {
+                return match (word >> 8).checked_sub(1).and_then(|index| program.constants.get(index as usize)) {
+                    Some(crate::types::Constant::StringArray(hints)) => hints,
+                    _ => &[],
+                };
+            }
+            // Skip operand words; a named-default argument count can resemble an opcode.
+            ip += match opcode {
+                op::COMPARE_JUMP | op::CALL_NAMED | op::INVOKE | op::PUSH_HANDLER | op::BIND_LOCAL => 2,
+                op::LOCAL_COMPARE_JUMP | op::GLOBAL_COMPARE_JUMP | op::INVOKE_NAMED | op::INVOKE_NAMED_SPREAD | op::ITER_NEXT | op::LOCAL_JUMP_IF_NE_CONST | op::FOR_LOOP_STEP => 3,
+                _ => 1,
+            };
+        }
+        &[]
     }
 
     /// Terminal small STRUCT literals whose values are parameters, not allocations.
@@ -1795,6 +1836,11 @@ impl JitState {
         arity: u32,
         writable: u32,
     ) -> bool {
+        // Every intrinsic reference must be consumed by a proven call within
+        // one expression block; references cannot escape through branch spills.
+        let callees: BTreeSet<usize> = code.iter().enumerate()
+            .filter(|(_, word)| (**word & 0xff) as u8 == op::CALL)
+            .filter_map(|(ip, _)| Self::intrinsic_call(code, consts, ip)).collect();
         // Loops stage numeric named-local writes, rollback on guards, and yield
         // every 1024 backedges. No heap writes/general calls/allocations.
         code.iter().enumerate().all(|(ip, &word)| {
@@ -1807,8 +1853,8 @@ impl JitState {
                 op::INDEX => true,
                 // Compiling an untaken read must not upgrade key presentation.
                 op::MEMBER => matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if { let mut name=name.clone(); let text=name.as_flat_str(); text==text.to_lowercase() }),
-                op::GET_PRIVATE => matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some()),
-                op::CALL => Self::intrinsic_call(code, consts, ip),
+                op::GET_PRIVATE => callees.contains(&ip),
+                op::CALL => Self::intrinsic_call(code, consts, ip).is_some(),
                 op::CONSTANT => matches!(
                     consts.get(arg as usize),
                     Some(
@@ -1842,14 +1888,14 @@ impl JitState {
     }
 
     /// Prove the callee within one expression block before touching Cranelift.
-    fn intrinsic_call(code: &[u32], consts: &[crate::types::Constant], ip: usize) -> bool {
+    fn intrinsic_call(code: &[u32], consts: &[crate::types::Constant], ip: usize) -> Option<usize> {
         let arity = code[ip] >> 8;
         let mut needed = arity as i32;
-        for &word in code[..ip].iter().rev() {
+        for (distance, &word) in code[..ip].iter().rev().enumerate() {
             let opcode = (word & 0xFF) as u8;
             if needed == 0 {
-                return opcode == op::GET_PRIVATE && matches!(consts.get((word >> 8) as usize),
-                    Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some_and(|(_, count, _)| count == arity));
+                return (opcode == op::GET_PRIVATE && matches!(consts.get((word >> 8) as usize),
+                    Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some_and(|(_, count, _)| count == arity))).then_some(ip - distance - 1);
             }
             needed += match opcode {
                 op::GET_LOCAL | op::GET_PRIVATE | op::CONSTANT => -1,
@@ -1870,10 +1916,10 @@ impl JitState {
                 | op::INDEX => 1,
                 op::CALL => (word >> 8) as i32,
                 op::NOT | op::MEMBER => 0,
-                _ => return false, // calls across branches/stores stay interpreted
+                _ => return None, // calls across branches/stores stay interpreted
             };
         }
-        false
+        None
     }
 
     fn compile_hot_fn(
@@ -1883,6 +1929,7 @@ impl JitState {
         consts: &[crate::types::Constant],
         writable: u32,
         members: &HashMap<usize, (u32, u32)>,
+        hints: &[String],
     ) -> anyhow::Result<HotFnFn> {
         use cranelift_codegen::ir::{Block, StackSlot, StackSlotData, StackSlotKind};
 
@@ -2056,6 +2103,11 @@ impl JitState {
         read_sig.returns.push(AbiParam::new(I64));
         let core_read = self.module.declare_function("jit_core_read", Linkage::Import, &read_sig)?;
         let core_read = self.module.declare_func_in_func(core_read, &mut self.ctx.func);
+        let mut kind_sig = self.module.make_signature();
+        kind_sig.params.extend([AbiParam::new(ptr_type), AbiParam::new(I64), AbiParam::new(I64)]);
+        kind_sig.returns.push(AbiParam::new(I64));
+        let kind_check = self.module.declare_function("jit_parameter_kind", Linkage::Import, &kind_sig)?;
+        let kind_check = self.module.declare_func_in_func(kind_check, &mut self.ctx.func);
         {
             let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx);
 
@@ -2101,6 +2153,35 @@ impl JitState {
                     ))
                 })
                 .collect();
+
+            // Guard declared parameters once, after defaults/events and at every
+            // native (re-)entry. No GC IDs, layouts or unchecked promises in metadata.
+            let mut parameter_values = HashMap::new();
+            let mut numeric_values = BTreeSet::new();
+            for (slot, hint) in hints.iter().enumerate() {
+                let Some(kind) = Self::hint_kind(hint) else { continue; };
+                let value = builder.ins().load(I64, MemFlags::new(), locals_ptr, (slot * 8) as i32);
+                let valid = if kind == 1 {
+                    let tagged = builder.ins().icmp_imm(IntCC::UnsignedLessThan, value, 0xFFF8000000000000_u64 as i64);
+                    let float = builder.ins().bitcast(F64, MemFlags::new(), value);
+                    let ordered = builder.ins().fcmp(FloatCC::Ordered, float, float);
+                    builder.ins().band(tagged, ordered)
+                } else if kind == 2 {
+                    let tag = builder.ins().band_imm(value, 0xffff000000000000_u64 as i64);
+                    builder.ins().icmp_imm(IntCC::Equal, tag, 0xfff9000000000000_u64 as i64)
+                } else {
+                    let kind = builder.ins().iconst(I64, kind as i64);
+                    let call = builder.ins().call(kind_check, &[vm_ptr, value, kind]);
+                    let result = builder.inst_results(call)[0];
+                    builder.ins().icmp_imm(IntCC::Equal, result, 1)
+                };
+                let accepted = builder.create_block();
+                builder.ins().brif(valid, accepted, &[], deopt_exit, &[]);
+                builder.switch_to_block(accepted);
+                builder.seal_block(accepted);
+                parameter_values.insert(slot, value);
+                if kind == 1 { numeric_values.insert(value); }
+            }
 
             // If ip=0 is itself a branch target, jump to it from entry
             if let Some(&t0_block) = target_blocks.get(&0) {
@@ -2173,12 +2254,10 @@ impl JitState {
 
                 match opcode {
                     op::GET_LOCAL => {
-                        vstack.push(builder.ins().load(
-                            I64,
-                            MemFlags::new(),
-                            locals_ptr,
-                            (op0 * 8) as i32,
-                        ));
+                        let value = if let Some(&value) = parameter_values.get(&op0) { value } else {
+                            builder.ins().load(I64, MemFlags::new(), locals_ptr, (op0 * 8) as i32)
+                        };
+                        vstack.push(value);
                     }
                     op::SET_LOCAL | op::SET_LOCAL_POP => {
                         let value = *vstack.last().unwrap();
@@ -2259,7 +2338,9 @@ impl JitState {
                                 return Err(anyhow::anyhow!("unsupported constant at idx {}", idx));
                             }
                         };
-                        vstack.push(builder.ins().iconst(I64, value.to_bits() as i64));
+                        let raw = builder.ins().iconst(I64, value.to_bits() as i64);
+                        if matches!(consts.get(idx), Some(crate::types::Constant::Number(number)) if !number.is_nan()) { numeric_values.insert(raw); }
+                        vstack.push(raw);
                     }
                     op::ADD
                     | op::ADD_FLOAT
@@ -2273,22 +2354,16 @@ impl JitState {
                         let b_i64 = vstack.pop().unwrap();
                         let a_i64 = vstack.pop().unwrap();
 
-                        let a_ok = builder.ins().icmp_imm(
-                            IntCC::UnsignedLessThan,
-                            a_i64,
-                            0xFFF8000000000000_u64 as i64,
-                        );
-                        let b_ok = builder.ins().icmp_imm(
-                            IntCC::UnsignedLessThan,
-                            b_i64,
-                            0xFFF8000000000000_u64 as i64,
-                        );
-                        let both = builder.ins().band(a_ok, b_ok);
-                        emit_deopt_brif!(both);
                         let a_f64 = builder.ins().bitcast(F64, MemFlags::new(), a_i64);
                         let b_f64 = builder.ins().bitcast(F64, MemFlags::new(), b_i64);
-                        let ordered = builder.ins().fcmp(FloatCC::Ordered, a_f64, b_f64);
-                        emit_deopt_brif!(ordered);
+                        if !numeric_values.contains(&a_i64) || !numeric_values.contains(&b_i64) {
+                            let a_ok = if numeric_values.contains(&a_i64) { builder.ins().iconst(cranelift_codegen::ir::types::I8, 1) } else { builder.ins().icmp_imm(IntCC::UnsignedLessThan, a_i64, 0xFFF8000000000000_u64 as i64) };
+                            let b_ok = if numeric_values.contains(&b_i64) { builder.ins().iconst(cranelift_codegen::ir::types::I8, 1) } else { builder.ins().icmp_imm(IntCC::UnsignedLessThan, b_i64, 0xFFF8000000000000_u64 as i64) };
+                            let both = builder.ins().band(a_ok, b_ok);
+                            emit_deopt_brif!(both);
+                            let ordered = builder.ins().fcmp(FloatCC::Ordered, a_f64, b_f64);
+                            emit_deopt_brif!(ordered);
+                        }
                         if matches!(opcode, op::DIVIDE | op::DIV_FLOAT) {
                             let zero = builder.ins().f64const(0.0);
                             let nonzero = builder.ins().fcmp(FloatCC::NotEqual, b_f64, zero);
@@ -2304,7 +2379,9 @@ impl JitState {
                         // Keep VM canonical NaN boxing and comparisons on the interpreter path.
                         let ordered = builder.ins().fcmp(FloatCC::Ordered, res_f64, res_f64);
                         emit_deopt_brif!(ordered);
-                        vstack.push(builder.ins().bitcast(I64, MemFlags::new(), res_f64));
+                        let raw = builder.ins().bitcast(I64, MemFlags::new(), res_f64);
+                        numeric_values.insert(raw);
+                        vstack.push(raw);
                     }
                     op::EQUAL
                     | op::NOT_EQUAL
@@ -2314,22 +2391,16 @@ impl JitState {
                     | op::GREATER_EQUAL => {
                         let b_i64 = vstack.pop().unwrap();
                         let a_i64 = vstack.pop().unwrap();
-                        let a_ok = builder.ins().icmp_imm(
-                            IntCC::UnsignedLessThan,
-                            a_i64,
-                            0xFFF8000000000000_u64 as i64,
-                        );
-                        let b_ok = builder.ins().icmp_imm(
-                            IntCC::UnsignedLessThan,
-                            b_i64,
-                            0xFFF8000000000000_u64 as i64,
-                        );
-                        let both = builder.ins().band(a_ok, b_ok);
-                        emit_deopt_brif!(both);
                         let a_f64 = builder.ins().bitcast(F64, MemFlags::new(), a_i64);
                         let b_f64 = builder.ins().bitcast(F64, MemFlags::new(), b_i64);
-                        let ordered = builder.ins().fcmp(FloatCC::Ordered, a_f64, b_f64);
-                        emit_deopt_brif!(ordered);
+                        if !numeric_values.contains(&a_i64) || !numeric_values.contains(&b_i64) {
+                            let a_ok = if numeric_values.contains(&a_i64) { builder.ins().iconst(cranelift_codegen::ir::types::I8, 1) } else { builder.ins().icmp_imm(IntCC::UnsignedLessThan, a_i64, 0xFFF8000000000000_u64 as i64) };
+                            let b_ok = if numeric_values.contains(&b_i64) { builder.ins().iconst(cranelift_codegen::ir::types::I8, 1) } else { builder.ins().icmp_imm(IntCC::UnsignedLessThan, b_i64, 0xFFF8000000000000_u64 as i64) };
+                            let both = builder.ins().band(a_ok, b_ok);
+                            emit_deopt_brif!(both);
+                            let ordered = builder.ins().fcmp(FloatCC::Ordered, a_f64, b_f64);
+                            emit_deopt_brif!(ordered);
+                        }
                         let float_cc = match opcode {
                             op::EQUAL => FloatCC::Equal,
                             op::NOT_EQUAL => FloatCC::NotEqual,

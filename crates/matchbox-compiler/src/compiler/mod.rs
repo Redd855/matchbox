@@ -2527,7 +2527,13 @@ impl Compiler {
         }
 
         if kind != FunctionKind::ComponentBody {
-            sub_compiler.chunk.emit0(op::FUNCTION_ENTER, self.current_line);
+            // Declarations are advisory JIT inputs, never permission for unchecked
+            // casts. The interpreter keeps its existing dynamic parameter behavior.
+            let hints: Vec<String> = params.iter().map(|p| p.type_name.as_deref().unwrap_or("").to_ascii_lowercase()).collect();
+            let hint_index = if hints.iter().any(|hint| !hint.is_empty() && hint != "any") {
+                sub_compiler.chunk.add_constant(Constant::StringArray(hints)) + 1
+            } else { 0 };
+            sub_compiler.chunk.emit1(op::FUNCTION_ENTER, hint_index, self.current_line);
         }
         match body {
             FunctionBody::Block(stmts) | FunctionBody::Component(stmts) => {

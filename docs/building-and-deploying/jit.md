@@ -63,12 +63,14 @@ The body-entry subset is readonly, forward-only leaves, plus bounded terminal re
 | Arithmetic | `ADD`, `SUBTRACT`, `MULTIPLY`, `DIVIDE` and float variants |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 | Boolean | `NOT`, Boolean-guarded conditions |
+| Readonly collections | Guarded `INDEX` on arrays/plain structs and lowercase constant `MEMBER` on plain structs |
+| Core calls | Proven `int`, `isStruct`, `structKeyExists` calls within one expression block |
 | Control flow | `JUMP`, `JUMP_IF_FALSE` (forward jumps) |
 | Stack | `POP`, `DUP` |
 | Return | `RETURN` |
 | Literal records | Terminal `STRUCT; RETURN`, at most two literal string keys with parameter values |
 
-Arithmetic/comparison guards require non-NaN floats. Integers, coercions, non-Boolean truthiness, zero divisors and NaN-producing arithmetic safely **deopt to body entry**, without replaying defaults/interception or losing scope mutations. For small records, machine code loads parameter values into a fixed two-slot result buffer; the epilogue performs terminal allocation through the same `literal_struct` VM service as the interpreter. Key interning/presentation and shared object identity are preserved. Inputs remain rooted in live frame scopes; heap allocation does not collect, and ordinary return handling roots the result. No allocations or side effects precede a possible deopt. General writes, calls and allocation remain interpreted; the old direct compiled-callee path and relaxed coercion helpers were removed because they bypassed these semantics. Program ownership guards prevent stale function/address reuse across GC; JIT state remains VM-local.
+Arithmetic/comparison guards require non-NaN floats. Integers, coercions, non-Boolean truthiness, zero divisors and NaN-producing arithmetic safely **deopt to body entry**, without replaying defaults/interception or losing scope mutations. For small records, machine code loads parameter values into a fixed two-slot result buffer; the epilogue performs terminal allocation through the same `literal_struct` VM service as the interpreter. Key interning/presentation and shared object identity are preserved. Inputs remain rooted in live frame scopes; heap allocation does not collect, and ordinary return handling roots the result. No allocations or side effects precede a possible deopt. Each core call requires the original native callee identity through the ordinary private-scope resolver at every native entry. Intrinsic references cannot escape as values or through branch spills. Struct index keys must already be strings; coercions, custom callees and unsupported receivers deopt. Reads observe current values/layouts, null versus missing and case-sensitive keys. General writes, calls and allocation remain interpreted; the old direct compiled-callee path and relaxed coercion helpers were removed because they bypassed these semantics. Program ownership guards prevent stale function/address reuse across GC; JIT state remains VM-local.
 
 ### Bounded function-loop regions
 
@@ -78,11 +80,11 @@ it does not recognize/reimplement a particular BoxLang helper. After 100 such
 invocations, it can compile the remaining region with:
 
 - Numeric `SET_LOCAL`/`SET_LOCAL_POP` to already-bound named locals, not parameters.
-- Guarded `INDEX` reads from arrays and `MEMBER` reads from plain structs.
+- Guarded `INDEX` reads from arrays/plain structs and `MEMBER` reads from plain structs.
   Member source names must already be lowercase, so compilation of an untaken
   branch cannot upgrade key presentation. Folded/exact IDs handle case-sensitive
   records; missing keys, instances and proxies deopt.
-- `GET_PRIVATE int; ...; CALL 1` proven within an expression block. Each native
+- Proven `int`, `isStruct` and `structKeyExists` calls within an expression block. Each native
   entry uses the **same private-scope resolver as the VM** and requires the core
   native function's identity. Captured/rebound/custom callees stay interpreted;
   native truncation preserves the current MatchBox BIF, not claimed full JVM
@@ -115,15 +117,38 @@ not a general analyzer speed guarantee or justification for arbitrary expansion.
 
 ---
 
+## Optional Parameter Type Hints
+
+Existing BoxLang parameter declarations (`numeric`, `boolean`, `array`, `struct`,
+`string`) are retained as immutable `FUNCTION_ENTER` metadata. Recognized hints
+are checked after ordinary defaults/events and at every native re-entry. A mismatch
+falls back to the interpreter; declarations do not authorize unchecked casts or
+change existing dynamic argument behavior. Unknown types and `any` are ignored.
+
+Guarded numeric parameters, numeric constants and non-NaN arithmetic results feed
+SSA facts, avoiding redundant numeric guards. Parameters remain readonly; hints
+prove neither record layouts nor element types. Return/local declarations, coercion
+contracts, structural/generic types and a static/gradual type checker are not added.
+This is an optimizer prototype using existing syntax, not a complete type system.
+
+`tests/jit_runner.py` proves real source-free typed/readonly compilation and
+execution, plus wrong-hint fallback, dynamic callees, branch-returned intrinsic
+references, live layouts, nulls, Unicode/case-sensitive keys, index errors and GC.
+In the bounded bx-lint experiment, JIT changes improved real-file edit medians
+about 3–4%; two added annotations produced no consistent additional gain. Frames,
+allocation and most traversal still remain interpreted.
+
+---
+
 ## What Is Not Supported in Tier 4
 
 The following categories cause a function to remain interpreted:
 
-- **Global variables** — `GET_GLOBAL`, `SET_GLOBAL`, `DEFINE_GLOBAL`, `SET_PRIVATE`, and `GET_PRIVATE` except the guarded core `int` intrinsic
+- **Global variables** — `GET_GLOBAL`, `SET_GLOBAL`, `DEFINE_GLOBAL`, `SET_PRIVATE`, and `GET_PRIVATE` except proven guarded core intrinsics
 - **I/O** — `PRINT`, `PRINTLN`
 - **Object / collection creation** — `NEW`, `ARRAY`, and `STRUCT` outside the bounded terminal-record pattern
-- **General property/index operations** — writes, instances/proxies/dynamic keys; readonly array/plain-struct reads are limited to the loop region above
-- **General calls** — all except proven core `int`; `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED` remain interpreted
+- **General property/index operations** — writes, instances/proxies and key coercions; readonly array/plain-struct reads use guards
+- **General calls** — all except proven core `int`, `isStruct`, `structKeyExists`; `INVOKE`, `INVOKE_NAMED`, `CALL_NAMED` remain interpreted
 - **Declarations/parameter mutation** — `BIND_LOCAL` and writes outside the staged named-local subset
 - **Strings/remainder/integer specializations** — `STRING_CONCAT`, `MODULO`, `ADD_INT`, `SUB_INT`, `MUL_INT`
 - **General function loops** — `FOR_LOOP_STEP`, `ITER_NEXT`, nested `LOOP` targets
@@ -131,7 +156,7 @@ The following categories cause a function to remain interpreted:
 - **Multi-word compare-jumps** — `LOCAL_COMPARE_JUMP`, `GLOBAL_COMPARE_JUMP`, `COMPARE_JUMP`, `LOCAL_JUMP_IF_NE_CONST`
 - **Miscellaneous** — `INC`, `DEC`, `INC_LOCAL`, `INC_GLOBAL`, `SWAP`, `OVER`, `JUMP_IF_NULL`
 
-This bounded subset enables numeric parameter-only helpers, bx-lint's `bxPosition`/`bxRange` and its nonallocating binary-search loop, not general functions or recursion. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
+This bounded subset enables numeric parameter-only helpers, bx-lint's `bxPosition`/`bxRange` and its nonallocating binary-search loop and readonly `bxGet`, not general functions or recursion. Compiled machine code and its immutable program/key metadata live until the VM is dropped; memory and application latency must still be measured.
 
 ---
 

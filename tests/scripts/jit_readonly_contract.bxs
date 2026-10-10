@@ -6,6 +6,7 @@ function guardedGet(record, key, fallback = null) {
 function readField(record) { return record.value; }
 function readItem(items, index) { return items[index]; }
 function leakIntrinsic() { return isStruct; }
+function leakBranch(flag) { return flag ? isStruct : structKeyExists; }
 var record = {value: 42, "Élève中😀": 17}; var items = [record, null, "hello"];
 for (var warm = 0; warm < 200; warm++) {
     assert guardedGet(record, "value") == 42;
@@ -35,7 +36,11 @@ isStruct = originalIsStruct;
 structKeyExists = function(value, key) { return false; };
 assert guardedGet({value: 42}, "value", 64) == 64;
 structKeyExists = originalKeyExists;
-for (var warm = 0; warm < 200; warm++) { assert leakIntrinsic() == originalIsStruct; }
+for (var warm = 0; warm < 200; warm++) {
+    assert leakIntrinsic() == originalIsStruct;
+    assert leakBranch(true) == originalIsStruct;
+    assert leakBranch(false) == originalKeyExists;
+}
 var numericKey = {"7": 23}; assert guardedGet(numericKey, 7) == 23;
 // Strings/records read from parameters remain live through ordinary collection.
 for (var churn = 0; churn < 30000; churn++) { var rubbish = [churn, {value: churn}]; }

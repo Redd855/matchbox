@@ -1,4 +1,5 @@
 use super::chunk::ChunkProgram;
+use crate::types::BxVM;
 /// JIT compilation of hot bytecode loops using Cranelift.
 ///
 /// Two tiers:
@@ -60,7 +61,7 @@ pub struct CompiledFn {
     call: HotFnFn,
     record_keys: Option<Arc<[crate::types::box_string::BoxString]>>,
     executed: bool,
-    uses_int: bool,
+    intrinsics: u8,
 }
 
 pub(super) enum FnJitOutcome {
@@ -73,8 +74,9 @@ struct FnReadEnv {
     local_scope: Option<usize>,
 }
 
-// Read-only guards: no methods/proxies, coercion, allocation or collection here.
-unsafe extern "C" fn jit_read_array(
+// Read-only guards: no methods/proxies, coercion, VM allocation or collection.
+// Temporary Rust string normalization cannot invalidate rooted VM values.
+unsafe extern "C" fn jit_read_index(
     env: *const FnReadEnv,
     value: u64,
     index: u64,
@@ -85,6 +87,15 @@ unsafe extern "C" fn jit_read_array(
     let vm = unsafe { &*env.vm };
     let value: BxValue = unsafe { std::mem::transmute(value) };
     let index: BxValue = unsafe { std::mem::transmute(index) };
+    let Some(id) = value.as_gc_id() else { return 1; };
+    if matches!(vm.heap.get_opt(id), Some(super::gc::GcObject::Struct(_))) {
+        if env.local_scope == Some(id) { return 1; }
+        let Some(key_id) = index.as_gc_id() else { return 1; };
+        let Some(super::gc::GcObject::String(key)) = vm.heap.get_opt(key_id) else { return 1; };
+        let mut key = key.clone();
+        unsafe { *out = vm.struct_get(id, key.as_flat_str()).to_bits(); }
+        return 0;
+    }
     if !index.is_number() {
         return 1;
     }
@@ -135,6 +146,35 @@ unsafe extern "C" fn jit_read_member(
     unsafe {
         *out = record.properties[index as usize].to_bits();
     }
+    0
+}
+
+// Each intrinsic is identity-guarded at ordinary function entry, not resolved
+// from a forged boxed tag or called through arbitrary user code under raw pointers.
+fn intrinsic(name: &str) -> Option<(u8, u32, crate::types::BxNativeFunction)> {
+    if name.eq_ignore_ascii_case("int") { Some((1, 1, crate::bifs::int_bif)) }
+    else if name.eq_ignore_ascii_case("isStruct") { Some((2, 1, crate::bifs::is_struct_bif)) }
+    else if name.eq_ignore_ascii_case("structKeyExists") { Some((4, 2, crate::bifs::struct_key_exists_bif)) }
+    else { None }
+}
+
+unsafe extern "C" fn jit_core_read(env: *const FnReadEnv, kind: u64, first: u64, second: u64, out: *mut u64) -> u64 {
+    use crate::types::BxValue;
+    let env = unsafe { &*env };
+    let vm = unsafe { &*env.vm };
+    let first: BxValue = unsafe { std::mem::transmute(first) };
+    let value = if kind == 2 {
+        vm.is_struct_value(first)
+    } else if kind == 4 {
+        let Some(id) = first.as_gc_id() else { return 1; };
+        if env.local_scope == Some(id) { return 1; }
+        let second: BxValue = unsafe { std::mem::transmute(second) };
+        let Some(key_id) = second.as_gc_id() else { return 1; };
+        let Some(super::gc::GcObject::String(key)) = vm.heap.get_opt(key_id) else { return 1; };
+        let mut key = key.clone();
+        vm.struct_key_exists(id, key.as_flat_str())
+    } else { return 1; };
+    unsafe { *out = BxValue::new_bool(value).to_bits(); }
     0
 }
 
@@ -226,6 +266,16 @@ pub unsafe extern "C" fn jit_load_prop_at(
 }
 
 impl super::VM {
+    fn jit_intrinsics_match(&mut self, fiber: usize, mask: u8) -> bool {
+        ["int", "isStruct", "structKeyExists"].iter().all(|name| {
+            let (kind, _, expected) = intrinsic(name).unwrap();
+            if mask & kind == 0 { return true; }
+            let Some(value) = self.private_value(fiber, name) else { return false; };
+            let Some(id) = value.as_gc_id() else { return false; };
+            matches!(self.heap.get_opt(id), Some(super::gc::GcObject::NativeFunction(function)) if std::ptr::fn_addr_eq(*function, expected))
+        })
+    }
+
     /// Defaults/arguments/interception have already run in the ordinary frame.
     /// A readonly, nonallocating body can safely deopt back to this entry.
     pub(super) fn run_jit_fn_body(
@@ -254,6 +304,7 @@ impl super::VM {
             &frame.function.name,
             &mut self.interner,
         )?;
+        if !self.jit_intrinsics_match(fiber, compiled.intrinsics) { return None; }
         let base = self.fibers[fiber].frames.last().unwrap().stack_base;
         let parameters = self.fibers[fiber]
             .frames
@@ -272,10 +323,11 @@ impl super::VM {
         // ponytail: at most two terminal record fields; wider/nested records
         // need GC-rooted spills before enabling their bytecodes.
         let mut results = [0u64; 2];
+        let env = FnReadEnv { vm: self as *const _, local_scope: None };
         let status = unsafe {
             (compiled.call)(
                 locals,
-                &self.heap as *const _ as *const std::ffi::c_void,
+                &env as *const _ as *const std::ffi::c_void,
                 results.as_mut_ptr(),
             )
         };
@@ -362,28 +414,12 @@ impl super::VM {
             &frame.function.name,
             &mut self.interner,
         )?;
-        if compiled.uses_int {
-            if self.fibers[fiber]
-                .frames
-                .last()
-                .unwrap()
-                .local_names
-                .values()
-                .any(|binding| binding.local && self.interner.resolve(binding.key).eq_ignore_ascii_case("int"))
-            {
-                return None; // A staged local write could change the callee binding.
-            }
-            let value = self.private_value(fiber, "int")?;
-            let id = value.as_gc_id()?;
-            let super::gc::GcObject::NativeFunction(function) = self.heap.get(id) else {
-                return None;
-            };
-            if !std::ptr::fn_addr_eq(
-                *function,
-                crate::bifs::int_bif as crate::types::BxNativeFunction,
-            ) {
-                return None;
-            }
+        if !self.jit_intrinsics_match(fiber, compiled.intrinsics)
+            || self.fibers[fiber].frames.last().unwrap().local_names.values().any(|binding| {
+                binding.local && intrinsic(self.interner.resolve(binding.key))
+                    .is_some_and(|(kind, _, _)| compiled.intrinsics & kind != 0)
+            }) {
+            return None; // A staged local write could change the callee binding.
         }
         self.sync_jit_locals(fiber, false);
         let mut saved = [BxValue::new_null(); 32];
@@ -500,7 +536,8 @@ impl JitState {
         );
         builder.symbol("jit_get_shape_id", jit_get_shape_id as *const u8);
         builder.symbol("jit_load_prop_at", jit_load_prop_at as *const u8);
-        builder.symbol("jit_read_array", jit_read_array as *const u8);
+        builder.symbol("jit_read_index", jit_read_index as *const u8);
+        builder.symbol("jit_core_read", jit_core_read as *const u8);
         builder.symbol("jit_read_member", jit_read_member as *const u8);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
@@ -1663,11 +1700,12 @@ impl JitState {
                 return None;
             }
             let mut members = HashMap::new();
-            let mut uses_int = false;
+            let mut intrinsics = 0;
             for &word in code {
                 let opcode = (word & 0xFF) as u8;
                 if opcode == op::GET_PRIVATE {
-                    uses_int = true;
+                    let crate::types::Constant::String(mut name) = program.constants[(word >> 8) as usize].clone() else { unreachable!() };
+                    intrinsics |= intrinsic(name.as_flat_str()).unwrap().0;
                 }
                 if opcode == op::MEMBER {
                     let constant = (word >> 8) as usize;
@@ -1696,7 +1734,7 @@ impl JitState {
                         call: compiled,
                         record_keys: record_keys.map(Arc::from),
                         executed: false,
-                        uses_int,
+                        intrinsics,
                     };
                     self.compiled_fns.insert(key, (program, compiled.clone()));
                     return Some(compiled);
@@ -1766,11 +1804,11 @@ impl JitState {
                 op::GET_LOCAL => arg < arity,
                 op::SET_LOCAL | op::SET_LOCAL_POP => arg < 32 && writable & (1 << arg) != 0,
                 op::LOOP => writable != 0 && (arg as usize) == ip + 1,
-                op::INDEX => writable != 0,
+                op::INDEX => true,
                 // Compiling an untaken read must not upgrade key presentation.
-                op::MEMBER => writable != 0 && matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if { let mut name=name.clone(); let text=name.as_flat_str(); text==text.to_lowercase() }),
-                op::GET_PRIVATE => writable != 0 && matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if name.clone().as_flat_str().eq_ignore_ascii_case("int")),
-                op::CALL => writable != 0 && arg == 1 && Self::int_call(code, ip),
+                op::MEMBER => matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if { let mut name=name.clone(); let text=name.as_flat_str(); text==text.to_lowercase() }),
+                op::GET_PRIVATE => matches!(consts.get(arg as usize), Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some()),
+                op::CALL => Self::intrinsic_call(code, consts, ip),
                 op::CONSTANT => matches!(
                     consts.get(arg as usize),
                     Some(
@@ -1804,12 +1842,14 @@ impl JitState {
     }
 
     /// Prove the callee within one expression block before touching Cranelift.
-    fn int_call(code: &[u32], ip: usize) -> bool {
-        let mut needed = 1i32; // the single argument expression
+    fn intrinsic_call(code: &[u32], consts: &[crate::types::Constant], ip: usize) -> bool {
+        let arity = code[ip] >> 8;
+        let mut needed = arity as i32;
         for &word in code[..ip].iter().rev() {
             let opcode = (word & 0xFF) as u8;
             if needed == 0 {
-                return opcode == op::GET_PRIVATE;
+                return opcode == op::GET_PRIVATE && matches!(consts.get((word >> 8) as usize),
+                    Some(crate::types::Constant::String(name)) if intrinsic(name.clone().as_flat_str()).is_some_and(|(_, count, _)| count == arity));
             }
             needed += match opcode {
                 op::GET_LOCAL | op::GET_PRIVATE | op::CONSTANT => -1,
@@ -1827,8 +1867,8 @@ impl JitState {
                 | op::LESS_EQUAL
                 | op::GREATER
                 | op::GREATER_EQUAL
-                | op::INDEX
-                | op::CALL => 1,
+                | op::INDEX => 1,
+                op::CALL => (word >> 8) as i32,
                 op::NOT | op::MEMBER => 0,
                 _ => return false, // calls across branches/stores stay interpreted
             };
@@ -1980,7 +2020,7 @@ impl JitState {
         self.func_counter += 1;
         self.ctx.func.signature = sig;
 
-        let readers = if writable != 0 {
+        let readers = if code.iter().any(|word| matches!((word & 0xFF) as u8, op::INDEX | op::MEMBER)) {
             let mut sig = self.module.make_signature();
             sig.params.extend([
                 AbiParam::new(ptr_type),
@@ -1991,7 +2031,7 @@ impl JitState {
             sig.returns.push(AbiParam::new(I64));
             let array = self
                 .module
-                .declare_function("jit_read_array", Linkage::Import, &sig)?;
+                .declare_function("jit_read_index", Linkage::Import, &sig)?;
             let array = self.module.declare_func_in_func(array, &mut self.ctx.func);
             let mut sig = self.module.make_signature();
             sig.params.extend([
@@ -2011,6 +2051,11 @@ impl JitState {
             None
         };
 
+        let mut read_sig = self.module.make_signature();
+        read_sig.params.extend([AbiParam::new(ptr_type), AbiParam::new(I64), AbiParam::new(I64), AbiParam::new(I64), AbiParam::new(ptr_type)]);
+        read_sig.returns.push(AbiParam::new(I64));
+        let core_read = self.module.declare_function("jit_core_read", Linkage::Import, &read_sig)?;
+        let core_read = self.module.declare_func_in_func(core_read, &mut self.ctx.func);
         {
             let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx);
 
@@ -2064,9 +2109,9 @@ impl JitState {
 
             // ── Per-instruction translation ───────────────────────────────────
             let mut vstack: Vec<cranelift_codegen::ir::Value> = Vec::new();
-            // Proven GET_PRIVATE int SSA values, not a forgeable boxed-value tag.
+            // Proven callee SSA values, not forgeable boxed-value tags.
             // Calls across control-flow/spill boundaries remain interpreted.
-            let mut int_functions = BTreeSet::new();
+            let mut functions = HashMap::new();
             let mut block_terminated = target_blocks.contains_key(&0);
 
             let mut ip = 0usize;
@@ -2149,18 +2194,30 @@ impl JitState {
                         let value = builder
                             .ins()
                             .iconst(I64, crate::types::BxValue::new_null().to_bits() as i64);
-                        int_functions.insert(value);
+                        let crate::types::Constant::String(mut name) = consts[op0].clone() else { unreachable!() };
+                        functions.insert(value, intrinsic(name.as_flat_str()).unwrap().0);
                         vstack.push(value);
                     }
                     op::CALL => {
-                        let argument = vstack.pop().unwrap();
+                        let second = if op0 == 2 { vstack.pop().unwrap() } else { builder.ins().iconst(I64, 0) };
+                        let first = vstack.pop().unwrap();
                         let function = vstack.pop().unwrap();
-                        if !int_functions.contains(&function) {
-                            return Err(anyhow::anyhow!("only proven core int calls are eligible"));
+                        let Some(&kind) = functions.get(&function) else {
+                            return Err(anyhow::anyhow!("only proven readonly core calls are eligible"));
+                        };
+                        if kind == 1 {
+                            let float = require_float!(first);
+                            let result = builder.ins().trunc(float);
+                            vstack.push(builder.ins().bitcast(I64, MemFlags::new(), result));
+                        } else {
+                            let out = builder.ins().stack_addr(ptr_type, spill_slots[0], 0);
+                            let kind = builder.ins().iconst(I64, kind as i64);
+                            let call = builder.ins().call(core_read, &[vm_ptr, kind, first, second, out]);
+                            let status = builder.inst_results(call)[0];
+                            let success = builder.ins().icmp_imm(IntCC::Equal, status, 0);
+                            emit_deopt_brif!(success);
+                            vstack.push(builder.ins().stack_load(I64, spill_slots[0], 0));
                         }
-                        let float = require_float!(argument);
-                        let result = builder.ins().trunc(float);
-                        vstack.push(builder.ins().bitcast(I64, MemFlags::new(), result));
                     }
                     op::INDEX | op::MEMBER => {
                         let out = builder.ins().stack_addr(ptr_type, spill_slots[0], 0);
@@ -2378,6 +2435,7 @@ impl JitState {
                     }
                     op::RETURN => {
                         let ret_val = vstack.pop().unwrap();
+                        if functions.contains_key(&ret_val) { return Err(anyhow::anyhow!("intrinsic references must not escape")); }
                         if writable != 0 {
                             require_float!(ret_val);
                         }

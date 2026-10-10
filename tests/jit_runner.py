@@ -13,7 +13,8 @@ with tempfile.TemporaryDirectory(prefix="matchbox-jit-runner-") as directory:
     source = work / "probe.bxs"
     source.write_text((root / "tests/scripts/jit_hot_fn.bxs").read_text() + "\n" +
                       (root / "tests/scripts/jit_function_contract.bxs").read_text() + "\n" +
-                      (root / "tests/scripts/jit_loop_contract.bxs").read_text() +
+                      (root / "tests/scripts/jit_loop_contract.bxs").read_text() + "\n" +
+                      (root / "tests/scripts/jit_readonly_contract.bxs").read_text() +
                       "\nfor (var warm=0; warm<20000; warm++) {}\n")
     module = work / "module"
     module.mkdir()
@@ -24,9 +25,9 @@ with tempfile.TemporaryDirectory(prefix="matchbox-jit-runner-") as directory:
     def check(command):
         result = subprocess.run(command, cwd=work, env=dict(env, PATH="/usr/bin:/bin"), capture_output=True, timeout=60)
         assert result.returncode == 0, (command, result.stdout, result.stderr)
-        assert result.stdout.splitlines() == [b"19900", b"199", b"Function JIT / defaults / named calls / guards / scopes / GC: OK", b"Function loop JIT / rollback / scope aliases / intrinsic guards / yields / GC: OK"], result.stdout
+        assert result.stdout.splitlines() == [b"19900", b"199", b"Function JIT / defaults / named calls / guards / scopes / GC: OK", b"Function loop JIT / rollback / scope aliases / intrinsic guards / yields / GC: OK", b"Readonly JIT / live fields / layouts / dynamic callees / index guards / GC: OK"], result.stdout
         assert b"[JIT] compiled empty loop" in result.stderr, (command, "Cranelift never activated", result.stderr)
-        for name in ["add", "max_val", "weighted", "choose", "divide", "ready", "pairRecord"]:
+        for name in ["add", "max_val", "weighted", "choose", "divide", "ready", "pairRecord", "guardedGet", "readField", "readItem"]:
             assert f"[JIT] compiled hot fn name={name} ".encode() in result.stderr, (command, "Real compiler function never compiled", result.stderr)
             assert f"[JIT] executed hot fn name={name}".encode() in result.stderr, (command, "Compiled function never executed successfully", result.stderr)
         for name in ["lowerBound", "countLocals", "truncatedLoop"]:

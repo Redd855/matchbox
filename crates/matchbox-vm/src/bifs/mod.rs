@@ -3453,7 +3453,7 @@ fn struct_delete_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
     }
 }
 
-fn struct_key_exists_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn struct_key_exists_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() < 2 {
         return Err("structKeyExists() expects 2 arguments: (struct, key)".to_string());
     }
@@ -4823,7 +4823,7 @@ fn array_depth(vm: &dyn BxVM, value: BxValue) -> usize {
     1 + array_depth(vm, vm.array_get(id, 0))
 }
 
-fn is_struct_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn is_struct_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.is_empty() {
         return Ok(BxValue::new_bool(false));
     }

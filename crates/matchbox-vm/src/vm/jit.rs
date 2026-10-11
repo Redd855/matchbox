@@ -78,6 +78,11 @@ struct FnReadEnv {
 }
 
 // Read-only guards: no methods/proxies, coercion, VM allocation or collection.
+// Native objects may explicitly opt into allocation-free scalar properties.
+fn native_scalar_property(object: &std::rc::Rc<std::cell::RefCell<dyn crate::types::BxNativeObject>>, name: &str) -> Option<crate::types::BxValue> {
+    let value = object.try_borrow().ok()?.readonly_jit_property(name)?;
+    (value.is_number() || value.is_bool() || value.is_null()).then_some(value)
+}
 // Temporary Rust string normalization cannot invalidate rooted VM values.
 unsafe extern "C" fn jit_read_index(
     env: *const FnReadEnv,
@@ -91,6 +96,12 @@ unsafe extern "C" fn jit_read_index(
     let value: BxValue = unsafe { std::mem::transmute(value) };
     let index: BxValue = unsafe { std::mem::transmute(index) };
     let Some(id) = value.as_gc_id() else { return 1; };
+    if let Some(super::gc::GcObject::NativeObject(object)) = vm.heap.get_opt(id) {
+        let Some(super::gc::GcObject::String(key)) = index.as_gc_id().and_then(|key| vm.heap.get_opt(key)) else { return 1; };
+        let mut key = key.clone();
+        let Some(value) = native_scalar_property(object, &key.as_flat_str().to_ascii_lowercase()) else { return 1; };
+        unsafe { *out = value.to_bits(); } return 0;
+    }
     if matches!(vm.heap.get_opt(id), Some(super::gc::GcObject::Struct(_))) {
         if env.local_scope == Some(id) { return 1; }
         let Some(key_id) = index.as_gc_id() else { return 1; };
@@ -138,6 +149,10 @@ unsafe extern "C" fn jit_read_member(
     // parameters. Its dictionary must not observe staged numeric stack writes.
     if env.local_scope == Some(id) {
         return 1;
+    }
+    if let Some(super::gc::GcObject::NativeObject(object)) = vm.heap.get_opt(id) {
+        let Some(value) = native_scalar_property(object, vm.interner.resolve(folded)) else { return 1; };
+        unsafe { *out = value.to_bits(); } return 0;
     }
     let Some(super::gc::GcObject::Struct(record)) = vm.heap.get_opt(id) else {
         return 1;

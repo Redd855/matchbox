@@ -525,6 +525,8 @@ pub struct VM {
     pub output_buffer: Option<String>,
     output_capture_stack: Vec<Option<String>>,
     pub gc_suspended: bool,
+    native_exception_depth: usize,
+    native_callback_exception: Option<(String, Rc<gc::RootedValue>)>,
     function_events: HashMap<usize, BxValue>,
     automatic_event_depth: usize,
     thread_futures: HashSet<usize>,
@@ -2345,10 +2347,25 @@ impl VM {
         a == b
     }
 
+    // Preserve original BoxLang throws across the existing String native ABI.
+    // Scoped save/restore prevents handled/retried/nested callback errors escaping.
+    fn native_exception_scope(&mut self, call: impl FnOnce(&mut Self) -> Result<BxValue, String>) -> Result<BxValue, String> {
+        let saved = self.native_callback_exception.take();
+        self.native_exception_depth += 1;
+        let result = call(self);
+        self.native_exception_depth -= 1;
+        let raised = self.native_callback_exception.take();
+        self.native_callback_exception = match (&result, raised) {
+            (Err(message), Some((original, root))) if *message == original => Some((original, root)),
+            _ => saved,
+        };
+        result
+    }
+
     fn invoke_callback(&mut self, callback: &crate::types::NativeCallback, args: &[BxValue]) -> Result<BxValue, String> {
         let previous = self.gc_suspended;
         self.gc_suspended = true;
-        let result = (callback.callback)(self, args);
+        let result = self.native_exception_scope(|vm| (callback.callback)(vm, args));
         self.gc_suspended = previous;
         result
     }
@@ -2398,6 +2415,8 @@ impl VM {
             output_buffer: None,
             output_capture_stack: Vec::new(),
             gc_suspended: false,
+            native_exception_depth: 0,
+            native_callback_exception: None,
             function_events: HashMap::new(),
             automatic_event_depth: 0,
             thread_futures: HashSet::new(),
@@ -3291,7 +3310,7 @@ impl VM {
                     let f = *f;
                     let previous_gc = self.gc_suspended;
                     self.gc_suspended = true;
-                    let res = f(self, &args).map_err(|e| anyhow::anyhow!(e));
+                    let res = self.native_exception_scope(|vm| f(vm, &args)).map_err(|e| anyhow::anyhow!(e));
                     self.gc_suspended = previous_gc;
                     let future = self.future_new();
                     match res {
@@ -5566,6 +5585,10 @@ impl VM {
                                 self.fibers[fiber_idx].stack.push(val);
                             }
                             GcObject::NativeObject(object) => {
+                                if object.borrow().is_readonly() {
+                                    flush_ip!(); self.throw_error(fiber_idx, "Native object is read-only")?;
+                                    frame_changed = true; continue 'quantum;
+                                }
                                 object.borrow_mut().set_property(&index_string, val);
                                 self.fibers[fiber_idx].stack.push(val);
                             }
@@ -6005,6 +6028,10 @@ impl VM {
                             GcObject::NativeObject(obj) => {
                                 let name =
                                     self.interner.resolve(name_id).to_string().to_lowercase();
+                                if obj.borrow().is_readonly() {
+                                    flush_ip!(); self.throw_error(fiber_idx, "Native object is read-only")?;
+                                    frame_changed = true; continue 'quantum;
+                                }
                                 obj.borrow_mut().set_property(&name, val);
                                 self.fibers[fiber_idx].stack.push(val);
                             }
@@ -7008,6 +7035,12 @@ impl VM {
     }
 
     fn throw_error(&mut self, fiber_idx: usize, msg: &str) -> Result<()> {
+        if let Some((original, root)) = self.native_callback_exception.take() {
+            if original == msg {
+                let value = self.heap.read_retained_value(&root).map_err(anyhow::Error::msg)?;
+                return self.throw_value_internal(fiber_idx, value, true);
+            }
+        }
         #[cfg(target_os = "espidf")]
         eprintln!("[matchbox-vm] throwing ExpressionException: {}", msg);
         self.collect_garbage();
@@ -7257,6 +7290,10 @@ impl VM {
     }
 
     fn throw_value(&mut self, fiber_idx: usize, val: BxValue) -> Result<()> {
+        self.throw_value_internal(fiber_idx, val, false)
+    }
+
+    fn throw_value_internal(&mut self, fiber_idx: usize, val: BxValue, preserve: bool) -> Result<()> {
         let mut source_context = String::new();
 
         // Build full stack trace and source context before unwinding frames
@@ -7271,7 +7308,7 @@ impl VM {
             }
         }
 
-        let val = self.normalize_thrown_value(val, &stack_trace);
+        let val = if preserve && self.is_exception_object(val) { val } else { self.normalize_thrown_value(val, &stack_trace) };
         let _root = self.heap.retain_value(val).map_err(anyhow::Error::msg)?;
 
         while !self.fibers[fiber_idx].frames.is_empty() {
@@ -7317,12 +7354,11 @@ impl VM {
             }
         }
         let val_str = self.exception_summary(val);
-        bail!(
-            "VM Runtime Error: {}{}\n\nStack trace:\n{}",
-            val_str,
-            source_context,
-            stack_trace
-        );
+        let message = format!("VM Runtime Error: {}{}\n\nStack trace:\n{}", val_str, source_context, stack_trace);
+        if self.native_exception_depth > 0 {
+            self.native_callback_exception = Some((message.clone(), _root));
+        }
+        bail!(message);
     }
 
     pub fn call_function(
@@ -7384,7 +7420,7 @@ impl VM {
                     } else { args };
                     let previous_gc = self.gc_suspended;
                     self.gc_suspended = true;
-                    let res = f(self, &args).map_err(|e| anyhow::anyhow!(e));
+                    let res = self.native_exception_scope(|vm| f(vm, &args)).map_err(|e| anyhow::anyhow!(e));
                     self.gc_suspended = previous_gc;
                     res
                 }
@@ -7872,6 +7908,7 @@ impl VM {
             "asyncallapply" => vec!["items", "mapper", "timeout", "timeunit"],
             "threadnew" => vec!["runnable", "name", "virtual"],
             "boxast" => vec!["source", "filepath", "returntype", "sourcetype", "recover", "includetokens"],
+            "boxastvisit" => vec!["tree", "visitor", "state"],
             "runthreadincontext" => vec!["context", "callback"],
             "lock" => vec!["name", "timeout", "type"],
             "compress" => vec![
@@ -8044,7 +8081,7 @@ impl VM {
                     }
                     self.fibers[fiber_idx].stack.pop(); // Pop the function object
 
-                    match func(self, &args) {
+                    match self.native_exception_scope(|vm| func(vm, &args)) {
                         Ok(val) => {
                             self.fibers[fiber_idx].stack.push(val);
                             Ok(())
@@ -8611,7 +8648,7 @@ impl VM {
                         let mut final_args = vec![receiver];
                         final_args.extend(args);
 
-                        match bif(self, &final_args) {
+                        match self.native_exception_scope(|vm| bif(vm, &final_args)) {
                             Ok(res) => {
                                 self.fibers[fiber_idx].stack.push(res);
                                 return Ok(());

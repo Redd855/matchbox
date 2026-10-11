@@ -4,3 +4,4 @@ pub mod cst;
 pub mod parser;
 pub mod tokenizer;
 pub mod inspect;
+pub mod visit;

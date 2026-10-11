@@ -1,3 +1,4 @@
+mod ast_visit;
 use crate::types::{BxNativeFunction, BxNativeObject, BxVM, BxValue, Tracer};
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
@@ -125,6 +126,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     );
     bifs.insert("boxannounce".to_string(), system::box_announce as BxNativeFunction);
     bifs.insert("boxast".to_string(), system::box_ast as BxNativeFunction);
+    bifs.insert("boxastvisit".to_string(), ast_visit::visit as BxNativeFunction);
     bifs.insert(
         "boxmodulereload".to_string(),
         system::box_module_reload as BxNativeFunction,

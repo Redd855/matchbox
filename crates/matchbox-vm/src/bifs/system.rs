@@ -52,7 +52,7 @@ pub fn box_ast(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     };
     let recover = bool_arg(4)?;
     let include_tokens = bool_arg(5)?;
-    if !matches!(return_type.as_str(), "struct" | "json" | "text") { return Err("boxAST() returnType must be one of struct, json, text".into()); }
+    if !matches!(return_type.as_str(), "struct" | "json" | "text" | "native") { return Err("boxAST() returnType must be one of struct, json, text, native".into()); }
     if !matches!(source_type.as_str(), "script" | "template" | "cfscript" | "cftemplate") { return Err("boxAST() sourceType must be one of script, template, cfscript, cftemplate".into()); }
     if source.trim().is_empty() && !filepath.trim().is_empty() {
         #[cfg(feature = "bif-io")]
@@ -67,6 +67,7 @@ pub fn box_ast(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     }
     // Template ASTs currently contain compiler stubs/desugaring, not faithful source data.
     if source_type != "script" { return Err(format!("boxAST() {} AST inspection is not implemented", source_type)); }
+    if return_type == "native" { return super::ast_visit::parse(vm, source, if filepath.is_empty() { None } else { Some(&filepath) }, recover, include_tokens); }
     let root = matchbox_parser::inspect::inspect(&source, if filepath.is_empty() { None } else { Some(&filepath) }, recover, include_tokens).map_err(|error| error.to_string())?;
     match return_type.as_str() {
         "struct" => Ok(super::json::json_to_bx(vm, root)),

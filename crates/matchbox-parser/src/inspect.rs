@@ -18,12 +18,17 @@ pub fn inspect(
     } else {
         (parser::parse(source, filename)?, Vec::new())
     };
+    inspect_parsed(source, &statements, &issues, recover, include_tokens)
+}
+
+/// Export an existing authoritative parse without parsing the source again.
+pub fn inspect_parsed(source: &str, statements: &[Statement], issues: &[parser::ParseError], recover: bool, include_tokens: bool) -> anyhow::Result<Value> {
     let export = Export::new(source);
     let lexed = lex(source);
     let mut root = export.node(
         "BoxScript",
         Some(Span::at(source, 0, source.len())),
-        json!({"statements": export.statements(&statements)}),
+        json!({"statements": export.statements(statements)}),
     );
     root["comments"] = json!(
         lexed

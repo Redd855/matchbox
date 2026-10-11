@@ -81,6 +81,7 @@ script_test!(deserialize_toml, "deserialize_toml.bxs");
 script_test!(deserialize_yaml, "deserialize_yaml.bxs");
 script_test!(bytes_bifs, "bytes_bifs.bxs");
 script_test!(vm_box_ast, "vm_box_ast.bxs");
+script_test!(vm_ast_visit, "vm_ast_visit.bxs");
 script_test!(for_in_loops, "for_in_loops.bxs");
 script_test!(for_loop, "for_loop.bxs");
 script_test!(functions, "functions.bxs");

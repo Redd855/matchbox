@@ -32,6 +32,67 @@ Nodes use `ASTType`, `ASTPackage`, `sourceText`, `comments` and node-specific fi
 - Source-backed script statements/expressions, tokens and trivia have spans. Compiler-synthesized/desugared subnodes without retained spans omit position/span and have null sourceText rather than guessed coordinates. Interpolation expression offsets are translated back into the containing source.
 - Internal lexer `Span.col` remains one-based Unicode-scalar indexing. Consumers must not confuse it with the exported UTF-16 column.
 
+## Experimental native snapshots and BoxLang visitors
+
+MatchBox adds `returnType="native"`; JVM `boxAST` does not support it. This retains
+an owned typed Rust parse and a compact syntax index, without building the JSON
+intermediate or VM AST structs. It does not move analysis/diagnostics into Rust.
+
+```boxlang
+function visit(node, phase, state) {
+    if (phase == 0) { arrayAppend(state.names, node.typeName()); }
+    return 0;
+}
+tree = boxAST(source="var answer=42;", returnType="native", recover=true);
+walk = boxASTVisit(tree=tree, visitor=visit, state={names: []});
+```
+
+`boxASTVisit(tree, visitor, state)` accepts a snapshot root or retained node and a
+function or BoxLang object with `visit(node, phase, state)`. Normal BoxLang argument,
+exception, capture and method semantics apply. Callback throws preserve their
+original type, message, fields and stack (including typed catches), rather than
+being rendered into a new ExpressionException. Reentrant traversal and traversal
+after a handled callback error are supported. Phases are **0 enter / 1 leave**.
+Numeric actions are **0 continue / 1 skip children / 2 stop**; other values fail.
+Skipped nodes still receive leave; stop and exceptions do not synthesize unwinding
+leave events. Walk order follows the defined native syntax edges, not exported
+metadata-key order. Result: `{state, completed, stoppedAt}`; state is the caller's
+mutable analysis state, stoppedAt retains its source snapshot. No inspected source
+executes. Traversal is synchronous; this is not async cancellation.
+
+Views expose readonly scalar `kind`, `id`, `parentId`, `bodyId`, `childCount`,
+`start`, `end`, `incomplete`. IDs are one-based and snapshot-local; absent parent/body
+is 0, absent spans are null. Dot/index assignments throw. Methods:
+
+- `typeName()`, `name()`, `returnType()`, `edge()`, `text()` are lazy strings/null.
+- `kinds()` returns an independent name-to-numeric-kind map; consumers need not
+  hardcode discriminants. Native kind names describe the compiler syntax, **not**
+  the BoxLang exported AST schema. This is a bounded inspection view, not every
+  original syntax field or a type-inferred semantic tree.
+- `nodes([kindName])` selects nodes across the whole snapshot; `node(id)` reads an
+  explicit snapshot-local node. Function/closure/lambda bodyId selects the body.
+- `position()` uses the same one-based-line/UTF-16-column convention; synthesized
+  nodes without source spans return null. Source spans stay UTF-8 byte offsets.
+- Root `toStruct()` exports the retained parse without reparsing, including current
+  recovery issues/tokens when requested. It deliberately materializes the legacy
+  representation; this is a bridge, not a zero-copy migration. Exports are independent.
+
+Native views own no VM values/IDs internally and remain valid across GC or loss of
+the original root. Traversal roots callable/state/node values across callbacks and
+releases roots on ordinary errors. No foreign-VM values enter shared program caches.
+
+The existing guarded readonly JIT can read opted-in native **scalar** properties.
+The internal `BxNativeObject::readonly_jit_property` contract is pure, allocation-
+free, callback-free and returns no GC values; all other native getters stay
+interpreted. This is not a new plugin ABI capability. Callback bodies still need
+ordinary JIT eligibility; mutable collectors, arbitrary calls and many fused/control
+forms remain interpreted. A native driver alone does not establish a compiled visitor.
+
+Checks: `vm_ast_visit` integration and application `tests/native_ast.py CLI RUNTIME_ROOT`
+cover function/class callbacks, actual visitor native execution, canonical export,
+readonly views, retained ownership, original function/class callback exceptions,
+reentrant/post-error traversal and source-free bytecode/standalone packaging.
+
 ## Current boundaries
 
 The compiler AST loses some original syntax: compound assignments and some unary forms are desugared; assignment targets, parameters, argument names, declaration annotations and other synthesized nodes do not yet all retain individual spans. Recovery skips invalid statements at balanced boundaries and reports missing closing braces without inventing tokens. Incomplete declaration headers and malformed class properties are not yet retained. Full source-preserving node/schema parity requires further frontend work.

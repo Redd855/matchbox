@@ -424,6 +424,10 @@ pub trait BxNativeObject: fmt::Debug {
     fn delegated_callback(&self, _name: &str) -> Option<NativeCallback> { None }
     fn native_data(&self, _kind: &str) -> Option<*mut std::ffi::c_void> { None }
     fn get_property(&self, name: &str) -> BxValue;
+    /// Internal opt-in: pure, allocation-free scalar reads; no callbacks, GC
+    /// values, interior mutation or VM access. Unknown fields must decline.
+    fn readonly_jit_property(&self, _name: &str) -> Option<BxValue> { None }
+    fn is_readonly(&self) -> bool { false }
     fn set_property(&mut self, name: &str, value: BxValue);
     fn call_method(&mut self, vm: &mut dyn BxVM, id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String>;
     #[cfg(not(target_arch = "wasm32"))]

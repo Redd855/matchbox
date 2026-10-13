@@ -23,6 +23,67 @@ impl ScopeBinding {
     }
 }
 
+// ponytail: index the first 32 slots; wider frames keep the map to cap sparse memory.
+pub(super) enum SlotBindings {
+    Dense(Vec<Option<ScopeBinding>>),
+    Sparse(std::collections::HashMap<usize, ScopeBinding>),
+}
+
+impl SlotBindings {
+    pub(super) fn new() -> Self { Self::Dense(Vec::new()) }
+    pub(super) fn get(&self, slot: &usize) -> Option<&ScopeBinding> {
+        match self { Self::Dense(v) => v.get(*slot)?.as_ref(), Self::Sparse(m) => m.get(slot) }
+    }
+    fn get_mut(&mut self, slot: &usize) -> Option<&mut ScopeBinding> {
+        match self { Self::Dense(v) => v.get_mut(*slot)?.as_mut(), Self::Sparse(m) => m.get_mut(slot) }
+    }
+    fn insert(&mut self, slot: usize, binding: ScopeBinding) -> Option<ScopeBinding> {
+        if slot >= 32 && let Self::Dense(v) = self {
+            *self = Self::Sparse(v.iter().enumerate().filter_map(|(i, b)| b.map(|b| (i, b))).collect());
+        }
+        match self {
+            Self::Dense(v) => { if v.len() <= slot { v.resize(slot + 1, None); } v[slot].replace(binding) }
+            Self::Sparse(m) => m.insert(slot, binding),
+        }
+    }
+    pub(super) fn remove(&mut self, slot: &usize) -> Option<ScopeBinding> {
+        match self { Self::Dense(v) => v.get_mut(*slot)?.take(), Self::Sparse(m) => m.remove(slot) }
+    }
+    pub(super) fn iter(&self) -> impl Iterator<Item = (usize, &ScopeBinding)> {
+        let (dense, sparse) = match self { Self::Dense(v) => (Some(v), None), Self::Sparse(m) => (None, Some(m)) };
+        dense.into_iter().flat_map(|v| v.iter().enumerate().filter_map(|(i, b)| b.as_ref().map(|b| (i, b))))
+            .chain(sparse.into_iter().flat_map(|m| m.iter().map(|(&i, b)| (i, b))))
+    }
+    pub(super) fn values(&self) -> impl Iterator<Item = &ScopeBinding> { self.iter().map(|(_, b)| b) }
+    fn retain(&mut self, mut keep: impl FnMut(&usize, &mut ScopeBinding) -> bool) {
+        match self {
+            Self::Dense(v) => { for (i, b) in v.iter_mut().enumerate() { if b.as_mut().is_some_and(|b| !keep(&i, b)) { *b = None; } } }
+            Self::Sparse(m) => m.retain(keep),
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_binding_tests {
+    use super::{ScopeBinding, SlotBindings};
+    #[test]
+    fn indexed_and_sparse_binding_operations_match_map() {
+        let mut bindings = SlotBindings::new(); let mut oracle = std::collections::HashMap::new();
+        for slot in [3, 0, 31, 3, 65_535, usize::MAX, 32, 2] {
+            let b = ScopeBinding::new(slot as u32, slot % 2 == 0);
+            assert_eq!(bindings.insert(slot, b).map(|b| b.key), oracle.insert(slot, b).map(|b| b.key));
+            for i in [0, 1, 2, 3, 31, 32, 65_535, usize::MAX] { assert_eq!(bindings.get(&i).map(|b| b.key), oracle.get(&i).map(|b| b.key)); }
+        }
+        bindings.get_mut(&3).unwrap().shape = Some(42); oracle.get_mut(&3).unwrap().shape = Some(42);
+        assert_eq!(bindings.get(&3).unwrap().shape, oracle[&3].shape);
+        for slot in [0, 65_535, 1, usize::MAX] { assert_eq!(bindings.remove(&slot).map(|b| b.key), oracle.remove(&slot).map(|b| b.key)); }
+        bindings.retain(|i, b| { b.index = Some(7); *i >= 3 }); oracle.retain(|i, b| { b.index = Some(7); *i >= 3 });
+        let mut actual: Vec<_> = bindings.iter().map(|(i, b)| (i, b.key, b.local, b.shape, b.index, b.write_ready)).collect(); actual.sort_unstable();
+        let mut expected: Vec<_> = oracle.iter().map(|(&i, b)| (i, b.key, b.local, b.shape, b.index, b.write_ready)).collect(); expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+}
+
 impl VM {
     pub(super) fn arguments_scope(&self, fiber: usize) -> Option<BxValue> {
         let frame = self.fibers[fiber].frames.last()?;
@@ -195,7 +256,7 @@ impl VM {
         let mut slots: Vec<_> = frame
             .local_names
             .iter()
-            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
+            .filter_map(|(slot, binding)| binding.local.then_some(slot))
             .chain(0..frame.function.params.len())
             .filter(|slot| base + slot < self.fibers[fiber].stack.len())
             .collect();

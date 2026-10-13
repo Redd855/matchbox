@@ -350,7 +350,7 @@ impl super::super::VM {
         let slots = frame
             .local_names
             .iter()
-            .filter_map(|(&slot, binding)| binding.local.then_some(slot + 1))
+            .filter_map(|(slot, binding)| binding.local.then_some(slot + 1))
             .max()?;
         if slots > 32 || self.fibers[fiber].stack.len() != base + slots {
             return None;
@@ -358,7 +358,7 @@ impl super::super::VM {
         let writable = frame
             .local_names
             .iter()
-            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
+            .filter_map(|(slot, binding)| binding.local.then_some(slot))
             .fold(0u32, |mask, slot| mask | (1 << slot));
         let owner = Arc::clone(&frame.chunk.borrow().program);
         let key = (Arc::as_ptr(&owner) as usize, entry, slots as u32, writable);

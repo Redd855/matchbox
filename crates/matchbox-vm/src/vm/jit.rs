@@ -418,7 +418,7 @@ impl super::VM {
         let frame = self.fibers[fiber].frames.last().unwrap();
         let base = frame.stack_base;
         let slots = frame.local_names.iter()
-            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
+            .filter_map(|(slot, binding)| binding.local.then_some(slot))
             .max().map(|slot| slot + 1)?;
         // ponytail: fixed 32-slot rollback checkpoint; add dynamically rooted
         // spills only if a measured workload needs larger nonallocating kernels.
@@ -428,7 +428,7 @@ impl super::VM {
         let writable = frame
             .local_names
             .iter()
-            .filter_map(|(&slot, binding)| binding.local.then_some(slot))
+            .filter_map(|(slot, binding)| binding.local.then_some(slot))
             .fold(0u32, |mask, slot| mask | (1 << slot));
         let program = Arc::clone(&frame.chunk.borrow().program);
         let key = (

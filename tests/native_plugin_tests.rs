@@ -1148,6 +1148,48 @@ assert StaticProbe.answer(right=3, left=4) == 7;
 }
 
 #[test]
+fn module_classes_exclude_build_outputs_but_keep_nested_source_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("module");
+    fs::create_dir(&module).unwrap();
+    fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
+    // Non-class scripts are not module classes; strings/comments are not declarations.
+    fs::write(module.join("Script.bxs"),
+        "// class NotADeclaration {}\nvar text = 'class Fake {}'; var kind = types.Class; var keys = [Class:'kind']; var unfinished = [:").unwrap();
+    let mut source = String::new();
+    for name in ["build", "dist", "target"] {
+        fs::create_dir_all(module.join(name).join("fixtures")).unwrap();
+        fs::write(module.join(name).join("fixtures/Incomplete.bx"), "class { function broken( }").unwrap();
+        fs::write(module.join(name).join("Incomplete.bxs"), "class { function broken( }").unwrap();
+        // These names are valid below a source directory, not globally reserved.
+        fs::create_dir_all(module.join("models").join(name)).unwrap();
+        fs::write(module.join("models").join(name).join("Kept.bx"),
+            "class { function value() { return 42; } }").unwrap();
+        source.push_str(&format!("assert new bxModules.module.models.{name}.Kept().value() == 42;\n"));
+    }
+    source.push_str("println('module source boundaries OK');");
+    fs::write(dir.path().join("app.bxs"), source).unwrap();
+    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    success(&output);
+    assert_eq!(output.stdout, b"module source boundaries OK\n");
+    fs::write(module.join("Broken.bxs"), "class { function broken( }").unwrap();
+    let invalid = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("Broken.bxs"));
+    fs::remove_file(module.join("Broken.bxs")).unwrap();
+    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
+    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    fs::remove_dir_all(module).unwrap();
+    fs::remove_file(dir.path().join("app.bxs")).unwrap();
+    for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("application"))
+        .env("MATCHBOX_NATIVE_CACHE", dir.path().join("fresh-cache"))
+        .current_dir(dir.path()).output().unwrap()] {
+        success(&output);
+        assert_eq!(output.stdout, b"module source boundaries OK\n");
+    }
+}
+
+#[test]
 fn module_names_mappings_dependencies_and_disabled_descriptors() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["consumer-dir", "provider-dir", "disabled"] {

@@ -63,6 +63,8 @@ At execution, load native providers, instantiate descriptors, call `configure()`
 
 Package `.bx`/`.bxs` class declarations are embedded under private identities, then bound to the resolved mapping paths at execution, before `configure()`. Surrounding script statements are not executed when loading those declarations. Constructors and imported class references work after removing the source package; named/default `init()` arguments, null-returning initializers, and static method calls/references use the shared VM invocation machinery. Only classes contained in the packaged module are embedded—mapping metadata can describe other paths, but classes from those paths are not bundled or loaded automatically. Implicit constructor arguments and constructor spreads fail explicitly until supported.
 
+Module-root `build/`, `dist/`, and `target/` directories are authoring outputs, not class sources: their contents are neither parsed nor embedded. This lets development checkouts retain generated packages and malformed test fixtures without loading them as module classes. These names remain valid below source directories such as `models/build/`. Non-BIF `.bxs` scripts are conservatively screened for class declarations using the lexer; comments, string contents, member names and struct keys do not turn them into class sources. Candidate class scripts still undergo normal syntax validation; surrounding script statements remain unexecuted.
+
 This is BoxLang package-class resolution, distinct from the class-provider boundary below. Arbitrary runtime mappings, source/template loading, and complete BoxLang static scopes remain separate work.
 
 ### Module-owned Java class providers

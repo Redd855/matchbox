@@ -1,7 +1,7 @@
 //! Compile module descriptors without executing them; resolve prebuilt native artifacts.
 use crate::modules::ModuleInfo;
 use anyhow::{Context, Result, bail};
-use matchbox_compiler::{ast::*, parser};
+use matchbox_compiler::{ast::*, parser, tokenizer::{lex, TokenKind}};
 use matchbox_vm::{
     Chunk,
     bundle::{Artifact, Bif, BifMember, Component, Module, ModuleClass, SharedLibrary, TARGET},
@@ -113,6 +113,21 @@ pub fn prepare(modules: &[ModuleInfo], target: &str) -> Result<Vec<Module>> {
                 let name = relative.with_extension("").to_string_lossy().replace(['/', '\\'], ".");
                 let global = format!("__mb_class_{index}_{class_index}");
                 let source = fs::read_to_string(&file)?;
+                if file.extension().is_some_and(|extension| extension == "bxs") {
+                    // ponytail: conservative lexer filter; ambiguous scripts still parse.
+                    // Use parser-level declaration discovery if further exclusions are needed.
+                    let lexed = lex(&source);
+                    let tokens = lexed.tokens();
+                    let has_class = tokens.iter().enumerate().any(|(i, token)| {
+                        if token.kind != TokenKind::Class { return false; }
+                        let previous = i.checked_sub(1).map(|p| tokens[p].kind);
+                        let member = matches!(previous, Some(TokenKind::Dot | TokenKind::QuestionDot | TokenKind::ColonColon));
+                        let key = matches!(previous, Some(TokenKind::LeftBrace | TokenKind::LeftBracket | TokenKind::Comma))
+                            && tokens.get(i + 1).is_some_and(|next| next.kind == TokenKind::Colon);
+                        !member && !key
+                    });
+                    if !has_class { continue; }
+                }
                 let mut ast = parser::parse(&source, file.to_str())?;
                 if !ast.iter().any(|s| matches!(s.kind, StatementKind::ClassDecl { .. })) { continue; }
                 // Loading a class must not execute surrounding script/application statements.
@@ -156,7 +171,10 @@ fn class_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
-            if path == root.join("bifs") || entry.file_name() == ".git" { continue; }
+            // BIFs are compiled separately; module-root build outputs are not source packages.
+            let excluded_root = directory == root
+                && matches!(entry.file_name().to_str(), Some("bifs" | "build" | "dist" | "target"));
+            if excluded_root || entry.file_name() == ".git" { continue; }
             let kind = entry.file_type()?;
             if kind.is_dir() { visit(root, &path, files)?; }
             else if path.extension().is_some_and(|extension| extension == "bx" || extension == "bxs") && path != root.join("ModuleConfig.bx") {

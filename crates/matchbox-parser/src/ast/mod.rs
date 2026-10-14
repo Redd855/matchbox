@@ -1,12 +1,22 @@
+use crate::tokenizer::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub kind: StatementKind,
     pub line: u32,
+    pub span: Option<Span>,
+    pub body_span: Option<Span>,
+    pub incomplete: bool,
 }
 
 impl Statement {
     pub fn new(kind: StatementKind, line: u32) -> Self {
-        Self { kind, line }
+        Self { kind, line, span: None, body_span: None, incomplete: false }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
     }
 }
 
@@ -46,6 +56,7 @@ pub enum StatementKind {
     },
     ClassDecl {
         name: String,
+        attributes: Vec<Attribute>,
         modifiers: ClassModifiers,
         extends: Option<String>,
         accessors: bool,
@@ -124,6 +135,11 @@ pub enum StatementKind {
         name: String,
         value: Expression,
     },
+    Component {
+        name: String,
+        attributes: Vec<(Expression, Expression)>,
+        body: Option<Vec<Statement>>,
+    },
     Expression(Expression),
 }
 
@@ -147,19 +163,41 @@ pub enum DestructureKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClassMember {
-    Property(String),
+    Property(PropertyDeclaration),
     Statement(Statement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyDeclaration {
+    pub name: String,
+    pub annotations: Vec<PropertyAnnotation>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyAnnotation {
+    pub key: String,
+    pub key_span: Span,
+    pub value: Option<Expression>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expression {
     pub kind: ExpressionKind,
     pub line: u32,
+    pub span: Option<Span>,
+    pub incomplete: bool,
 }
 
 impl Expression {
     pub fn new(kind: ExpressionKind, line: u32) -> Self {
-        Self { kind, line }
+        Self { kind, line, span: None, incomplete: false }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
     }
 }
 
@@ -255,6 +293,7 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionBody {
     Block(Vec<Statement>),
+    Component(Vec<Statement>),
     Expression(Box<Expression>),
     Abstract,
 }

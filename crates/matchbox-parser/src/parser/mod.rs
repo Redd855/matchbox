@@ -84,6 +84,9 @@ pub fn parse_bxm(source: &str, filename: Option<&str>) -> Result<Vec<Statement>>
 
 pub fn parse(source: &str, filename: Option<&str>) -> Result<Vec<Statement>> {
     let lexed = lex(source);
+    if let Some((span, message)) = lexed.errors().first() {
+        return Err(ParseError::new(filename, *span, message).with_source(source).into());
+    }
     match Parser::new(source, lexed.tokens(), filename).parse_program() {
         Ok(stmts) => Ok(stmts),
         Err(err) => {
@@ -99,6 +102,20 @@ pub fn parse(source: &str, filename: Option<&str>) -> Result<Vec<Statement>> {
             Err(err)
         }
     }
+}
+
+/// Editor inspection retains valid statements within their original scopes and reports recovered errors.
+pub fn parse_recover(source: &str, filename: Option<&str>) -> (Vec<Statement>, Vec<ParseError>) {
+    let lexed = lex(source);
+    let mut errors: Vec<_> = lexed.errors().iter().map(|(span, message)|
+        ParseError::new(filename, *span, message).with_source(source)).collect();
+    let tokens: Vec<_> = lexed.tokens().iter().copied().filter(|token|
+        !lexed.errors().iter().any(|(span, _)| token.span.start >= span.start && token.span.start < span.end)).collect();
+    let mut parser = Parser::new(source, &tokens, filename);
+    parser.issues = Some(Vec::new());
+    let statements = parser.parse_program().expect("recovery records statement errors");
+    errors.extend(parser.issues.take().unwrap());
+    (statements, errors)
 }
 
 /// Parse `source` as if it began at `line_offset` blank lines. Used by the
@@ -145,11 +162,13 @@ struct Parser<'a> {
     tokens: &'a [SyntaxToken],
     pos: usize,
     filename: Option<&'a str>,
+    issues: Option<Vec<ParseError>>,
+    unclosed_blocks: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(source: &'a str, tokens: &'a [SyntaxToken], filename: Option<&'a str>) -> Self {
-        Self { source, tokens, pos: 0, filename }
+        Self { source, tokens, pos: 0, filename, issues: None, unclosed_blocks: 0 }
     }
 
     fn kind(&self, offset: usize) -> Option<TokenKind> {
@@ -173,28 +192,22 @@ impl<'a> Parser<'a> {
     /// is one past the end of the last token so the caret sits at true
     /// end-of-input rather than re-pointing at the previously-consumed token.
     fn current_span(&self) -> Span {
-        if let Some(tok) = self.tokens.get(self.pos) {
-            return tok.span;
+        self.tokens.get(self.pos).map(|token| token.span)
+            .unwrap_or_else(|| Span::at(self.source, self.source.len(), self.source.len()))
+    }
+
+    fn span_since(&self, start: usize) -> Span {
+        let mut span = self.tokens.get(start).map(|token| token.span)
+            .unwrap_or_else(|| self.current_span());
+        if self.pos > start {
+            if let Some(last) = self.tokens.get(self.pos.saturating_sub(1)) { span.end = last.span.end; }
         }
-        // No current token: synthesize an EOF span just past the last token.
-        let eof_byte = self.source.len();
-        match self.tokens.last() {
-            Some(last) => {
-                let last_len = last.span.end.saturating_sub(last.span.start) as u32;
-                Span {
-                    start: eof_byte,
-                    end: eof_byte,
-                    line: last.span.line,
-                    col: last.span.col.saturating_add(last_len),
-                }
-            }
-            None => Span {
-                start: eof_byte,
-                end: eof_byte,
-                line: 1,
-                col: 1,
-            },
-        }
+        span
+    }
+
+    fn span_from(&self, mut span: Span) -> Span {
+        if let Some(last) = self.tokens.get(self.pos.saturating_sub(1)) { span.end = last.span.end; }
+        span
     }
 
     fn peek_is(&self, kind: TokenKind) -> bool {
@@ -341,23 +354,81 @@ impl<'a> Parser<'a> {
     fn parse_program(&mut self) -> Result<Vec<Statement>> {
         let mut stmts = Vec::new();
         while self.peek_kind().is_some() {
-            stmts.push(self.parse_statement()?);
+            let start = self.pos;
+            match self.parse_statement() {
+                Ok(statement) => stmts.push(statement),
+                Err(error) => self.recover_statement(error, start, false)?,
+            }
         }
         Ok(stmts)
     }
 
+    fn record_issue(&mut self, error: anyhow::Error) -> Result<()> {
+        if self.issues.is_none() { return Err(error); }
+        let issue = error.downcast_ref::<ParseError>().cloned()
+            .unwrap_or_else(|| self.error_current(error.to_string()));
+        self.issues.as_mut().unwrap().push(issue);
+        Ok(())
+    }
+
+    fn recover_statement(&mut self, error: anyhow::Error, start: usize, in_block: bool) -> Result<()> {
+        self.record_issue(error)?;
+        // Rescan the failed statement so consumed delimiters cannot steal the enclosing brace.
+        self.pos = start;
+        let mut braces = 0usize;
+        let mut parens = 0usize;
+        let mut brackets = 0usize;
+        while let Some(kind) = self.peek_kind() {
+            if braces == 0 && kind == TokenKind::RightBrace {
+                if !in_block { self.pos += 1; }
+                break;
+            }
+            if braces == 0 && parens == 0 && brackets == 0 {
+                if kind == TokenKind::Semicolon { self.pos += 1; break; }
+                if self.pos > start && matches!(kind, TokenKind::Function | TokenKind::Class | TokenKind::Var | TokenKind::Return) { break; }
+            }
+            match kind {
+                TokenKind::LeftBrace => braces += 1,
+                TokenKind::RightBrace => braces = braces.saturating_sub(1),
+                TokenKind::LeftParen => parens += 1,
+                TokenKind::RightParen => parens = parens.saturating_sub(1),
+                TokenKind::LeftBracket => brackets += 1,
+                TokenKind::RightBracket => brackets = brackets.saturating_sub(1),
+                _ => {},
+            }
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
     fn parse_statement(&mut self) -> Result<Statement> {
+        let start = self.pos;
+        let unclosed = self.unclosed_blocks;
+        let mut statement = self.parse_statement_inner()?;
+        let mut span = self.span_since(start);
+        statement.incomplete = self.unclosed_blocks > unclosed;
+        if statement.incomplete {
+            span.end = self.source.len();
+            if let Some(body) = statement.body_span.as_mut() { body.end = self.source.len(); }
+        }
+        Ok(statement.with_span(span))
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Statement> {
         let line = self.peek_line();
 
+        if self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon) {
+            return self.parse_component_statement(line);
+        }
         match self.peek_kind() {
             Some(TokenKind::Import) => self.parse_import(line),
-            Some(TokenKind::Class) | Some(TokenKind::Abstract) | Some(TokenKind::Final)
+            Some(TokenKind::Class) | Some(TokenKind::Abstract) | Some(TokenKind::Final) | Some(TokenKind::At)
                 if self.is_class_decl() =>
             {
                 self.parse_class(line)
             }
             Some(TokenKind::Interface) => self.parse_interface(line),
-            Some(TokenKind::Function) | Some(TokenKind::At)
+            Some(TokenKind::Function) | Some(TokenKind::At) | Some(TokenKind::Identifier)
             | Some(TokenKind::Public) | Some(TokenKind::Private)
             | Some(TokenKind::Remote) | Some(TokenKind::Package)
             | Some(TokenKind::Static) | Some(TokenKind::Abstract) | Some(TokenKind::Final)
@@ -396,8 +467,50 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn is_function_decl(&self) -> bool {
+    fn declaration_start(&self) -> usize {
         let mut i = self.pos;
+        while self.tokens.get(i).is_some_and(|t| t.kind == TokenKind::At) {
+            i += 2; // @ and annotation name
+            if self.tokens.get(i).is_some_and(|t| t.kind == TokenKind::LeftParen) {
+                let mut depth = 0;
+                while let Some(token) = self.tokens.get(i) {
+                    i += 1;
+                    match token.kind {
+                        TokenKind::LeftParen => depth += 1,
+                        TokenKind::RightParen => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            while self.tokens.get(i).is_some_and(|t| t.kind == TokenKind::Semicolon) { i += 1; }
+        }
+        i
+    }
+
+    fn parse_attributes(&mut self) -> Result<Vec<Attribute>> {
+        let mut attributes = Vec::new();
+        while self.peek_is(TokenKind::At) {
+            self.pos += 1;
+            let name = self.expect_get(TokenKind::Identifier)?;
+            let args = if self.peek_is(TokenKind::LeftParen) {
+                self.pos += 1;
+                let args = self.parse_args()?;
+                self.expect(TokenKind::RightParen)?;
+                args
+            } else {
+                vec![]
+            };
+            attributes.push(Attribute { name, args });
+            while self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
+        }
+        Ok(attributes)
+    }
+
+    fn is_function_decl(&self) -> bool {
+        let mut i = self.declaration_start();
         while i < self.tokens.len() {
             match self.tokens[i].kind {
                 TokenKind::At | TokenKind::Public | TokenKind::Private | TokenKind::Remote
@@ -427,7 +540,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_class_decl(&self) -> bool {
-        let mut i = self.pos;
+        let mut i = self.declaration_start();
         while i < self.tokens.len() {
             match self.tokens[i].kind {
                 TokenKind::Abstract | TokenKind::Final => {
@@ -442,6 +555,19 @@ impl<'a> Parser<'a> {
     }
 
     // ---- Statement parsers ----
+
+    fn parse_component_statement(&mut self, line: u32) -> Result<Statement> {
+        self.pos += 2; // bx:
+        let name = self.expect_get(TokenKind::Identifier)?;
+        let mut attributes = Vec::new();
+        while self.peek_is(TokenKind::Identifier) {
+            let key = self.advance_lexeme().unwrap();
+            let value = if self.peek_is(TokenKind::Equal) { self.pos += 1; self.parse_expression()? } else { Expression::new(ExpressionKind::Literal(Literal::Boolean(true)),line) };
+            attributes.push((Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(key)])),line),value));
+        }
+        let body = if self.peek_is(TokenKind::LeftBrace) { self.pos += 1; Some(self.parse_block()?) } else { self.expect(TokenKind::Semicolon)?; None };
+        template::component_statement(&name, attributes, body, line)
+    }
 
     fn parse_import(&mut self, line: u32) -> Result<Statement> {
         self.pos += 1; // import
@@ -473,6 +599,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_class(&mut self, line: u32) -> Result<Statement> {
+        let mut attributes = self.parse_attributes()?;
         let mut modifiers = crate::ast::ClassModifiers::default();
         while matches!(self.peek_kind(), Some(TokenKind::Abstract) | Some(TokenKind::Final)) {
             match self.peek_kind() {
@@ -483,7 +610,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         self.expect(TokenKind::Class)?;
-        let name = if self.peek_is(TokenKind::Identifier) {
+        let name = if self.peek_is(TokenKind::Identifier)
+            && !matches!(self.kind(1), Some(TokenKind::Equal | TokenKind::Colon))
+            && !self.peek_lexeme().is_some_and(|s| s.eq_ignore_ascii_case("boxBif") || s.eq_ignore_ascii_case("boxMember"))
+        {
             self.advance_lexeme().unwrap_or_default()
         } else {
             String::new()
@@ -496,47 +626,81 @@ impl<'a> Parser<'a> {
             Some(TokenKind::Extends) | Some(TokenKind::Accessors) | Some(TokenKind::Implements)
             | Some(TokenKind::Identifier)
         ) {
-            let attr_name = self.peek_lexeme().unwrap_or("").to_string();
-            if matches!(attr_name.as_str(), "extends" | "accessors" | "implements") {
-                self.pos += 1; // attr name
-                self.expect(TokenKind::Equal)?;
-                let val = if self.peek_kind() == Some(TokenKind::String) {
-                    let s = self.peek_lexeme().unwrap_or("").to_string();
-                    self.pos += 1;
-                    if s.len() >= 2 { s[1..s.len() - 1].to_string() } else { s }
-                } else {
-                    return Err(self
-                        .error_current(format!("expected string value for '{}'", attr_name))
-                        .into());
-                };
-                match attr_name.as_str() {
-                    "extends" => extends = Some(val),
-                    "accessors" => accessors = val.to_lowercase() == "true",
-                    "implements" => implements = val.split(',').map(|s| s.trim().to_string()).collect(),
-                    _ => {}
-                }
-            } else {
-                break;
+            let attr_name = self.advance_lexeme().unwrap_or_default();
+            let value = if matches!(self.peek_kind(), Some(TokenKind::Equal | TokenKind::Colon)) {
+                self.pos += 1;
+                Some(self.parse_expression()?)
+            } else { None };
+            let text = value.as_ref().and_then(|v| match &v.kind {
+                ExpressionKind::Literal(Literal::String(parts)) => parts.iter().map(|part| {
+                    match part { StringPart::Text(text) => Some(text.as_str()), _ => None }
+                }).collect::<Option<String>>(),
+                ExpressionKind::Literal(Literal::Boolean(value)) => Some(value.to_string()),
+                _ => None,
+            });
+            match attr_name.to_ascii_lowercase().as_str() {
+                "extends" => extends = Some(text.ok_or_else(|| self.error_current("extends requires a string"))?),
+                "accessors" => accessors = text.as_deref().unwrap_or("true").eq_ignore_ascii_case("true"),
+                "implements" => implements = text.ok_or_else(|| self.error_current("implements requires a string"))?.split(',').map(|s| s.trim().to_string()).collect(),
+                _ => attributes.push(Attribute { name: attr_name, args: value.into_iter().map(|value| Argument { name: None, value }).collect() }),
             }
         }
 
+        let body_start = self.pos;
         self.expect(TokenKind::LeftBrace)?;
         let mut members = Vec::new();
-        while !self.peek_is(TokenKind::RightBrace) {
-            if self.peek_is(TokenKind::Property) {
-                self.pos += 1; // property
-                let prop_name = self.expect_get(TokenKind::Identifier)?;
-                members.push(ClassMember::Property(prop_name));
-                if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
+        while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
+            let start = self.pos;
+            let member = if self.peek_is(TokenKind::Property) {
+                self.parse_property().map(ClassMember::Property)
             } else {
-                members.push(ClassMember::Statement(self.parse_statement()?));
+                self.parse_statement().map(ClassMember::Statement)
+            };
+            match member {
+                Ok(member) => members.push(member),
+                Err(error) => self.recover_statement(error, start, true)?,
             }
         }
-        self.pos += 1; // }
-        Ok(Statement::new(
-            StatementKind::ClassDecl { name, modifiers, extends, accessors, implements, members },
+        self.close_block()?;
+        let mut statement = Statement::new(
+            StatementKind::ClassDecl { name, attributes, modifiers, extends, accessors, implements, members },
             line,
-        ))
+        );
+        statement.body_span = Some(self.span_since(body_start));
+        Ok(statement)
+    }
+
+    fn parse_property(&mut self) -> Result<PropertyDeclaration> {
+        let start = self.pos;
+        self.expect(TokenKind::Property)?;
+        let mut annotations = Vec::new();
+        while matches!(self.peek_kind(), Some(TokenKind::Identifier | TokenKind::Default | TokenKind::Required)) {
+            let annotation_start = self.pos;
+            let mut key = self.advance_lexeme().unwrap();
+            while self.peek_is(TokenKind::Dot) {
+                self.pos += 1;
+                key.push('.');
+                key.push_str(&self.expect_get(TokenKind::Identifier)?);
+            }
+            let key_span = self.span_since(annotation_start);
+            let value = if self.peek_is(TokenKind::Equal) {
+                self.pos += 1;
+                Some(self.parse_expression()?)
+            } else { None };
+            annotations.push(PropertyAnnotation { key, key_span, value, span: self.span_since(annotation_start) });
+        }
+        let name = if let Some(annotation) = annotations.iter().find(|annotation| annotation.key.eq_ignore_ascii_case("name") && annotation.value.is_some()) {
+            match &annotation.value.as_ref().unwrap().kind {
+                ExpressionKind::Literal(Literal::String(parts)) => parts.iter().map(|part| match part {
+                    StringPart::Text(text) => Some(text.as_str()), _ => None,
+                }).collect::<Option<String>>(),
+                _ => None,
+            }
+        } else {
+            annotations.iter().rev().find(|annotation| annotation.value.is_none()).map(|annotation| annotation.key.clone())
+        }.filter(|name| !name.is_empty()).ok_or_else(|| self.error_current("property requires a nonempty literal name"))?;
+        if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
+        Ok(PropertyDeclaration { name, annotations, span: self.span_since(start) })
     }
 
     fn parse_interface(&mut self, line: u32) -> Result<Statement> {
@@ -547,28 +711,12 @@ impl<'a> Parser<'a> {
             String::new()
         };
         self.expect(TokenKind::LeftBrace)?;
-        let mut members = Vec::new();
-        while !self.peek_is(TokenKind::RightBrace) {
-            members.push(self.parse_statement()?);
-        }
-        self.pos += 1; // }
+        let members = self.parse_block()?;
         Ok(Statement::new(StatementKind::InterfaceDecl { name, members }, line))
     }
 
     fn parse_function_decl(&mut self, line: u32) -> Result<Statement> {
-        let mut attributes = Vec::new();
-        while self.peek_is(TokenKind::At) {
-            self.pos += 1; // @
-            let attr_name = self.expect_get(TokenKind::Identifier)?;
-            let mut args = Vec::new();
-            if self.peek_is(TokenKind::LeftParen) {
-                self.pos += 1; // (
-                args = self.parse_args()?;
-                self.expect(TokenKind::RightParen)?;
-            }
-            attributes.push(Attribute { name: attr_name, args });
-        }
-
+        let attributes = self.parse_attributes()?;
         let mut modifiers = crate::ast::FunctionModifiers::default();
         loop {
             match self.peek_kind() {
@@ -604,6 +752,7 @@ impl<'a> Parser<'a> {
         let params = self.parse_params()?;
         self.expect(TokenKind::RightParen)?;
 
+        let body_start = self.pos;
         let body = if self.peek_is(TokenKind::LeftBrace) {
             self.pos += 1; // {
             FunctionBody::Block(self.parse_block()?)
@@ -614,10 +763,13 @@ impl<'a> Parser<'a> {
             FunctionBody::Abstract
         };
 
-        Ok(Statement::new(
+        let body_span = if matches!(body, FunctionBody::Block(_)) { Some(self.span_since(body_start)) } else { None };
+        let mut statement = Statement::new(
             StatementKind::FunctionDecl { name, attributes, modifiers, return_type, params, body },
             line,
-        ))
+        );
+        statement.body_span = body_span;
+        Ok(statement)
     }
 
     fn parse_params(&mut self) -> Result<Vec<FunctionParam>> {
@@ -678,10 +830,22 @@ impl<'a> Parser<'a> {
     fn parse_block(&mut self) -> Result<Vec<Statement>> {
         let mut stmts = Vec::new();
         while !self.peek_is(TokenKind::RightBrace) && self.peek_kind().is_some() {
-            stmts.push(self.parse_statement()?);
+            let start = self.pos;
+            match self.parse_statement() {
+                Ok(statement) => stmts.push(statement),
+                Err(error) => self.recover_statement(error, start, true)?,
+            }
         }
-        self.pos += 1; // }
+        self.close_block()?;
         Ok(stmts)
+    }
+
+    fn close_block(&mut self) -> Result<()> {
+        if let Err(error) = self.expect(TokenKind::RightBrace) {
+            self.record_issue(error.into())?;
+            self.unclosed_blocks += 1;
+        }
+        Ok(())
     }
 
     fn parse_for(&mut self, line: u32) -> Result<Statement> {
@@ -777,6 +941,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for_init(&mut self) -> Result<Statement> {
+        let start = self.pos;
         if self.peek_is(TokenKind::Var) {
             let line = self.peek_line();
             self.pos += 1; // var
@@ -786,11 +951,11 @@ impl<'a> Parser<'a> {
             return Ok(Statement::new(
                 StatementKind::VariableDecl { name, value },
                 line,
-            ));
+            ).with_span(self.span_since(start)));
         }
         // Assignment or expression (don't consume trailing semicolon)
         let expr = self.parse_expression()?;
-        Ok(Statement::new(StatementKind::Expression(expr), self.peek_line()))
+        Ok(Statement::new(StatementKind::Expression(expr), self.peek_line()).with_span(self.span_since(start)))
     }
 
     fn parse_for_body(&mut self) -> Result<Vec<Statement>> {
@@ -1174,6 +1339,9 @@ impl<'a> Parser<'a> {
     }
 
     fn at_statement_boundary(&self) -> bool {
+        if self.peek_is(TokenKind::Function) && self.kind(1) == Some(TokenKind::LeftParen) {
+            return false;
+        }
         matches!(self.peek_kind(),
             Some(TokenKind::RightBrace) | Some(TokenKind::Case) | Some(TokenKind::Default)
             | Some(TokenKind::Import) | Some(TokenKind::Class) | Some(TokenKind::Interface)
@@ -1187,7 +1355,13 @@ impl<'a> Parser<'a> {
     // ---- Expression parser (Pratt) ----
 
     fn parse_expression(&mut self) -> Result<Expression> {
-        self.parse_assignment_or_conditional()
+        let start = self.pos;
+        let unclosed = self.unclosed_blocks;
+        let mut expression = self.parse_assignment_or_conditional()?;
+        let mut span = self.span_since(start);
+        expression.incomplete = self.unclosed_blocks > unclosed;
+        if expression.incomplete { span.end = self.source.len(); }
+        Ok(expression.with_span(span))
     }
 
     fn parse_assignment_or_conditional(&mut self) -> Result<Expression> {
@@ -1221,13 +1395,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expression> {
+        let start = self.pos;
         let line = self.peek_line();
         let left = self.parse_unary()?;
-
-        self.parse_binary_tail(left, min_prec, line)
+        let expression = self.parse_binary_tail(left, min_prec, line)?;
+        Ok(expression.with_span(self.span_since(start)))
     }
 
     fn parse_binary_tail(&mut self, mut left: Expression, min_prec: u8, line: u32) -> Result<Expression> {
+        let start_span = left.span.unwrap_or_else(|| self.current_span());
         loop {
             if let Some((op_prec, op, consume)) = self.phrase_operator() {
                 if op_prec < min_prec {
@@ -1265,7 +1441,7 @@ impl<'a> Parser<'a> {
                 left = Expression::new(
                     ExpressionKind::Binary { left: Box::new(left), operator: op, right: Box::new(right) },
                     line,
-                );
+                ).with_span(self.span_from(start_span));
                 continue;
             }
 
@@ -1337,7 +1513,7 @@ impl<'a> Parser<'a> {
             left = Expression::new(
                 ExpressionKind::Binary { left: Box::new(left), operator: op, right: Box::new(right) },
                 line,
-            );
+            ).with_span(self.span_from(start_span));
         }
 
         // Check for simple assignment after primary
@@ -1367,6 +1543,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expression> {
+        let start = self.pos;
+        let expression = self.parse_unary_inner()?;
+        Ok(expression.with_span(self.span_since(start)))
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expression> {
         let line = self.peek_line();
         match self.peek_kind() {
             Some(TokenKind::Bang) => {
@@ -1410,6 +1592,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix(&mut self) -> Result<Expression> {
+        let start = self.pos;
         let line = self.peek_line();
         let mut expr = self.parse_primary()?;
 
@@ -1433,29 +1616,17 @@ impl<'a> Parser<'a> {
                         line,
                     );
                 }
-                Some(TokenKind::Dot) => {
-                    self.pos += 1; // .
-                    let member = if self.peek_is(TokenKind::Contains) {
-                        self.advance_lexeme().unwrap_or_default()
-                    } else {
-                        self.expect_get(TokenKind::Identifier)?
-                    };
-                    expr = Expression::new(
-                        ExpressionKind::MemberAccess { base: Box::new(expr), member },
-                        line,
-                    );
-                }
-                Some(TokenKind::QuestionDot) => {
-                    self.pos += 1; // ?.
-                    let member = if self.peek_is(TokenKind::Contains) {
-                        self.advance_lexeme().unwrap_or_default()
-                    } else {
-                        self.expect_get(TokenKind::Identifier)?
-                    };
-                    expr = Expression::new(
-                        ExpressionKind::SafeMemberAccess { base: Box::new(expr), member },
-                        line,
-                    );
+                Some(TokenKind::Dot | TokenKind::ColonColon | TokenKind::QuestionDot) => {
+                    let safe = self.peek_is(TokenKind::QuestionDot);
+                    self.pos += 1;
+                    let member = if self.peek_lexeme().is_some_and(|name| {
+                        name.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '$')
+                            && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+                    }) { self.advance_lexeme().unwrap() }
+                    else { self.expect_get(TokenKind::Identifier)? };
+                    let kind = if safe { ExpressionKind::SafeMemberAccess { base: Box::new(expr), member } }
+                        else { ExpressionKind::MemberAccess { base: Box::new(expr), member } };
+                    expr = Expression::new(kind, line);
                 }
                 Some(TokenKind::PlusPlus) | Some(TokenKind::MinusMinus) => {
                     let operator = self.advance_lexeme().unwrap_or_default();
@@ -1466,12 +1637,19 @@ impl<'a> Parser<'a> {
                 }
                 _ => break,
             }
+            expr = expr.with_span(self.span_since(start));
         }
 
         Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expression> {
+        let start = self.pos;
+        let expression = self.parse_primary_inner()?;
+        Ok(expression.with_span(self.span_since(start)))
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expression> {
         let line = self.peek_line();
 
         match self.peek_kind() {
@@ -1498,8 +1676,9 @@ impl<'a> Parser<'a> {
                 Ok(Expression::new(ExpressionKind::Identifier(name), line))
             }
             Some(TokenKind::String) => {
+                let offset = self.current_span().start;
                 let lexeme = self.advance_lexeme().unwrap_or_default();
-                let parts = parse_string_content(&lexeme);
+                let parts = parse_string_content(&lexeme, self.source, offset);
                 Ok(Expression::new(ExpressionKind::Literal(Literal::String(parts)), line))
             }
             Some(TokenKind::StringStart) => {
@@ -1733,7 +1912,12 @@ impl<'a> Parser<'a> {
                     Expression::new(ExpressionKind::Literal(Literal::Null), line),
                 ));
             } else {
-                let key = self.parse_expression()?;
+                let key = if self.tokens.get(self.pos + 1).is_some_and(|token| matches!(token.kind, TokenKind::Colon | TokenKind::Equal))
+                    && self.peek_lexeme().is_some_and(|key| key.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')) {
+                    let key = self.peek_lexeme().unwrap().to_owned();
+                    self.pos += 1;
+                    Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(key)])), line)
+                } else { self.parse_expression()? };
                 if !matches!(self.peek_kind(), Some(TokenKind::Colon) | Some(TokenKind::Equal)) {
                     return Err(self
                         .error_current("expected ':' or '=' in struct literal")
@@ -1877,7 +2061,7 @@ impl<'a> Parser<'a> {
 }
 
 // Parse string content (between quotes) into StringParts, handling #expr# interpolation
-fn parse_string_content(raw: &str) -> Vec<StringPart> {
+fn parse_string_content(raw: &str, source: &str, offset: usize) -> Vec<StringPart> {
     let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { return vec![]; };
     let quote = raw.chars().next().unwrap_or('"');
 
@@ -1893,6 +2077,11 @@ fn parse_string_content(raw: &str) -> Vec<StringPart> {
             continue;
         }
         if chars[i] == '#' {
+            if i + 1 < chars.len() && chars[i + 1] == '#' {
+                text.push('#');
+                i += 2;
+                continue;
+            }
             let closing = chars[i + 1..].iter().position(|character| *character == '#');
             let valid_interpolation = closing.is_some_and(|closing| {
                 let expression: String = chars[i + 1..i + 1 + closing].iter().collect();
@@ -1909,15 +2098,11 @@ fn parse_string_content(raw: &str) -> Vec<StringPart> {
                 continue;
             }
             i += 1;
-            if i < chars.len() && chars[i] == '#' {
-                text.push('#');
-                i += 1;
-                continue;
-            }
             // Interpolation start
             if !text.is_empty() {
                 parts.push(StringPart::Text(std::mem::take(&mut text)));
             }
+            let expression_start = i;
             let mut expr = String::new();
             while i < chars.len() {
                 if chars[i] == '"' {
@@ -1956,7 +2141,17 @@ fn parse_string_content(raw: &str) -> Vec<StringPart> {
             }
             if !expr.is_empty() {
                 let lexed = crate::tokenizer::lex(&expr);
-                let mut p = Parser::new(&expr, lexed.tokens(), None);
+                let base = offset + 1 + chars[..expression_start].iter().map(|ch| ch.len_utf8()).sum::<usize>();
+                let origin = Span::at(source, base, base);
+                let tokens: Vec<_> = lexed.tokens().iter().map(|token| {
+                    let mut token = *token;
+                    token.span.start += base;
+                    token.span.end += base;
+                    if token.span.line == 1 { token.span.col += origin.col - 1; }
+                    token.span.line += origin.line - 1;
+                    token
+                }).collect();
+                let mut p = Parser::new(source, &tokens, None);
                 if let Ok(e) = p.parse_expression() {
                     parts.push(StringPart::Expression(e));
                 }
@@ -1999,7 +2194,7 @@ fn expr_to_assignment_target(expr: &Expression) -> Result<AssignmentTarget> {
         }),
         _ => {
             // No parser context here; report against the expression's line.
-            let span = Span { start: 0, end: 0, line: expr.line, col: 1 };
+            let span = expr.span.unwrap_or(Span { start: 0, end: 0, line: expr.line, col: 1 });
             Err(ParseError::new(None, span, "invalid assignment target").into())
         }
     }
@@ -2051,6 +2246,13 @@ mod tests {
     }
 
     #[test]
+    fn typed_function_without_access_modifier() {
+        let ast = parse("numeric function answer() { return 42; }", None).unwrap();
+        assert_eq!(ast.len(), 1);
+        assert!(matches!(&ast[0].kind, StatementKind::FunctionDecl { return_type: Some(name), .. } if name == "numeric"));
+    }
+
+    #[test]
     fn parse_function_decl() {
         let ast = parse("function foo(x) { return x; }\n", None).unwrap();
         assert_eq!(ast.len(), 1);
@@ -2077,6 +2279,9 @@ mod tests {
         let ast = parse("for (var i = 0; i < 10; i = i + 1) { }\n", None).unwrap();
         assert_eq!(ast.len(), 1);
         assert!(matches!(ast[0].kind, StatementKind::ForClassic { .. }));
+        if let StatementKind::ForClassic { init: Some(init), .. } = &ast[0].kind {
+            assert_eq!((init.span.unwrap().start, init.span.unwrap().end), (5, 14));
+        }
     }
 
     #[test]
@@ -2183,7 +2388,7 @@ mod tests {
     fn preserves_backslash_sequences_in_string_literals() {
         let source = format!("{}{}{}{}", '"', char::from(92), 'n', '"');
         assert_eq!(
-            parse_string_content(&source),
+            parse_string_content(&source, &source, 0),
             vec![StringPart::Text(format!("{}{}", char::from(92), 'n'))]
         );
     }
@@ -2192,7 +2397,7 @@ mod tests {
     fn collapses_doubled_string_delimiters() {
         let source = format!("{}he{}{}llo{}", '"', '"', '"', '"');
         assert_eq!(
-            parse_string_content(&source),
+            parse_string_content(&source, &source, 0),
             vec![StringPart::Text("he\"llo".to_string())]
         );
     }

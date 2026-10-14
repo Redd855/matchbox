@@ -100,6 +100,8 @@ pub mod op {
     pub const STRICT_EQUAL: u8 = 88;
     pub const STRICT_NOT_EQUAL: u8 = 89;
     pub const SAFE_INDEX: u8 = 90;
+    pub const BIND_LOCAL: u8 = 91; // 2-word: op0=slot, w1=name_idx
+    pub const FUNCTION_ENTER: u8 = 92;
 }
 
 pub fn opcode_name(op: u8) -> &'static str {
@@ -195,6 +197,8 @@ pub fn opcode_name(op: u8) -> &'static str {
         op::STRICT_EQUAL => "STRICT_EQUAL",
         op::STRICT_NOT_EQUAL => "STRICT_NOT_EQUAL",
         op::SAFE_INDEX => "SAFE_INDEX",
+        op::BIND_LOCAL => "BIND_LOCAL",
+        op::FUNCTION_ENTER => "FUNCTION_ENTER",
         _ => "UNKNOWN",
     }
 }

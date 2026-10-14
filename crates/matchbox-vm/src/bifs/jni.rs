@@ -32,7 +32,33 @@ fn get_jvm() -> Result<Arc<JavaVM>, String> {
     res.clone()
 }
 
-pub fn create_java_object(
+/// Optional JNI backend: resolve without invoking a constructor.
+pub fn create_java_class(vm: &mut dyn BxVM, class_name: &str) -> Result<BxValue, String> {
+    #[cfg(target_arch = "wasm32")]
+    { let _ = (vm, class_name); Err("JNI class loading is not supported in WASM".into()) }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let jvm = get_jvm()?;
+        let mut env = jvm.attach_current_thread().map_err(|error| error.to_string())?;
+        env.find_class(class_name.replace('.', "/")).map_err(|error| format!("Java class not provided and JNI lookup failed for {class_name}: {error}"))?;
+        Ok(BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(JniClassReference(class_name.into()))))))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct JniClassReference(String);
+#[cfg(not(target_arch = "wasm32"))]
+impl BxNativeObject for JniClassReference {
+    fn get_property(&self, _name: &str) -> BxValue { BxValue::new_null() }
+    fn set_property(&mut self, _name: &str, _value: BxValue) {}
+    fn call_method(&mut self, vm: &mut dyn BxVM, _id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String> {
+        if name.eq_ignore_ascii_case("init") { create_java_object(vm, &self.0, args) }
+        else { Err(format!("JNI static class methods are not supported: {}.{name}", self.0)) }
+    }
+}
+
+fn create_java_object(
     vm: &mut dyn BxVM,
     class_name: &str,
     args: &[BxValue],
@@ -258,6 +284,7 @@ impl JniObject {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl BxNativeObject for JniObject {
+    fn has_method(&self, _name: &str) -> bool { true }
     fn get_property(&self, _name: &str) -> BxValue {
         BxValue::new_null()
     }

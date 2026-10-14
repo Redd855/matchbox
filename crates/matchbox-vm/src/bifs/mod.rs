@@ -1,3 +1,4 @@
+mod ast_visit;
 use crate::types::{BxNativeFunction, BxNativeObject, BxVM, BxValue, Tracer};
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
@@ -82,12 +83,8 @@ mod jni;
 #[cfg(not(feature = "bif-jni"))]
 mod jni {
     use crate::types::{BxVM, BxValue};
-    pub fn create_java_object(
-        _vm: &mut dyn BxVM,
-        _class_name: &str,
-        _args: &[BxValue],
-    ) -> Result<BxValue, String> {
-        Err("Java interoperability is not enabled in this build.".to_string())
+    pub fn create_java_class(_vm: &mut dyn BxVM, class_name: &str) -> Result<BxValue, String> {
+        Err(format!("Java class not provided: {class_name} (JNI is not enabled)"))
     }
 }
 mod binary;
@@ -129,6 +126,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     );
     bifs.insert("boxannounce".to_string(), system::box_announce as BxNativeFunction);
     bifs.insert("boxast".to_string(), system::box_ast as BxNativeFunction);
+    bifs.insert("boxastvisit".to_string(), ast_visit::visit as BxNativeFunction);
     bifs.insert(
         "boxmodulereload".to_string(),
         system::box_module_reload as BxNativeFunction,
@@ -332,6 +330,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
         "createobject".to_string(),
         create_object as BxNativeFunction,
     );
+    bifs.insert("__mb_resolve_class".into(), resolve_class as BxNativeFunction);
     bifs.insert("isnull".to_string(), is_null_bif as BxNativeFunction);
     bifs.insert("nullvalue".to_string(), null_value_bif as BxNativeFunction);
     bifs.insert("isnumeric".to_string(), is_numeric_bif as BxNativeFunction);
@@ -998,9 +997,13 @@ fn preserve_single_quotes_bif(
 #[derive(Debug)]
 struct StringBuilderObject {
     value: String,
+    is_buffer: bool,
 }
 
 impl BxNativeObject for StringBuilderObject {
+    fn native_data(&self, kind: &str) -> Option<*mut std::ffi::c_void> {
+        (self.is_buffer && kind == "matchbox.component.buffer").then_some(self as *const Self as *mut std::ffi::c_void)
+    }
     fn get_property(&self, _name: &str) -> BxValue {
         BxValue::new_null()
     }
@@ -1017,7 +1020,7 @@ impl BxNativeObject for StringBuilderObject {
         let name = name.to_ascii_lowercase();
         let self_value = || BxValue::new_ptr(id);
         match name.as_str() {
-            "__is_string_builder" => Ok(BxValue::new_bool(true)),
+            "__is_string_builder" => Ok(BxValue::new_bool(!self.is_buffer)),
             "tostring" => Ok(BxValue::new_ptr(vm.string_new(self.value.clone()))),
             "append" => {
                 self.value.push_str(&builder_arg_string(vm, args, 0)?);
@@ -1155,13 +1158,17 @@ fn builder_mid(value: &str, start: isize, count: Option<usize>) -> String {
     value[start_offset..end_offset].to_string()
 }
 
-fn string_builder_new_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn string_buffer_new(vm: &mut dyn BxVM) -> BxValue {
+    BxValue::new_ptr(vm.native_object_new(Rc::new(RefCell::new(StringBuilderObject { value: String::new(), is_buffer: true }))))
+}
+
+pub(crate) fn string_builder_new_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let value = args
         .first()
         .filter(|value| !value.is_null())
         .map(|value| vm.to_string(*value))
         .unwrap_or_default();
-    let id = vm.native_object_new(Rc::new(RefCell::new(StringBuilderObject { value })));
+    let id = vm.native_object_new(Rc::new(RefCell::new(StringBuilderObject { value, is_buffer: false })));
     Ok(BxValue::new_ptr(id))
 }
 
@@ -1454,7 +1461,7 @@ fn string_starts_with_no_case_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result
     Ok(BxValue::new_bool(input.starts_with(&prefix)))
 }
 
-fn ascii_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn ascii_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() != 1 {
         return Err("ascii() expects exactly 1 argument".to_string());
     }
@@ -2734,7 +2741,7 @@ fn floor_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     }
 }
 
-fn int_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn int_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() != 1 {
         return Err("int() expects exactly 1 argument".to_string());
     }
@@ -3080,7 +3087,7 @@ fn get_system_setting(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, St
 
 // --- Array BIFs ---
 
-fn array_append(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn array_append(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() != 2 {
         return Err("arrayAppend() expects exactly 2 arguments".to_string());
     }
@@ -3448,7 +3455,7 @@ fn struct_delete_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
     }
 }
 
-fn struct_key_exists_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn struct_key_exists_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() < 2 {
         return Err("structKeyExists() expects 2 arguments: (struct, key)".to_string());
     }
@@ -4740,6 +4747,15 @@ fn run_async(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     vm.spawn_by_value(&args[0], Vec::new(), priority, chunk)
 }
 
+pub(crate) fn jni_class_reference(vm: &mut dyn BxVM, name: &str) -> Result<BxValue, String> {
+    jni::create_java_class(vm, name)
+}
+
+fn resolve_class(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    if args.len() != 1 || !vm.is_string_value(args[0]) { return Err("Class resolution requires a class name".into()); }
+    vm.resolve_class_reference(&vm.to_string(args[0]))
+}
+
 fn create_object(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() < 2 {
         return Err("createObject() expects at least 2 arguments: (type, class)".to_string());
@@ -4748,35 +4764,13 @@ fn create_object(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String>
     let class_name = vm.to_string(args[1]);
 
     match obj_type.as_str() {
-        "java" if class_name.eq_ignore_ascii_case("java.io.File") && args.len() == 2 => {
-            let id = vm.native_object_new(Rc::new(RefCell::new(JavaClassPlaceholder)));
-            Ok(BxValue::new_ptr(id))
+        "java" => {
+            if args.len() != 2 { return Err("Java class paths, JARs and class loaders are not supported".into()); }
+            vm.resolve_class_reference(&format!("java:{class_name}"))
         }
-        "java" => jni::create_java_object(vm, &class_name, &args[2..]),
         "rust" => vm.construct_native_class(&class_name, &args[2..]),
         "native" => Err("Use 'rust' type for native objects".to_string()),
         _ => Err(format!("Unknown object type: {}", obj_type)),
-    }
-}
-
-#[derive(Debug)]
-struct JavaClassPlaceholder;
-
-impl BxNativeObject for JavaClassPlaceholder {
-    fn get_property(&self, _name: &str) -> BxValue {
-        BxValue::new_null()
-    }
-
-    fn set_property(&mut self, _name: &str, _value: BxValue) {}
-
-    fn call_method(
-        &mut self,
-        _vm: &mut dyn BxVM,
-        _id: usize,
-        name: &str,
-        _args: &[BxValue],
-    ) -> Result<BxValue, String> {
-        Err(format!("Java class placeholder method '{}' not found", name))
     }
 }
 
@@ -4831,7 +4825,7 @@ fn array_depth(vm: &dyn BxVM, value: BxValue) -> usize {
     1 + array_depth(vm, vm.array_get(id, 0))
 }
 
-fn is_struct_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+pub(crate) fn is_struct_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.is_empty() {
         return Ok(BxValue::new_bool(false));
     }

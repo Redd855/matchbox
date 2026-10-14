@@ -242,6 +242,7 @@ pub struct LexedSource<'a> {
     source: &'a str,
     tokens: Vec<SyntaxToken>,
     trivia: Vec<Trivia>,
+    errors: Vec<(Span, String)>,
 }
 
 impl<'a> LexedSource<'a> {
@@ -255,6 +256,10 @@ impl<'a> LexedSource<'a> {
 
     pub fn trivia(&self) -> &[Trivia] {
         &self.trivia
+    }
+
+    pub fn errors(&self) -> &[(Span, String)] {
+        &self.errors
     }
 
     pub fn into_parts(self) -> (&'a str, Vec<SyntaxToken>, Vec<Trivia>) {
@@ -303,6 +308,16 @@ pub struct Span {
     pub col: u32,
 }
 
+impl Span {
+    /// Byte offsets, one-based lines and Unicode-scalar columns.
+    pub fn at(source: &str, start: usize, end: usize) -> Self {
+        let prefix = &source[..start];
+        let line = 1 + prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let col = 1 + prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
+        Self { start, end, line, col }
+    }
+}
+
 struct Lexer<'a> {
     source: &'a str,
     pos: usize,
@@ -311,6 +326,7 @@ struct Lexer<'a> {
     tokens: Vec<SyntaxToken>,
     trivia: Vec<Trivia>,
     mode_stack: Vec<LexerMode>,
+    errors: Vec<(Span, String)>,
 }
 
 impl<'a> Lexer<'a> {
@@ -323,6 +339,7 @@ impl<'a> Lexer<'a> {
             tokens: Vec::new(),
             trivia: Vec::new(),
             mode_stack: vec![initial_mode],
+            errors: Vec::new(),
         }
     }
 
@@ -411,6 +428,7 @@ impl<'a> Lexer<'a> {
             source: self.source,
             tokens: std::mem::take(&mut self.tokens),
             trivia: std::mem::take(&mut self.trivia),
+            errors: std::mem::take(&mut self.errors),
         }
     }
 
@@ -601,14 +619,17 @@ impl<'a> Lexer<'a> {
                 let start_col = self.col;
                 self.advance();
                 self.advance();
+                let mut closed = false;
                 while self.pos < self.source.len() {
                     if self.source[self.pos..].starts_with("*/") {
                         self.advance();
                         self.advance();
+                        closed = true;
                         break;
                     }
                     self.advance();
                 }
+                if !closed { self.errors.push((Span { start, end: self.pos, line: start_line, col: start_col }, "unterminated block comment".into())); }
                 self.push_trivia(TriviaKind::BlockComment, start, self.pos, start_line, start_col);
             } else {
                 let start = self.pos;
@@ -830,6 +851,7 @@ impl<'a> Lexer<'a> {
 
         self.advance(); // consume opening quote
         let xml_like_string = quote == '"' && self.source[self.pos..].trim_start().starts_with('<');
+        let mut closed = false;
 
         loop {
             if self.pos >= self.source.len() {
@@ -860,6 +882,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     continue;
                 }
+                closed = true;
                 break; // closing quote
             }
             if ch == '#' {
@@ -925,6 +948,7 @@ impl<'a> Lexer<'a> {
         }
 
         let str_end = self.pos;
+        if !closed { self.errors.push((Span { start: str_start, end: str_end, line: str_start_line, col: str_start_col }, "unterminated string".into())); }
 
         self.push_token(
             TokenKind::String,

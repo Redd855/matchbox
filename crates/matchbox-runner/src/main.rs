@@ -157,7 +157,7 @@ fn load_embedded_bytecode() -> Result<Chunk> {
     let len_bytes = &bytes[len_start..footer_start];
     let len = u64::from_le_bytes(len_bytes.try_into()?) as usize;
 
-    let chunk_start = len_start - len;
+    let chunk_start = len_start.checked_sub(len).ok_or_else(|| anyhow::anyhow!("Invalid embedded bytecode length"))?;
     let chunk_bytes = &bytes[chunk_start..len_start];
     
     let mut chunk: Chunk = postcard::from_bytes(chunk_bytes)?;
@@ -171,11 +171,19 @@ fn main() {}
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn main() -> Result<()> {
+    // Keep the OS default Ctrl+C action: VM polling cannot interrupt blocked native calls.
+    let mut vm = VM::new_with_args(std_env::args().collect());
+    #[cfg(feature = "jit")]
+    vm.enable_jit();
+
     #[cfg(not(target_family = "wasm"))]
     {
-        ctrlc::set_handler(move || {
-            matchbox_vm::vm::INTERRUPT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-        }).expect("Error setting Ctrl-C handler");
+        let bytes = fs::read(std_env::current_exe()?)?;
+        if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
+            let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+            application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+            return Ok(());
+        }
     }
 
     // 1. Try to load embedded bytecode from the executable itself
@@ -185,6 +193,12 @@ fn main() -> Result<()> {
             // 2. Fallback: Check for an external 'app.bxb' in the same directory
             let bytes = fs::read("app.bxb")
                 .map_err(|_| anyhow::anyhow!("No embedded bytecode or app.bxb found"))?;
+            #[cfg(not(target_family = "wasm"))]
+            if bytes.ends_with(matchbox_vm::bundle::MAGIC) {
+                let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
+                application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
+                return Ok(());
+            }
             let mut chunk: Chunk = match postcard::from_bytes(&bytes) {
                 Ok(c) => c,
                 Err(e) => return Err(anyhow::anyhow!("Failed to deserialize app.bxb: {}", e)),
@@ -194,9 +208,6 @@ fn main() -> Result<()> {
         }
     };
 
-    // Collect CLI arguments (including the executable path as args[0])
-    let cli_args: Vec<String> = std_env::args().collect();
-    let mut vm = VM::new_with_args(cli_args);
     match vm.interpret(chunk) {
         Ok(_val) => {
             // println!("Result: {}", val);

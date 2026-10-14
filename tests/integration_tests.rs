@@ -80,6 +80,8 @@ script_test!(bifs, "bifs.bxs");
 script_test!(deserialize_toml, "deserialize_toml.bxs");
 script_test!(deserialize_yaml, "deserialize_yaml.bxs");
 script_test!(bytes_bifs, "bytes_bifs.bxs");
+script_test!(vm_box_ast, "vm_box_ast.bxs");
+script_test!(vm_ast_visit, "vm_ast_visit.bxs");
 script_test!(for_in_loops, "for_in_loops.bxs");
 script_test!(for_loop, "for_loop.bxs");
 script_test!(functions, "functions.bxs");
@@ -100,6 +102,47 @@ script_test!(
     "vm_throw_structured_exception.bxs"
 );
 script_test!(vm_functions, "vm_functions.bxs");
+script_test!(vm_function_execution, "vm_function_execution.bxs");
+script_test!(vm_scope_bindings, "vm_scope_bindings.bxs");
+script_test!(guarded_frame_local_alias, "test01-local.bxs");
+script_test!(guarded_frame_argument_alias, "test02-arguments.bxs");
+script_test!(guarded_frame_capture, "test03-capture.bxs");
+script_test!(guarded_frame_context, "test04-context.bxs");
+script_test!(guarded_frame_block_rebinding, "test05-rebinding.bxs");
+script_test!(guarded_frame_duplicate_parameters, "test06-parameter-names.bxs");
+script_test!(guarded_frame_boundaries, "test07-boundaries.bxs");
+script_test!(guarded_frame_wide_arguments, "guarded_frame_wide_arguments.bxs");
+script_test!(jit_function_contract, "jit_function_contract.bxs");
+script_test!(jit_loop_contract, "jit_loop_contract.bxs");
+script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");
+script_test!(vm_execution_contexts, "vm_execution_contexts.bxs");
+
+#[cfg(feature = "jit")]
+#[test]
+fn compiled_loop_metadata_keeps_member_ids_vm_local() {
+    use matchbox_vm::{types::{BxVM, BxValue, Constant}, vm::{VM, chunk::Chunk, gc::GcObject, opcode::op}};
+    let source = "function read(record, limit) { var count=0; var total=0; while(count<limit) { total=total+record.start; count=count+1; } return total; } return read;";
+    let ast = matchbox_compiler::parser::parse(source, Some("shared-loop.bxs")).unwrap();
+    let script = matchbox_compiler::compiler::Compiler::new("shared-loop.bxs").compile(&ast, source).unwrap();
+    let mut first = VM::new(); first.enable_jit();
+    let function = first.interpret(script).unwrap();
+    let record = first.struct_new(); first.struct_set(record, "start", BxValue::new_number(3.0));
+    for _ in 0..200 {
+        assert_eq!(first.call_function_value(function, vec![BxValue::new_ptr(record), BxValue::new_number(6.0)], None).unwrap().as_number(), 18.0);
+    }
+    let GcObject::CompiledFunction(function) = first.heap.get(function.as_gc_id().unwrap()) else { panic!("Expected function"); };
+    let mut transferred = Chunk::new("shared-loop-copy.bxs");
+    let slot = transferred.add_constant(Constant::CompiledFunction((**function).clone()));
+    transferred.emit1(op::CONSTANT, slot, 1); transferred.emit0(op::RETURN, 1);
+    let mut second = VM::new(); second.enable_jit();
+    let record = second.struct_new();
+    for index in 0..256 { second.struct_set(record, &format!("padding{index}"), BxValue::new_number(-1.0)); }
+    second.struct_set(record, "start", BxValue::new_number(7.0));
+    let function = second.interpret(transferred).unwrap();
+    for _ in 0..200 {
+        assert_eq!(second.call_function_value(function, vec![BxValue::new_ptr(record), BxValue::new_number(6.0)], None).unwrap().as_number(), 42.0);
+    }
+}
 
 #[test]
 fn vm_locals_survive_stack_reallocation() {
@@ -134,6 +177,7 @@ fn vm_locals_survive_stack_reallocation() {
 script_test!(vm_if, "vm_if.bxs");
 script_test!(vm_loop, "vm_loop.bxs");
 script_test!(vm_struct_assign, "vm_struct_assign.bxs");
+script_test!(vm_wide_struct, "vm_wide_struct.bxs");
 script_test!(vm_struct_iter, "vm_struct_iter.bxs");
 script_test!(vm_struct_iter_single_var, "vm_struct_iter_single_var.bxs");
 script_test!(
@@ -193,6 +237,7 @@ script_test!(vm_string_bifs_batch2, "vm_string_bifs_batch2.bxs");
 script_test!(vm_string_bifs, "vm_string_bifs.bxs");
 script_test!(vm_val, "vm_val.bxs");
 script_test!(vm_functional_bif, "vm_functional_bif.bxs");
+script_test!(vm_native_calls, "vm_native_calls.bxs");
 script_test!(vm_spread, "vm_spread.bxs");
 script_test!(vm_destructuring, "vm_destructuring.bxs");
 script_test!(vm_math_datetime, "vm_math_datetime.bxs");
@@ -764,6 +809,7 @@ fn test_bytecode_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "bif-jni"), ignore = "requires feature bif-jni")]
 fn test_java_import() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1152,22 +1198,9 @@ fn test_native_math_module() {
         .join("modules")
         .join("native-math");
 
-    if let Err(e) = process_file(
-        &script_path,
-        false,
-        None,
-        Vec::new(),
-        false,
-        false,
-        false,
-        None,
-        &[module_path],
-        false,
-        None,
-        false,
-        false,
-        false,
-    ) {
-        panic!("Native math module test failed: {}", e);
-    }
+    let error = process_file(
+        &script_path, false, None, Vec::new(), false, false, false, None,
+        &[module_path], false, None, false, false, false,
+    ).unwrap_err();
+    assert!(error.to_string().contains("Source-only native modules require --target native"));
 }

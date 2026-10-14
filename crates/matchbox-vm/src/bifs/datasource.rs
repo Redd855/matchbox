@@ -191,10 +191,9 @@ pub fn query_execute(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
     if db_type == "query" {
         #[cfg(feature = "qoq")]
         {
-            let qoq_params = if args.len() > 1 && !args[1].is_null() {
-                parse_qoq_bind_params(vm, args[1])?
-            } else {
-                qoq::BindParams::default()
+            let qoq_params = qoq::BindParams {
+                positional: params.iter().map(|param| param.value.clone()).collect(),
+                ..qoq::BindParams::default()
             };
             return query_execute_qoq(vm, &sql, &return_type, &qoq_params);
         }
@@ -469,79 +468,6 @@ fn qoq_error_to_string(prefix: &str, e: qoq::ExecutionError) -> String {
         )
     } else {
         format!("{}: {}", prefix, e.message)
-    }
-}
-
-#[cfg(all(
-    feature = "bif-datasource",
-    feature = "qoq",
-    not(target_arch = "wasm32")
-))]
-fn parse_qoq_bind_params(vm: &mut dyn BxVM, val: BxValue) -> Result<qoq::BindParams, String> {
-    if let Some(id) = val.as_gc_id() {
-        if vm.struct_len(id) > 0 {
-            let mut named = std::collections::HashMap::new();
-            for key in vm.struct_key_array(id) {
-                let item = vm.struct_get(id, &key);
-                let sql_val = if let Some(item_id) = item.as_gc_id() {
-                    if vm.struct_key_exists(item_id, "value") {
-                        let v = vm.struct_get(item_id, "value");
-                        let sql_type_str = {
-                            let t = vm.struct_get(item_id, "cfsqltype");
-                            if t.is_null() {
-                                None
-                            } else {
-                                Some(vm.to_string(t))
-                            }
-                        };
-                        coerce_cf_sql_type(vm, v, sql_type_str.as_deref())
-                    } else {
-                        bx_to_sql(vm, item)
-                    }
-                } else {
-                    bx_to_sql(vm, item)
-                };
-                named.insert(key.to_lowercase(), sql_val);
-            }
-            Ok(qoq::BindParams {
-                positional: vec![],
-                named,
-            })
-        } else {
-            let len = vm.array_len(id);
-            let mut positional = Vec::with_capacity(len);
-            for i in 0..len {
-                let item = vm.array_get(id, i);
-                let sql_val = if let Some(item_id) = item.as_gc_id() {
-                    if vm.struct_key_exists(item_id, "value") {
-                        let v = vm.struct_get(item_id, "value");
-                        let sql_type_str = {
-                            let t = vm.struct_get(item_id, "cfsqltype");
-                            if t.is_null() {
-                                None
-                            } else {
-                                Some(vm.to_string(t))
-                            }
-                        };
-                        coerce_cf_sql_type(vm, v, sql_type_str.as_deref())
-                    } else {
-                        bx_to_sql(vm, item)
-                    }
-                } else {
-                    bx_to_sql(vm, item)
-                };
-                positional.push(sql_val);
-            }
-            Ok(qoq::BindParams {
-                positional,
-                named: std::collections::HashMap::new(),
-            })
-        }
-    } else {
-        Ok(qoq::BindParams {
-            positional: vec![bx_to_sql(vm, val)],
-            named: std::collections::HashMap::new(),
-        })
     }
 }
 

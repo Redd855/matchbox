@@ -43,6 +43,120 @@ unsafe impl GlobalAlloc for CountedSystem {
 }
 
 #[test]
+fn repeated_local_bindings_and_member_writes_do_not_allocate_operand_strings() {
+    for bind in [true, false] {
+        let mut allocations = Vec::new();
+        for repeats in [1, 100] {
+            let mut vm = VM::new();
+            let record = vm.struct_new();
+            vm.struct_set(record, "value", BxValue::new_int(0));
+            vm.insert_global("target".into(), BxValue::new_ptr(record));
+            let mut body = Chunk::new("key-operands.bxs");
+            let name = body.add_constant(Constant::String(BoxString::new("value")));
+            let target = body.add_constant(Constant::String(BoxString::new("target")));
+            let local = body.add_constant(Constant::String(BoxString::new("local")));
+            let answer = body.add_constant(Constant::Number(42.0));
+            body.emit0(op::FUNCTION_ENTER, 1);
+            if bind { body.emit1(op::CONSTANT, answer, 1); }
+            for _ in 0..repeats {
+                if bind {
+                    body.emit2(op::BIND_LOCAL, 1, name, 1);
+                } else {
+                    body.emit1(op::GET_GLOBAL, target, 1);
+                    body.emit1(op::CONSTANT, answer, 1);
+                    body.emit1(op::SET_MEMBER, name, 1);
+                    body.emit0(op::POP, 1);
+                }
+            }
+            body.emit1(if bind { op::GET_PRIVATE } else { op::GET_GLOBAL }, if bind { local } else { target }, 1);
+            body.emit0(op::RETURN, 1);
+            let function = BxCompiledFunction {
+                name: "keyOperands".into(), kind: FunctionKind::Udf,
+                arity: 1, min_arity: 0, params: Vec::new(), bif: None,
+                modifiers: Default::default(), captured_receiver: None,
+                captured_scopes: Vec::new(), chunk: body,
+            };
+            let mut script = Chunk::new("key-operands-owner.bxs");
+            let function = script.add_constant(Constant::CompiledFunction(function));
+            script.emit1(op::CONSTANT, function, 1); script.emit0(op::RETURN, 1);
+            let function = vm.interpret(script).unwrap();
+            let _root = vm.retain_value(function).unwrap();
+            vm.call_function_value(function, Vec::new(), None).unwrap();
+            ALLOCATIONS.with(|count| count.set(Some(0)));
+            let result = vm.call_function_value(function, Vec::new(), None).unwrap();
+            allocations.push(ALLOCATIONS.with(|count| count.replace(None).unwrap()));
+            assert_eq!(vm.struct_get(result.as_gc_id().unwrap(), "value").as_number(), 42.0);
+        }
+        eprintln!("Operand allocations bind={bind}, 1/100 operations: {allocations:?}");
+        assert!(allocations[1] <= allocations[0] + 8, "Operand names allocate per instruction: {allocations:?}");
+    }
+}
+
+#[test]
+fn local_operand_folding_preserves_presentation_through_gc() {
+    for spelling in ["MiXeD", "İ", "ǅ", "Élève中😀_identifier_long_tail"] {
+        let mut vm = VM::new();
+        let folded = spelling.to_lowercase();
+        let presentation = vm.struct_new();
+        vm.struct_set(presentation, &folded, BxValue::new_int(7));
+        let _presentation_root = vm.retain_value(BxValue::new_ptr(presentation)).unwrap();
+        let mut body = Chunk::new("local-operand-spelling.bxs");
+        let name = body.add_constant(Constant::String(BoxString::new(spelling).concat(&BoxString::new(""))));
+        let local = body.add_constant(Constant::String(BoxString::new("local")));
+        let answer = body.add_constant(Constant::Number(42.0));
+        body.emit0(op::FUNCTION_ENTER, 1);
+        body.emit1(op::CONSTANT, answer, 1);
+        body.emit2(op::BIND_LOCAL, 1, name, 1);
+        body.emit1(op::GET_PRIVATE, local, 1); body.emit0(op::RETURN, 1);
+        let function = BxCompiledFunction {
+            name: "localSpelling".into(), kind: FunctionKind::Udf,
+            arity: 1, min_arity: 0, params: Vec::new(), bif: None,
+            modifiers: Default::default(), captured_receiver: None,
+            captured_scopes: Vec::new(), chunk: body,
+        };
+        let mut script = Chunk::new("local-spelling-owner.bxs");
+        let function = script.add_constant(Constant::CompiledFunction(function));
+        script.emit1(op::CONSTANT, function, 1); script.emit0(op::RETURN, 1);
+        let function = vm.interpret(script).unwrap();
+        let _root = vm.retain_value(function).unwrap();
+        for _ in 0..10 {
+            vm.collect_garbage_now();
+            let scope = vm.call_function_value(function, Vec::new(), None).unwrap().as_gc_id().unwrap();
+            assert_eq!(vm.struct_key_array(scope), [folded.clone()]);
+            assert_eq!(vm.struct_key_array(presentation), [folded.clone()]);
+            assert_eq!(vm.struct_get(scope, spelling).as_number(), 42.0);
+        }
+    }
+}
+
+#[test]
+fn string_operands_preserve_exact_member_keys_in_independent_vms() {
+    for spelling in ["VaLuE", "İ", "ǅ", "Élève中😀_identifier_long_tail"] {
+        let mut script = Chunk::new("exact-member-operands.bxs");
+        let target = script.add_constant(Constant::String(BoxString::new("target")));
+        let key = script.add_constant(Constant::String(BoxString::new(spelling).concat(&BoxString::new(""))));
+        let answer = script.add_constant(Constant::Number(42.0));
+        script.emit1(op::GET_GLOBAL, target, 1); script.emit1(op::CONSTANT, answer, 1);
+        script.emit1(op::SET_MEMBER, key, 1); script.emit0(op::POP, 1);
+        script.emit1(op::GET_GLOBAL, target, 1); script.emit1(op::MEMBER, key, 1);
+        script.emit0(op::RETURN, 1);
+        for padding in [0, 17] {
+            let mut vm = VM::new();
+            for i in 0..padding { vm.insert_global(format!("padding{i}"), BxValue::new_int(i)); }
+            let record = vm.struct_new_with_options(&["casesensitive".into(), "ordered".into()]);
+            vm.struct_set(record, &spelling.to_lowercase(), BxValue::new_int(7));
+            vm.insert_global("target".into(), BxValue::new_ptr(record));
+            for _ in 0..10 {
+                vm.collect_garbage_now();
+                assert_eq!(vm.interpret_chunk_borrowed(&script).unwrap().as_number(), 42.0);
+                assert_eq!(vm.struct_get(record, &spelling.to_lowercase()).as_number(), 7.0);
+                assert_eq!(vm.struct_key_array(record), [spelling.to_lowercase(), spelling.to_string()]);
+            }
+        }
+    }
+}
+
+#[test]
 fn existing_canonical_struct_reads_do_not_allocate_temporary_keys() {
     let mut vm = VM::new();
     let data = vm.struct_new();

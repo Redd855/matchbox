@@ -428,6 +428,9 @@ pub trait BxNativeObject: fmt::Debug {
     /// values, interior mutation or VM access. Unknown fields must decline.
     fn readonly_jit_property(&self, _name: &str) -> Option<BxValue> { None }
     fn is_readonly(&self) -> bool { false }
+    /// Estimated new Rust-owned bytes charged when this wrapper is allocated.
+    /// Shared-owner views charge zero; this is GC pressure, not live-heap accounting.
+    fn external_allocation_bytes(&self) -> usize { 0 }
     fn set_property(&mut self, name: &str, value: BxValue);
     fn call_method(&mut self, vm: &mut dyn BxVM, id: usize, name: &str, args: &[BxValue]) -> Result<BxValue, String>;
     #[cfg(not(target_arch = "wasm32"))]

@@ -28,7 +28,7 @@ pub fn inspect_parsed(source: &str, statements: &[Statement], issues: &[parser::
     let mut root = export.node(
         "BoxScript",
         Some(Span::at(source, 0, source.len())),
-        json!({"statements": export.statements(statements)}),
+        Value::from_iter([("statements", export.statements(statements))]),
     );
     root["comments"] = json!(
         lexed
@@ -56,6 +56,17 @@ pub fn inspect_parsed(source: &str, statements: &[Statement], issues: &[parser::
         root["trivia"] = json!(lexed.trivia().iter().map(|trivia| json!({"kind":match trivia.kind {TriviaKind::Whitespace=>"whitespace", TriviaKind::LineComment=>"lineComment", TriviaKind::BlockComment=>"blockComment"}, "text":lexed.text(trivia.span), "position":export.position(trivia.span), "span":{"start":trivia.span.start,"end":trivia.span.end}})).collect::<Vec<_>>());
     }
     Ok(root)
+}
+
+/// Independent flat token/comment/recovery data for a native snapshot. No AST export.
+pub fn lexical_parsed(source: &str, issues: &[parser::ParseError]) -> anyhow::Result<Value> {
+    let export = Export::new(source);
+    let lexed = lex(source);
+    Ok(json!({
+        "tokens": lexed.tokens().iter().map(|token| json!({"kind":token.kind.to_string(),"text":lexed.text(token.span),"position":export.position(token.span),"span":{"start":token.span.start,"end":token.span.end}})).collect::<Vec<_>>(),
+        "comments": lexed.trivia().iter().filter(|t|t.kind!=TriviaKind::Whitespace).map(|t|export.node(if t.kind==TriviaKind::LineComment{"BoxSingleLineComment"}else{"BoxMultiLineComment"},Some(t.span),json!({"commentText":lexed.text(t.span)}))).collect::<Vec<_>>(),
+        "issues": issues.iter().map(|i|json!({"message":i.message,"filename":i.filename,"position":export.position(i.span),"span":{"start":i.span.start,"end":i.span.end}})).collect::<Vec<_>>()
+    }))
 }
 
 struct Export<'a> {
@@ -128,11 +139,7 @@ impl<'a> Export<'a> {
         fields
     }
     fn statements(&self, body: &[Statement]) -> Value {
-        json!(
-            body.iter()
-                .map(|stmt| self.statement(stmt))
-                .collect::<Vec<_>>()
-        )
+        body.iter().map(|stmt| self.statement(stmt)).collect()
     }
     fn optional(&self, expr: &Option<Expression>) -> Value {
         expr.as_ref()
@@ -151,7 +158,7 @@ impl<'a> Export<'a> {
         self.node(
             "BoxStatementBlock",
             span,
-            json!({"statements":self.statements(body)}),
+            Value::from_iter([("statements", self.statements(body))]),
         )
     }
     fn params(&self, params: &[FunctionParam]) -> Value {
@@ -160,10 +167,10 @@ impl<'a> Export<'a> {
     fn body(&self, body: &FunctionBody) -> Value {
         match body {
             FunctionBody::Block(stmts) | FunctionBody::Component(stmts) => self.statements(stmts),
-            FunctionBody::Expression(expr) => json!([self.node(
+            FunctionBody::Expression(expr) => Value::Array(vec![self.node(
                 "BoxReturn",
                 expr.span,
-                json!({"expression":self.expression(expr)})
+                Value::from_iter([("expression", self.expression(expr))]),
             )]),
             FunctionBody::Abstract => Value::Null,
         }
@@ -202,7 +209,13 @@ impl<'a> Export<'a> {
                 body,
             } => (
                 "BoxFunctionDeclaration",
-                json!({"name":name,"args":self.params(params),"body":self.body(body),"type":return_type.as_ref().map(|name|self.return_type(name)),"accessModifier":modifiers.access.as_ref().map(|name|self.enum_value("BoxFunctionDeclaration",&capitalize(name))),"modifiers":([("Static",modifiers.is_static),("Abstract",modifiers.is_abstract),("Final",modifiers.is_final)].iter().filter(|(_,enabled)|*enabled).map(|(name,_)|self.enum_value("BoxFunctionDeclaration",name)).collect::<Vec<_>>()),"annotations":self.attributes(attributes),"documentation":[]}),
+                Value::from_iter([
+                    ("name", json!(name)), ("args", self.params(params)), ("body", self.body(body)),
+                    ("type", return_type.as_ref().map(|name| self.return_type(name)).unwrap_or(Value::Null)),
+                    ("accessModifier", modifiers.access.as_ref().map(|name| self.enum_value("BoxFunctionDeclaration", &capitalize(name))).unwrap_or(Value::Null)),
+                    ("modifiers", [("Static", modifiers.is_static), ("Abstract", modifiers.is_abstract), ("Final", modifiers.is_final)].iter().filter(|(_, enabled)| *enabled).map(|(name, _)| self.enum_value("BoxFunctionDeclaration", name)).collect()),
+                    ("annotations", self.attributes(attributes)), ("documentation", json!([])),
+                ]),
             ),
             StatementKind::ClassDecl {
                 name,
@@ -214,11 +227,20 @@ impl<'a> Export<'a> {
                 members,
             } => (
                 "BoxClass",
-                json!({"name":name,"extends":extends,"accessors":accessors,"implements":implements,"annotations":self.attributes(attributes),"modifiers":{"abstract":modifiers.is_abstract,"final":modifiers.is_final},"body":members.iter().filter_map(|member|if let ClassMember::Statement(stmt)=member{Some(self.statement(stmt))}else{None}).collect::<Vec<_>>(),"properties":members.iter().filter_map(|member|if let ClassMember::Property(property)=member{Some(self.node("BoxProperty",Some(property.span),json!({"name":property.name,"annotations":property.annotations.iter().map(|annotation|self.node("BoxAnnotation",Some(annotation.span),json!({"key":self.node("BoxFQN",Some(annotation.key_span),json!({"value":annotation.key})),"value":self.optional(&annotation.value)}))).collect::<Vec<_>>(),"documentation":[]})))}else{None}).collect::<Vec<_>>() }),
+                Value::from_iter([
+                    ("name", json!(name)), ("extends", json!(extends)), ("accessors", json!(accessors)), ("implements", json!(implements)),
+                    ("annotations", self.attributes(attributes)), ("modifiers", json!({"abstract":modifiers.is_abstract,"final":modifiers.is_final})),
+                    ("body", members.iter().filter_map(|member| if let ClassMember::Statement(stmt) = member { Some(self.statement(stmt)) } else { None }).collect()),
+                    ("properties", members.iter().filter_map(|member| if let ClassMember::Property(property) = member { Some(self.node("BoxProperty", Some(property.span), Value::from_iter([
+                        ("name", json!(property.name)), ("annotations", property.annotations.iter().map(|annotation| self.node("BoxAnnotation", Some(annotation.span), Value::from_iter([
+                            ("key", self.node("BoxFQN", Some(annotation.key_span), json!({"value":annotation.key}))), ("value", self.optional(&annotation.value)),
+                        ]))).collect()), ("documentation", json!([])),
+                    ]))) } else { None }).collect()),
+                ]),
             ),
             StatementKind::InterfaceDecl { name, members } => (
                 "BoxInterface",
-                json!({"name":name,"body":self.statements(members)}),
+                Value::from_iter([("name", json!(name)), ("body", self.statements(members))]),
             ),
             StatementKind::Import { path, alias } => (
                 "BoxImport",
@@ -235,15 +257,19 @@ impl<'a> Export<'a> {
                 else_branch,
             } => (
                 "BoxIfElse",
-                json!({"condition":self.expression(condition),"thenBody":self.block(then_branch),"elseBody":else_branch.as_ref().map(|body|self.block(body))}),
+                Value::from_iter([
+                    ("condition", self.expression(condition)),
+                    ("thenBody", self.block(then_branch)),
+                    ("elseBody", else_branch.as_ref().map(|body| self.block(body)).unwrap_or(Value::Null)),
+                ]),
             ),
             StatementKind::WhileLoop { condition, body } => (
                 "BoxWhile",
-                json!({"condition":self.expression(condition),"body":self.block(body)}),
+                Value::from_iter([("condition", self.expression(condition)), ("body", self.block(body))]),
             ),
             StatementKind::DoWhile { body, condition } => (
                 "BoxDo",
-                json!({"condition":self.expression(condition),"body":self.block(body)}),
+                Value::from_iter([("condition", self.expression(condition)), ("body", self.block(body))]),
             ),
             StatementKind::ForLoop {
                 item,
@@ -252,7 +278,10 @@ impl<'a> Export<'a> {
                 body,
             } => (
                 "BoxForIn",
-                json!({"variable":self.node("BoxIdentifier",None,json!({"name":item})),"secondVariable":index,"expression":self.expression(collection),"body":self.block(body)}),
+                Value::from_iter([
+                    ("variable", self.node("BoxIdentifier", None, json!({"name":item}))), ("secondVariable", json!(index)),
+                    ("expression", self.expression(collection)), ("body", self.block(body)),
+                ]),
             ),
             StatementKind::ForClassic {
                 init,
@@ -261,7 +290,10 @@ impl<'a> Export<'a> {
                 body,
             } => (
                 "BoxForIndex",
-                json!({"initializer":init.as_ref().map(|stmt|self.statement(stmt)),"condition":self.optional(condition),"step":self.optional(update),"body":self.block(body)}),
+                Value::from_iter([
+                    ("initializer", init.as_ref().map(|stmt| self.statement(stmt)).unwrap_or(Value::Null)),
+                    ("condition", self.optional(condition)), ("step", self.optional(update)), ("body", self.block(body)),
+                ]),
             ),
             StatementKind::TryCatch {
                 try_branch,
@@ -269,7 +301,11 @@ impl<'a> Export<'a> {
                 finally_branch,
             } => (
                 "BoxTry",
-                json!({"tryBody":self.statements(try_branch),"catches":catches.iter().map(|catch|json!({"exception":catch.exception_var,"body":self.statements(&catch.body)})).collect::<Vec<_>>(),"finallyBody":finally_branch.as_ref().map(|body|self.statements(body))}),
+                Value::from_iter([
+                    ("tryBody", self.statements(try_branch)),
+                    ("catches", catches.iter().map(|catch| Value::from_iter([("exception", json!(catch.exception_var)), ("body", self.statements(&catch.body))])).collect()),
+                    ("finallyBody", finally_branch.as_ref().map(|body| self.statements(body)).unwrap_or(Value::Null)),
+                ]),
             ),
             StatementKind::Switch {
                 value,
@@ -277,7 +313,11 @@ impl<'a> Export<'a> {
                 default_case,
             } => (
                 "BoxSwitch",
-                json!({"condition":self.expression(value),"cases":cases.iter().map(|case|json!({"condition":self.expression(&case.value),"body":self.statements(&case.body)})).collect::<Vec<_>>(),"defaultBody":default_case.as_ref().map(|body|self.statements(body))}),
+                Value::from_iter([
+                    ("condition", self.expression(value)),
+                    ("cases", cases.iter().map(|case| Value::from_iter([("condition", self.expression(&case.value)), ("body", self.statements(&case.body))])).collect()),
+                    ("defaultBody", default_case.as_ref().map(|body| self.statements(body)).unwrap_or(Value::Null)),
+                ]),
             ),
             StatementKind::Assert { condition, message } => (
                 "BoxAssert",
@@ -312,7 +352,11 @@ impl<'a> Export<'a> {
                 body,
             } => (
                 "BoxComponent",
-                json!({"name":name,"attributes":attributes.iter().map(|(key,value)|json!({"key":self.expression(key),"value":self.expression(value)})).collect::<Vec<_>>(),"body":body.as_ref().map(|body|self.statements(body))}),
+                Value::from_iter([
+                    ("name", json!(name)),
+                    ("attributes", attributes.iter().map(|(key, value)| Value::from_iter([("key", self.expression(key)), ("value", self.expression(value))])).collect()),
+                    ("body", body.as_ref().map(|body| self.statements(body)).unwrap_or(Value::Null)),
+                ]),
             ),
         };
         let mut node = self.node(kind, stmt.span, fields);
@@ -527,7 +571,7 @@ impl<'a> Export<'a> {
                 } else {
                     "BoxClosure"
                 },
-                json!({"args":self.params(params),"body":self.body(body)}),
+                Value::from_iter([("args", self.params(params)), ("body", self.body(body))]),
             ),
         };
         self.node(kind, span, fields)

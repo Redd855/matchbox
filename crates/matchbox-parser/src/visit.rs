@@ -19,6 +19,8 @@ impl Kind {
         }
     }
 }
+#[derive(Debug, Clone)]
+pub enum AttributeValue { Text(String), Flag(bool), Names(Vec<String>), Number(f64) }
 #[derive(Debug)]
 pub struct Node {
     pub kind: Kind,
@@ -30,6 +32,8 @@ pub struct Node {
     pub body: Option<usize>,
     pub name: Option<String>,
     pub return_type: Option<String>,
+    pub body_span: Option<Span>,
+    pub attributes: Vec<(&'static str, AttributeValue)>,
 }
 #[derive(Debug)]
 pub struct Snapshot {
@@ -50,7 +54,7 @@ impl Snapshot {
     }
 }
 fn add(nodes:&mut Vec<Node>,kind:Kind,span:Option<Span>,parent:usize,edge:&'static str,name:Option<&str>,incomplete:bool)->usize {
-    let id=nodes.len();nodes.push(Node{kind,span,incomplete,parent,edge,children:Vec::new(),body:None,name:name.map(str::to_owned),return_type:None});
+    let id=nodes.len();nodes.push(Node{kind,span,incomplete,parent,edge,children:Vec::new(),body:None,name:name.map(str::to_owned),return_type:None,body_span:None,attributes:Vec::new()});
     if id!=0 {nodes[parent].children.push(id);} id
 }
 fn block(nodes:&mut Vec<Node>,body:&[Statement],parent:usize,edge:&'static str,span:Option<Span>)->usize {
@@ -64,7 +68,7 @@ fn function_body(nodes:&mut Vec<Node>,body:&FunctionBody,parent:usize,span:Optio
     };nodes[parent].body=id;
 }
 fn params(nodes:&mut Vec<Node>,params:&[FunctionParam],parent:usize) {
-    for param in params {let id=add(nodes,Kind::Parameter,None,parent,"parameters",Some(&param.name),false);if let Some(value)=&param.default_value{expr(nodes,value,id,"default");}}
+    for param in params {let id=add(nodes,Kind::Parameter,None,parent,"parameters",Some(&param.name),false);nodes[id].attributes.push(("required",AttributeValue::Flag(param.required)));if let Some(t)=&param.type_name{nodes[id].attributes.push(("type",AttributeValue::Text(t.clone())));}if let Some(value)=&param.default_value{expr(nodes,value,id,"default");}}
 }
 fn attributes(nodes:&mut Vec<Node>,attributes:&[Attribute],parent:usize) {
     for a in attributes {let id=add(nodes,Kind::Annotation,None,parent,"annotations",Some(&a.name),false);arguments(nodes,&a.args,id);}
@@ -85,6 +89,20 @@ fn stmt(nodes:&mut Vec<Node>,value:&Statement,parent:usize,edge:&'static str)->u
         StatementKind::ForLoop{..}=>(Kind::ForIn,None),StatementKind::ForClassic{..}=>(Kind::For,None),StatementKind::WhileLoop{..}=>(Kind::While,None),StatementKind::DoWhile{..}=>(Kind::DoWhile,None),StatementKind::If{..}=>(Kind::If,None),StatementKind::Switch{..}=>(Kind::Switch,None),StatementKind::Return(..)=>(Kind::Return,None),StatementKind::Throw(..)=>(Kind::Throw,None),StatementKind::Continue=>(Kind::Continue,None),StatementKind::Break=>(Kind::Break,None),StatementKind::Rethrow=>(Kind::Rethrow,None),StatementKind::Assert{..}=>(Kind::Assert,None),StatementKind::Not(..)=>(Kind::Unary,None),StatementKind::Include(..)=>(Kind::Include,None),StatementKind::Destructure{..}=>(Kind::Destructure,None),StatementKind::BufferOutput(..)=>(Kind::Output,None),StatementKind::TryCatch{..}=>(Kind::Try,None),StatementKind::Expression(..)=>(Kind::Expression,None),
     };
     let id=add(nodes,kind,value.span,parent,edge,name,value.incomplete);
+    nodes[id].body_span=value.body_span;
+    match &value.kind {
+        StatementKind::FunctionDecl{modifiers,..}=>{
+            if let Some(a)=&modifiers.access{nodes[id].attributes.push(("access",AttributeValue::Text(a.clone())));}
+            for (key,flag) in [("static",modifiers.is_static),("abstract",modifiers.is_abstract),("final",modifiers.is_final)]{nodes[id].attributes.push((key,AttributeValue::Flag(flag)));}
+        },
+        StatementKind::ClassDecl{extends,implements,accessors,modifiers,..}=>{
+            if let Some(e)=extends{nodes[id].attributes.push(("extends",AttributeValue::Text(e.clone())));}
+            nodes[id].attributes.extend([("implements",AttributeValue::Names(implements.clone())),("accessors",AttributeValue::Flag(*accessors)),("abstract",AttributeValue::Flag(modifiers.is_abstract)),("final",AttributeValue::Flag(modifiers.is_final))]);
+        },
+        StatementKind::Import{alias,..}=>{if let Some(a)=alias{nodes[id].attributes.push(("alias",AttributeValue::Text(a.clone())));}},
+        StatementKind::ForLoop{item,index,..}=>{nodes[id].attributes.push(("item",AttributeValue::Text(item.clone())));if let Some(i)=index{nodes[id].attributes.push(("index",AttributeValue::Text(i.clone())));}},
+        _=>{},
+    }
     match &value.kind {
         StatementKind::FunctionDecl{params:p,body,attributes:a,return_type,..}=>{nodes[id].return_type=return_type.clone();attributes(nodes,a,id);params(nodes,p,id);function_body(nodes,body,id,value.body_span);},
         StatementKind::ClassDecl{members,attributes:a,..}=>{attributes(nodes,a,id);for member in members {match member {ClassMember::Statement(s)=>{stmt(nodes,s,id,"members");},ClassMember::Property(p)=>{let property=add(nodes,Kind::Property,Some(p.span),id,"properties",Some(&p.name),false);for a in &p.annotations {let annotation=add(nodes,Kind::Annotation,Some(a.span),property,"annotations",Some(&a.key),false);if let Some(v)=&a.value{expr(nodes,v,annotation,"value");}}}}}},
@@ -110,6 +128,16 @@ fn expr(nodes:&mut Vec<Node>,value:&Expression,parent:usize,edge:&'static str)->
         ExpressionKind::Literal(literal)=>(match literal {Literal::String(..)=>Kind::String,Literal::Number(..)=>Kind::Number,Literal::Boolean(..)=>Kind::Boolean,Literal::Null=>Kind::Null,Literal::Array(..)=>Kind::Array,Literal::Struct(..)=>Kind::Struct,Literal::Function{is_lambda,..}=>if *is_lambda{Kind::Lambda}else{Kind::Closure}},None),
     };
     let id=add(nodes,kind,value.span,parent,edge,name,value.incomplete);
+    match &value.kind {
+        ExpressionKind::Literal(Literal::String(parts))=>{
+            let plain=parts.iter().all(|p|matches!(p,StringPart::Text(_)));
+            nodes[id].attributes.push(("interpolated",AttributeValue::Flag(!plain)));
+            if plain{nodes[id].attributes.push(("value",AttributeValue::Text(parts.iter().filter_map(|p|if let StringPart::Text(t)=p{Some(t.as_str())}else{None}).collect())));}
+        },
+        ExpressionKind::Literal(Literal::Boolean(value))=>nodes[id].attributes.push(("value",AttributeValue::Flag(*value))),
+        ExpressionKind::Literal(Literal::Number(value))=>nodes[id].attributes.push(("value",AttributeValue::Number(*value))),
+        _=>{},
+    }
     match &value.kind {
         ExpressionKind::New{args,..}=>arguments(nodes,args,id),ExpressionKind::Assignment{target:t,value}=>{target(nodes,t,id);expr(nodes,value,id,"value");},ExpressionKind::Binary{left,right,..}|ExpressionKind::Elvis{left,right}=>{expr(nodes,left,id,"left");expr(nodes,right,id,"right");},
         ExpressionKind::UnaryNot(v)|ExpressionKind::UnaryBitwiseNot(v)|ExpressionKind::Spread(v)=>{expr(nodes,v,id,"value");},ExpressionKind::Ternary{condition,then_expr,else_expr}=>{expr(nodes,condition,id,"condition");expr(nodes,then_expr,id,"then");expr(nodes,else_expr,id,"else");},ExpressionKind::FunctionCall{base,args}=>{expr(nodes,base,id,"base");arguments(nodes,args,id);},ExpressionKind::ArrayAccess{base,index}=>{expr(nodes,base,id,"base");expr(nodes,index,id,"index");},ExpressionKind::MemberAccess{base,..}|ExpressionKind::SafeMemberAccess{base,..}|ExpressionKind::Postfix{base,..}=>{expr(nodes,base,id,"base");},ExpressionKind::Prefix{target:t,..}=>target(nodes,t,id),

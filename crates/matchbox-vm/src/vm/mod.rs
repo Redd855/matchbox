@@ -1267,15 +1267,7 @@ impl BxVM for VM {
     }
 
     fn struct_set(&mut self, id: usize, key: &str, val: BxValue) {
-        let key_id = self.struct_key_id(id, key);
-        if let GcObject::Struct(s) = self.heap.get_mut(id) {
-            if let Some(idx) = self.shapes.get_index(s.shape_id, key_id) {
-                s.properties[idx as usize] = val;
-            } else {
-                s.shape_id = self.shapes.transition(s.shape_id, key_id);
-                s.properties.push(val);
-            }
-        }
+        self.struct_set_and_key(id, key, val);
     }
 
     fn struct_get(&self, id: usize, key: &str) -> BxValue {
@@ -1897,6 +1889,20 @@ impl VM {
         found
     }
 
+    /// Keep the write barrier and spelling rules in one path; bindings reuse its key.
+    fn struct_set_and_key(&mut self, id: usize, key: &str, val: BxValue) -> u32 {
+        let key_id = self.struct_key_id(id, key);
+        if let GcObject::Struct(s) = self.heap.get_mut(id) {
+            if let Some(idx) = self.shapes.get_index(s.shape_id, key_id) {
+                s.properties[idx as usize] = val;
+            } else {
+                s.shape_id = self.shapes.transition(s.shape_id, key_id);
+                s.properties.push(val);
+            }
+        }
+        key_id
+    }
+
     fn struct_key_id(&mut self, id: usize, key: &str) -> u32 {
         let case_sensitive = matches!(self.heap.get_opt(id), Some(GcObject::Struct(s)) if s.case_sensitive);
         if case_sensitive {
@@ -2352,10 +2358,15 @@ impl VM {
     // Preserve original BoxLang throws across the existing String native ABI.
     // Scoped save/restore prevents handled/retried/nested callback errors escaping.
     fn native_exception_scope(&mut self, call: impl FnOnce(&mut Self) -> Result<BxValue, String>) -> Result<BxValue, String> {
+        let previous_gc = self.gc_suspended;
+        // Native arguments/temporaries may live only in Rust. Reentrant BoxLang
+        // callbacks must not yield for collection until this boundary returns.
+        self.gc_suspended = true;
         let saved = self.native_callback_exception.take();
         self.native_exception_depth += 1;
         let result = call(self);
         self.native_exception_depth -= 1;
+        self.gc_suspended = previous_gc;
         let raised = self.native_callback_exception.take();
         self.native_callback_exception = match (&result, raised) {
             (Err(message), Some((original, root))) if *message == original => Some((original, root)),
@@ -3995,7 +4006,7 @@ impl VM {
             // run_fiber_to_completion) can run collect_garbage(). Throttled with safe_point_count
             // to avoid checking every single iteration.
             safe_point_count = safe_point_count.wrapping_add(1);
-            if safe_point_count & 1023 == 0 && self.heap.should_collect() {
+            if !self.gc_suspended && (safe_point_count & 1023 == 0 || self.heap.should_collect_promptly()) && self.heap.should_collect() {
                 self.fibers[fiber_idx].frames.last_mut().unwrap().ip = ip;
                 return Ok(None);
             }
@@ -4540,8 +4551,14 @@ impl VM {
                 }
                 op::BIND_LOCAL => {
                     let key = next_word!();
-                    let name = self.read_string_constant(fiber_idx, key as usize)?.to_lowercase();
-                    self.bind_local(fiber_idx, op0 as usize, name);
+                    let mut name = self.read_string_constant(fiber_idx, key as usize)?;
+                    let name = name.as_flat_str();
+                    let folded = if name.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+                        std::borrow::Cow::Borrowed(name)
+                    } else {
+                        std::borrow::Cow::Owned(name.to_lowercase())
+                    };
+                    self.bind_local(fiber_idx, op0 as usize, &folded);
                 }
                 op::CONSTANT => {
                     let idx = op0;
@@ -5701,8 +5718,8 @@ impl VM {
                                 let properties_ptr = &s.properties as *const Vec<BxValue>;
 
                                 let key_id = if s.case_sensitive {
-                                    let name = self.read_string_constant(fiber_idx, idx as usize)?;
-                                    self.interner.get_exact_id(&name)
+                                    let mut name = self.read_string_constant(fiber_idx, idx as usize)?;
+                                    self.interner.get_exact_id(name.as_flat_str())
                                 } else {
                                     Some(name_id)
                                 };
@@ -5922,8 +5939,8 @@ impl VM {
                         }
 
                         let struct_name_id = if matches!(self.heap.get_opt(id), Some(GcObject::Struct(_))) {
-                            let name = self.read_string_constant(fiber_idx, idx as usize)?;
-                            Some(self.struct_key_id(id, &name))
+                            let mut name = self.read_string_constant(fiber_idx, idx as usize)?;
+                            Some(self.struct_key_id(id, name.as_flat_str()))
                         } else {
                             None
                         };
@@ -8793,11 +8810,20 @@ impl VM {
         }
     }
 
-    fn read_string_constant(&mut self, fiber_idx: usize, idx: usize) -> Result<String> {
+    /// Operand names are immutable metadata, not per-frame boxed string values.
+    fn read_string_constant(&mut self, fiber_idx: usize, idx: usize) -> Result<BoxString> {
+        {
+            let frame = self.fibers[fiber_idx].frames.last().unwrap();
+            let chunk = frame.chunk.borrow();
+            if let Constant::String(name) = &chunk.constants()[idx] {
+                return Ok(name.clone());
+            }
+        }
+        // Preserve the existing malformed-operand error path.
         let val = self.read_constant(fiber_idx, idx)?;
         if let Some(id) = val.as_gc_id() {
             if let GcObject::String(s) = self.heap.get(id) {
-                return Ok(s.to_string());
+                return Ok(s.clone());
             }
         }
         bail!("Constant at index {} is not a string: {:?}", idx, val)

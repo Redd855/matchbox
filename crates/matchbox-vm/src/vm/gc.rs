@@ -100,6 +100,7 @@ pub struct Heap {
     marks: Vec<bool>,
     free_list: Vec<GcId>,
     alloc_count: usize,
+    external_pressure: bool,
     next_gc_threshold: usize,
     generations: Vec<u8>,
     dirty: Vec<bool>,
@@ -123,6 +124,7 @@ impl Heap {
             marks: Vec::with_capacity(cap),
             free_list: Vec::new(),
             alloc_count: 0,
+            external_pressure: false,
             next_gc_threshold: config.initial_threshold,
             generations: Vec::with_capacity(cap),
             dirty: Vec::with_capacity(cap),
@@ -158,8 +160,18 @@ impl Heap {
         Ok(root.value)
     }
 
+    fn allocation_weight(obj: &GcObject) -> usize {
+        let bytes = match obj {
+            GcObject::NativeObject(object) => object.borrow().external_allocation_bytes(),
+            _ => 0,
+        };
+        1usize.saturating_add(bytes.div_ceil(std::mem::size_of::<GcObject>()))
+    }
+
     pub fn alloc(&mut self, obj: GcObject) -> GcId {
-        self.alloc_count += 1;
+        let weight = Self::allocation_weight(&obj);
+        self.external_pressure |= weight > 1;
+        self.alloc_count = self.alloc_count.saturating_add(weight);
         if let Some(id) = self.free_list.pop() {
             self.objects[id] = Some(obj);
             self.marks[id] = false;
@@ -182,7 +194,9 @@ impl Heap {
     /// storage cannot grow (e.g. out of memory). The fast path (reusing a
     /// slot from the free list) is identical to `alloc`.
     pub fn try_alloc(&mut self, obj: GcObject) -> Option<GcId> {
-        self.alloc_count += 1;
+        let weight = Self::allocation_weight(&obj);
+        self.external_pressure |= weight > 1;
+        self.alloc_count = self.alloc_count.saturating_add(weight);
         if let Some(id) = self.free_list.pop() {
             self.objects[id] = Some(obj);
             self.marks[id] = false;
@@ -237,6 +251,11 @@ impl Heap {
         self.alloc_count > self.next_gc_threshold
     }
 
+    /// Large external owners cannot wait1024 opcodes before the next safe point.
+    pub fn should_collect_promptly(&self) -> bool {
+        self.external_pressure && self.should_collect()
+    }
+
     /// Returns the current GC threshold (for testing/diagnostics).
     pub fn gc_threshold(&self) -> usize {
         self.next_gc_threshold
@@ -245,6 +264,7 @@ impl Heap {
     pub fn collect(&mut self, roots: &[BxValue]) {
         self.retained_values.retain(|root| root.strong_count() > 0);
         self.alloc_count = 0;
+        self.external_pressure = false;
         self.minor_gc_count += 1;
 
         if self.minor_gc_count >= 8 {
@@ -254,7 +274,8 @@ impl Heap {
             self.minor_collect(roots);
         }
 
-        let live = self.objects.iter().filter(|o| o.is_some()).count();
+        // Each vacant arena slot occurs exactly once in the free list.
+        let live = self.objects.len() - self.free_list.len();
         let dynamic = live.saturating_mul(2).max(self.config.initial_threshold);
         self.next_gc_threshold = dynamic.min(self.config.max_threshold);
     }
@@ -514,6 +535,42 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_threshold_tracks_live_objects_through_reuse_and_retained_graphs() {
+        let config = GCConfig { initial_capacity: 1, initial_threshold: 2, max_threshold: 16, max_objects: Some(12) };
+        let mut heap = Heap::with_config(config.clone());
+        let parent = heap.alloc(GcObject::Array(Vec::new()));
+        let retained = heap.retain_value(BxValue::new_ptr(parent)).unwrap();
+        let check_slots = |heap: &Heap| {
+            let mut free = heap.free_list.clone();
+            free.sort_unstable();
+            let holes: Vec<_> = heap.objects.iter().enumerate().filter_map(|(id, o)| o.is_none().then_some(id)).collect();
+            assert_eq!(free, holes); // Also rejects duplicate free IDs.
+            assert_eq!(heap.objects.len() - heap.free_list.len(), heap.objects.iter().filter(|o| o.is_some()).count());
+        };
+        for cycle in 0..32 {
+            let child = heap.try_alloc(GcObject::Bytes(vec![cycle])).unwrap();
+            if let GcObject::Array(values) = heap.get_mut(parent) {
+                *values = vec![BxValue::new_ptr(child)]; // Old-to-young barrier; previous child becomes garbage.
+            } else { panic!("retained parent lost"); }
+            while heap.try_alloc(GcObject::Bytes(Vec::new())).is_some() { check_slots(&heap); }
+            check_slots(&heap); // Failed bounded allocation cannot add a phantom slot.
+            heap.collect(&[]); // Reachability is supplied by the retained root, not the caller.
+            check_slots(&heap);
+            let live = (0..12).filter(|id| heap.get_opt(*id).is_some()).count();
+            assert_eq!(heap.gc_threshold(), (live * 2).max(config.initial_threshold).min(config.max_threshold));
+            assert_eq!(heap.read_retained_value(&retained).unwrap().as_gc_id(), Some(parent));
+            assert!(matches!(heap.get(child), GcObject::Bytes(bytes) if bytes == &[cycle]));
+            assert!(!heap.should_collect());
+        }
+        drop(retained);
+        for _ in 0..8 { heap.collect(&[]); check_slots(&heap); }
+        assert!((0..12).all(|id| heap.get_opt(id).is_none()));
+        assert_eq!(heap.gc_threshold(), config.initial_threshold);
+        for _ in 0..12 { assert!(heap.try_alloc(GcObject::Bytes(Vec::new())).is_some()); check_slots(&heap); }
+        assert!(heap.try_alloc(GcObject::Bytes(Vec::new())).is_none());
+    }
 
     #[test]
     fn try_alloc_succeeds_with_free_list_reuse() {

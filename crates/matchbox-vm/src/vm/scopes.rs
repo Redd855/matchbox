@@ -136,12 +136,11 @@ impl VM {
         scope
     }
 
-    pub(super) fn bind_local(&mut self, fiber: usize, slot: usize, name: String) {
+    pub(super) fn bind_local(&mut self, fiber: usize, slot: usize, name: &str) {
         let frame = self.fibers[fiber].frames.last().unwrap();
         let value = self.fibers[fiber].stack[frame.stack_base + slot];
         let scope = self.local_scope(fiber).as_gc_id().unwrap();
-        self.struct_set(scope, &name, value);
-        let key = self.struct_key_lookup_id(scope, &name).unwrap();
+        let key = self.struct_set_and_key(scope, name, value);
         let frame = self.fibers[fiber].frames.last_mut().unwrap();
         // ponytail: bounded scan of at most 32 slots; shared/sparse frames keep ordinary guards.
         // Different block slots may alias one function-local name without scope exposure.

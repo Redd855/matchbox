@@ -45,4 +45,18 @@ if(!failed){throw "Collection callback original throw lost";}
 failed=false;
 try{boxASTVisit(callbackTree,function(node,phase,state){return 99;},{});}catch(ExpressionException error){failed=true;}
 if(!failed){throw "Handled callback errors contaminated a later native validation error";}
+// External snapshot pressure inside a synchronous native callback must not
+// strand the callback at a GC safe point; its retained views still own syntax.
+function pressureNative(node,phase,state){
+    var parsed=boxAST(source=state.source,returnType="native");
+    state.retained=parsed.nodes("Number")[1];
+    return 2;
+}
+var pressureState={source:repeatString("var value=1;",2000)};
+var pressureWalk=boxASTVisit(callbackTree,pressureNative,pressureState);
+if(pressureWalk.completed||pressureState.retained.text()!="1"){throw "Native visitor stalled/lost ownership under snapshot pressure";}
+var pressureMapped=arrayMap([1],function(item){return boxAST(source=pressureState.source,returnType="native").nodes("Number")[1];});
+for(var pressureChurn=1;pressureChurn<=12000;pressureChurn++){var pressureGarbage={value:pressureChurn};}
+if(pressureState.retained.text()!="1"||pressureMapped[1].text()!="1"){throw "Callback snapshot ownership changed after collection";}
+println("Native and collection callbacks / snapshot pressure / retained ownership: OK");
 println("Native AST / real BoxLang visitor / independent export / readonly / retained ownership / stop / original exceptions / reentrancy: OK");

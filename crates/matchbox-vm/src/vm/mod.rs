@@ -406,6 +406,7 @@ pub struct CallFrame {
     context: Option<BxValue>,
     // Invocation-local numeric scope bindings; no GC values or shared-program IDs.
     local_names: scopes::SlotBindings,
+    scope_mode: scopes::ScopeMode,
     #[cfg(feature = "jit")]
     jit_loop_attempted: bool,
     #[cfg(feature = "jit")]
@@ -2083,6 +2084,7 @@ impl VM {
                 chunk,
                 context: None,
                 ip: 0,
+                scope_mode: scopes::ScopeMode::Binding,
                 local_scope: None,
                 local_names: scopes::SlotBindings::new(),
                 stack_base: 1,
@@ -3190,6 +3192,7 @@ impl VM {
                 promoted_constants: Vec::new(),
                 local_scope: None,
                 local_names: scopes::SlotBindings::new(),
+                scope_mode: scopes::ScopeMode::Binding,
                 context: None,
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
@@ -3249,6 +3252,7 @@ impl VM {
                 promoted_constants: Vec::new(),
                 local_scope: None,
                 local_names: scopes::SlotBindings::new(),
+                scope_mode: scopes::ScopeMode::Binding,
                 context: None,
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
@@ -3407,6 +3411,7 @@ impl VM {
                 promoted_constants: Vec::new(),
                 local_scope: None,
                 local_names: scopes::SlotBindings::new(),
+                scope_mode: scopes::ScopeMode::Binding,
                 context: None,
                 #[cfg(feature = "jit")]
                 jit_loop_attempted: false,
@@ -3645,6 +3650,7 @@ impl VM {
                 chunk,
                 context: None,
                 ip: 0,
+                scope_mode: scopes::ScopeMode::Binding,
                 local_scope: None,
                 local_names: scopes::SlotBindings::new(),
                 stack_base: 1,
@@ -4517,6 +4523,7 @@ impl VM {
                     self.set_local_value(fiber_idx, op0 as usize, val);
                 }
                 op::FUNCTION_ENTER => {
+                    self.enter_frame_scopes(fiber_idx);
                     flush_ip!();
                     if let Err(error) = self.enter_function_events(fiber_idx) {
                         self.throw_error(fiber_idx, &error)?;
@@ -6481,6 +6488,7 @@ impl VM {
                                 function: Rc::new(constructor),
                                 chunk: sub_chunk,
                                 ip: 0,
+                                scope_mode: scopes::ScopeMode::Binding,
                                 local_scope: None,
                                 local_names: scopes::SlotBindings::new(),
                                 stack_base: class_idx + 1 + arg_count as usize,
@@ -7488,6 +7496,7 @@ impl VM {
                             stack
                         },
                         frames: vec![CallFrame {
+                            scope_mode: scopes::ScopeMode::Binding,
                             #[cfg(feature = "jit")]
                             jit_loop_attempted: false,
                             #[cfg(feature = "jit")]
@@ -7624,6 +7633,7 @@ impl VM {
                 function: Rc::new(constructor),
                 chunk: sub_chunk,
                 ip: 0,
+                scope_mode: scopes::ScopeMode::Binding,
                 local_scope: None,
                 local_names: scopes::SlotBindings::new(),
                 stack_base: 1,
@@ -8040,6 +8050,7 @@ impl VM {
                         chunk: sub_chunk,
                         ip: 0,
                         local_scope: None,
+                        scope_mode: scopes::ScopeMode::Binding,
                         local_names: scopes::SlotBindings::new(),
                         stack_base: 0,
                         receiver: func.captured_receiver,
@@ -8313,6 +8324,7 @@ impl VM {
                                 function,
                                 chunk: sub_chunk,
                                 ip: 0,
+                                scope_mode: scopes::ScopeMode::Binding,
                                 local_scope: None,
                                 local_names: scopes::SlotBindings::new(),
                                 stack_base,
@@ -8491,6 +8503,7 @@ impl VM {
                         let constant_count = sub_chunk.borrow().constants().len();
                         let stack_base = self.fibers[fiber_idx].stack.len() - func.arity as usize;
                         let frame = CallFrame {
+                            scope_mode: scopes::ScopeMode::Binding,
                             #[cfg(feature = "jit")]
                             jit_loop_attempted: false,
                             #[cfg(feature = "jit")]
@@ -8534,6 +8547,7 @@ impl VM {
                             jit_construct_unsupported: None,
                             context: None,
                             local_scope: None,
+                            scope_mode: scopes::ScopeMode::Binding,
                             local_names: scopes::SlotBindings::new(),
                             function: on_missing.clone(),
                             chunk: sub_chunk,

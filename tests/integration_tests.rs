@@ -104,6 +104,14 @@ script_test!(
 script_test!(vm_functions, "vm_functions.bxs");
 script_test!(vm_function_execution, "vm_function_execution.bxs");
 script_test!(vm_scope_bindings, "vm_scope_bindings.bxs");
+script_test!(guarded_frame_local_alias, "test01-local.bxs");
+script_test!(guarded_frame_argument_alias, "test02-arguments.bxs");
+script_test!(guarded_frame_capture, "test03-capture.bxs");
+script_test!(guarded_frame_context, "test04-context.bxs");
+script_test!(guarded_frame_block_rebinding, "test05-rebinding.bxs");
+script_test!(guarded_frame_duplicate_parameters, "test06-parameter-names.bxs");
+script_test!(guarded_frame_boundaries, "test07-boundaries.bxs");
+script_test!(guarded_frame_wide_arguments, "guarded_frame_wide_arguments.bxs");
 script_test!(jit_function_contract, "jit_function_contract.bxs");
 script_test!(jit_loop_contract, "jit_loop_contract.bxs");
 script_test!(vm_lexical_closures, "vm_lexical_closures.bxs");

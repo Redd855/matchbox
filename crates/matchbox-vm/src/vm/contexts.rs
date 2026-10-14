@@ -119,6 +119,7 @@ impl VM {
     pub(crate) fn execution_context(&mut self) -> Result<BxValue, String> {
         let mut scopes = HashMap::new();
         if let Some(fiber) = self.current_fiber_idx {
+            self.expose_frame_scopes(fiber);
             let frame = self.fibers[fiber]
                 .frames
                 .last()

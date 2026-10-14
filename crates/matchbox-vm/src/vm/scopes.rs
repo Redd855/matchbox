@@ -84,7 +84,36 @@ mod slot_binding_tests {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScopeMode { Binding, Stack, Shared }
+
 impl VM {
+    pub(super) fn enter_frame_scopes(&mut self, fiber: usize) {
+        let frame = self.fibers[fiber].frames.last_mut().unwrap();
+        if frame.scope_mode == ScopeMode::Binding
+            && frame.function.kind == crate::types::FunctionKind::Udf
+            && frame.function.arity as usize == frame.function.params.len() + 1
+            && frame.function.params.len() < 32
+            && frame.function.params.iter().enumerate().all(|(slot, name)|
+                !name.chars().any(char::is_uppercase) && !frame.function.params[..slot].contains(name))
+            && frame.function.captured_scopes.is_empty()
+            && frame.function.captured_receiver.is_none()
+            && frame.receiver.is_none()
+            && frame.context.is_none()
+            && !cfg!(feature = "debugger")
+        {
+            frame.scope_mode = ScopeMode::Stack;
+        }
+    }
+
+    pub(super) fn expose_frame_scopes(&mut self, fiber: usize) {
+        // Permanent transition: keep live dictionaries and the existing deletion fallback.
+        // Do not copy aliased dictionary values back into stack fallback slots here.
+        if let Some(frame) = self.fibers[fiber].frames.last_mut() {
+            frame.scope_mode = ScopeMode::Shared;
+        }
+    }
+
     pub(super) fn arguments_scope(&self, fiber: usize) -> Option<BxValue> {
         let frame = self.fibers[fiber].frames.last()?;
         if frame.function.kind == crate::types::FunctionKind::ComponentBody {
@@ -113,6 +142,15 @@ impl VM {
         let scope = self.local_scope(fiber).as_gc_id().unwrap();
         self.struct_set(scope, &name, value);
         let key = self.struct_key_lookup_id(scope, &name).unwrap();
+        let frame = self.fibers[fiber].frames.last_mut().unwrap();
+        // ponytail: bounded scan of at most 32 slots; shared/sparse frames keep ordinary guards.
+        // Different block slots may alias one function-local name without scope exposure.
+        if slot >= 32 || (frame.scope_mode == ScopeMode::Stack
+            && frame.local_names.get(&slot).is_none_or(|old| !old.local || old.key != key)
+            && frame.local_names.values().any(|old| old.local && old.key == key))
+        {
+            frame.scope_mode = ScopeMode::Shared;
+        }
         self.fibers[fiber]
             .frames
             .last_mut()
@@ -174,6 +212,15 @@ impl VM {
 
     pub(super) fn local_value(&mut self, fiber: usize, slot: usize) -> BxValue {
         let frame = self.fibers[fiber].frames.last().unwrap();
+        if frame.scope_mode == ScopeMode::Stack && slot == frame.function.params.len() {
+            // The compiler prologue stays dictionary-authoritative in Binding mode.
+            // A body read of its implicit arguments slot is a real scope exposure.
+            self.expose_frame_scopes(fiber);
+        }
+        let frame = self.fibers[fiber].frames.last().unwrap();
+        if frame.scope_mode == ScopeMode::Stack {
+            return self.fibers[fiber].stack[frame.stack_base + slot];
+        }
         if frame.function.kind == crate::types::FunctionKind::ComponentBody
             && slot == frame.function.params.len()
             && let Some(arguments) = self.arguments_scope(fiber)
@@ -293,9 +340,11 @@ impl VM {
 
     pub(super) fn function_scope_value(&mut self, fiber: usize, name: &str) -> Option<BxValue> {
         if name == "local" && self.arguments_scope(fiber).is_some() {
+            self.expose_frame_scopes(fiber);
             return Some(self.local_scope(fiber));
         }
         if name == "arguments" {
+            self.expose_frame_scopes(fiber);
             return self.arguments_scope(fiber);
         }
         self.function_scope_entry(fiber, name)
@@ -319,6 +368,7 @@ impl VM {
         value: BxValue,
     ) -> bool {
         if let Some((scope, _)) = self.function_scope_entry(fiber, name) {
+            self.expose_frame_scopes(fiber);
             self.struct_set(scope.as_gc_id().unwrap(), name, value);
             return true;
         }
@@ -326,6 +376,7 @@ impl VM {
     }
 
     pub(super) fn capture_scopes(&mut self, fiber: usize) -> Vec<BxValue> {
+        self.expose_frame_scopes(fiber);
         let function = &self.fibers[fiber].frames.last().unwrap().function;
         if function.kind == crate::types::FunctionKind::ComponentBody {
             return function.captured_scopes.clone();

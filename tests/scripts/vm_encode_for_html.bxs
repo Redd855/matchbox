@@ -1,5 +1,5 @@
-// encodeForHTML /htmlEditFotmat
-// Expected valyes from BoxLang JVM:Ortus BoxLang™ v1.17.6+65
+// encodeForHTML / htmlEditFormat
+// Expected values from BoxLang JVM: Ortus BoxLang™ v1.17.6+65
 // see tests/fixtures/encode_for_html/expected-jvm.txt
 // direct calls and no #39 Case
 

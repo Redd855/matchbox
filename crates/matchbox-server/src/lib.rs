@@ -54,7 +54,9 @@ pub fn request_data_from_parts(
     let mut header_map = HashMap::new();
     for (name, value) in headers.iter() {
         if let Ok(value) = value.to_str() {
-            header_map.insert(name.as_str().to_lowercase(), value.to_string());
+            header_map
+                .entry(name.as_str().to_lowercase())
+                .or_insert_with(|| value.to_string());
         }
     }
     let cookie_map = header_map
@@ -557,8 +559,15 @@ async fn handler(
         form: HashMap::new(),
         headers: parts
             .headers
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().into(), v.into())))
+            .keys()
+            .filter_map(|k| {
+                parts
+                    .headers
+                    .get(k)?
+                    .to_str()
+                    .ok()
+                    .map(|v| (k.as_str().into(), v.into()))
+            })
             .collect(),
         body,
     };

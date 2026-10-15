@@ -192,7 +192,7 @@ fn headers_to_map(headers: Fields) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (name, value) in headers.entries() {
         if let Ok(value) = String::from_utf8(value) {
-            map.insert(name.to_ascii_lowercase(), value);
+            map.entry(name.to_ascii_lowercase()).or_insert(value);
         }
     }
     map

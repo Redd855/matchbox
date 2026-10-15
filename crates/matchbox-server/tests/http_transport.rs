@@ -35,7 +35,7 @@ fn http_transport_preserves_body_protocol_peer_and_repeated_headers() {
         bx:header name="X-Repeat" value="second";
         writeOutput("discard");
         bx:content type="text/plain";
-        writeOutput(d.method & "|" & d.protocol & "|" & d.content & "|" & cgi.query_string & "|" & cgi.remote_addr);
+        writeOutput(d.method & "|" & d.protocol & "|" & d.content & "|" & cgi.query_string & "|" & cgi.remote_addr & "|" & d.headers["x-test"] & "|" & cgi.http_x_test);
     "#).unwrap();
     let mut server = Server(
         Command::new(env!("CARGO_BIN_EXE_matchbox_server"))
@@ -60,7 +60,7 @@ fn http_transport_preserves_body_protocol_peer_and_repeated_headers() {
     let response = request(
         port,
         &format!(
-            "PATCH /request.bxs?raw=%2B HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "PATCH /request.bxs?raw=%2B HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Test: first\r\nX-Test: second\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
     );
@@ -73,7 +73,7 @@ fn http_transport_preserves_body_protocol_peer_and_repeated_headers() {
     assert!(headers.contains("content-type: text/plain"), "{headers}");
     assert_eq!(
         body,
-        r#"PATCH|HTTP/1.0|{"name":"BoxLang"}|raw=%2B|127.0.0.1"#
+        r#"PATCH|HTTP/1.0|{"name":"BoxLang"}|raw=%2B|127.0.0.1|first|first"#
     );
     let response = request(
         port,

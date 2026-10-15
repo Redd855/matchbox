@@ -97,6 +97,30 @@ fn binary_bodies_remain_binary_and_named_include_body_can_omit_them() {
 }
 
 #[test]
+fn absent_body_is_text_but_announced_empty_chunked_binary_body_is_binary() {
+    let engine =
+        engine(r#"<bx:script>writeOutput(isBinary(getHTTPRequestData().content));</bx:script>"#);
+    for (chunked, expected) in [(false, "false"), (true, "true")] {
+        let mut headers =
+            HashMap::from([("content-type".into(), "application/octet-stream".into())]);
+        if chunked {
+            headers.insert("transfer-encoding".into(), "chunked".into());
+        } else {
+            headers.insert("content-length".into(), "0".into());
+        }
+        let response = engine
+            .handle(WebrootRequest {
+                method: "POST".into(),
+                path: "/".into(),
+                headers,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(response.body, expected.as_bytes());
+    }
+}
+
+#[test]
 fn transport_context_preserves_original_url_and_alias_script_name() {
     let engine = engine(
         r##"<bx:output>#cgi.script_name#|#cgi.query_string#|#cgi.request_url#|#cgi.remote_addr#|#cgi.server_protocol#|#cgi.server_name#|#cgi.server_port#|#cgi.http_x_test#</bx:output>"##,

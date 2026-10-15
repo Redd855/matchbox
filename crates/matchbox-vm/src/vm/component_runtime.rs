@@ -33,9 +33,8 @@ impl BxNativeObject for BodyResult {
         args: &[BxValue],
     ) -> Result<BxValue, String> {
         let name = name.to_ascii_lowercase();
-        if !args.is_empty()
-            && !(matches!(name.as_str(), "isbreak" | "iscontinue") && args.len() == 1)
-        {
+        let has_label = matches!(name.as_str(), "isbreak" | "iscontinue") && args.len() == 1;
+        if !args.is_empty() && !has_label {
             return Err("Invalid component body result arguments".into());
         }
         match name.as_str() {

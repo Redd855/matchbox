@@ -78,6 +78,7 @@ pub(crate) fn install_web_context(
                             }
                             let mut response = state.borrow_mut();
                             append_header(&mut response, "content-type", &content_type)?;
+                            // Validate before replacing, so a caught error leaves headers intact.
                             let last = response.headers.pop().unwrap();
                             response.headers.retain(|(name, _)| name != "content-type");
                             response.headers.push(last);
@@ -150,9 +151,17 @@ pub(crate) fn install_web_context(
                         .get("content-type")
                         .map(String::as_str)
                         .unwrap_or("");
-                    let content = if text_content_type(content_type)
-                        || (request.body.is_empty() && content_type.is_empty())
-                    {
+                    let chunked = request
+                        .headers
+                        .get("transfer-encoding")
+                        .is_some_and(|value| {
+                            value
+                                .split(',')
+                                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+                        });
+                    let no_body = request.body.is_empty()
+                        && (!chunked || !request.headers.contains_key("content-type"));
+                    let content = if text_content_type(content_type) || no_body {
                         BxValue::new_ptr(
                             vm.string_new(String::from_utf8_lossy(&request.body).into_owned()),
                         )

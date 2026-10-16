@@ -117,7 +117,10 @@ impl FileSystemAssetStore {
 
 impl AssetStore for FileSystemAssetStore {
     fn source_path(&self, relative_path: &str) -> Result<String> {
-        Ok(self.full_path(relative_path)?.to_string_lossy().into_owned())
+        Ok(self
+            .full_path(relative_path)?
+            .to_string_lossy()
+            .into_owned())
     }
 
     fn metadata(&self, relative_path: &str) -> Result<Option<AssetMetadata>> {
@@ -257,7 +260,9 @@ impl<S: AssetStore + Send + Sync + 'static> WebrootEngine<S> {
 
     pub fn with_runtime(store: S, config: WebrootConfig, runtime: WebrootRuntime) -> Self {
         Self {
-            store: Arc::new(store), config, runtime,
+            store: Arc::new(store),
+            config,
+            runtime,
             sessions: Mutex::new(HashMap::new()),
             scope_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -300,10 +305,15 @@ impl<S: AssetStore + Send + Sync + 'static> WebrootEngine<S> {
             .map(|metadata| metadata.is_dir)
             .unwrap_or(false)
         {
-            asset_path = first_existing_index(self.store.as_ref(), &asset_path)?.unwrap_or(asset_path);
+            asset_path =
+                first_existing_index(self.store.as_ref(), &asset_path)?.unwrap_or(asset_path);
         }
 
-        let extension = Path::new(&asset_path).extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+        let extension = Path::new(&asset_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if matches!(extension.as_str(), "bx" | "cfm" | "cfc" | "cfs" | "cfml") {
             return Ok(text_response(501, "Unsupported executable source type"));
         }
@@ -311,7 +321,9 @@ impl<S: AssetStore + Send + Sync + 'static> WebrootEngine<S> {
         let mut response = if is_template_path(&asset_path) {
             self.render_template(&asset_path, request, context)?
         } else {
-            let Some(bytes) = bytes else { return Ok(text_response(404, "Not Found")); };
+            let Some(bytes) = bytes else {
+                return Ok(text_response(404, "Not Found"));
+            };
             if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
                 return Ok(text_response(405, "Method Not Allowed"));
             }
@@ -362,15 +374,40 @@ impl<S: AssetStore + Send + Sync + 'static> WebrootEngine<S> {
         Ok(None)
     }
 
-    fn render_template(&self, asset_path: &str, request: WebrootRequest, context: WebrootContext) -> Result<WebrootResponse> {
-        let cookies = request.headers.get("cookie").map(|raw| parse_cookie_header(raw)).unwrap_or_default();
-        let session_id = cookies.get("MBX_SESSION_ID").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let session = self.sessions.lock().unwrap().get(&session_id).cloned().unwrap_or_default();
+    fn render_template(
+        &self,
+        asset_path: &str,
+        request: WebrootRequest,
+        context: WebrootContext,
+    ) -> Result<WebrootResponse> {
+        let cookies = request
+            .headers
+            .get("cookie")
+            .map(|raw| parse_cookie_header(raw))
+            .unwrap_or_default();
+        let session_id = cookies
+            .get("MBX_SESSION_ID")
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
         let result = self.runtime.render(RenderJob {
-            store: self.store.clone(), asset_path: asset_path.into(), scope_id: self.scope_id.clone(),
-            request, context, session_id: session_id.clone(), session,
+            store: self.store.clone(),
+            asset_path: asset_path.into(),
+            scope_id: self.scope_id.clone(),
+            request,
+            context,
+            session_id: session_id.clone(),
+            session,
         })?;
-        if let Some(session) = result.session { self.sessions.lock().unwrap().insert(session_id, session); }
+        if let Some(session) = result.session {
+            self.sessions.lock().unwrap().insert(session_id, session);
+        }
         Ok(result.response)
     }
 }

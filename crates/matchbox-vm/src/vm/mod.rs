@@ -1886,6 +1886,9 @@ impl VM {
                     found = inst.variables.borrow().get(name).copied();
                 }
             }
+            if found.is_none() && self.instance_has_method(receiver, name) {
+                found = self.method_reference(receiver, name).ok();
+            }
         }
         if found.is_none() && !lambda && name == "variables" {
             let proxy = VariablesScopeProxy { variables: Rc::clone(&self.fibers[fiber].variables) };
@@ -3179,7 +3182,10 @@ impl VM {
         if let Some(receiver) = receiver { self.instance_class_name(receiver)?; }
         let mut chunk = chunk.clone_without_runtime_caches();
         chunk.ensure_caches();
-        self.interpret_chunk_shared_current_task(Chunk::default(), Rc::new(RefCell::new(chunk)), receiver)
+        let previous = self.current_fiber_idx;
+        let result = self.interpret_chunk_shared_current_task(Chunk::default(), Rc::new(RefCell::new(chunk)), receiver);
+        self.current_fiber_idx = previous;
+        result
     }
 
     fn interpret_chunk_shared(

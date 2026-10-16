@@ -1,7 +1,8 @@
 //! Buffered HTTP multipart parsing with request-owned, securely created temporary files.
 use crate::webroot_core::WebrootRequest;
 use anyhow::{Context, Result, ensure};
-use std::{io::Write, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
+use tokio::io::AsyncWriteExt;
 #[derive(Clone, Debug)]
 pub struct UploadedFile {
     pub field: String,
@@ -18,10 +19,10 @@ pub(crate) struct Cleanup(pub Vec<UploadedFile>);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         for file in &self.0 {
-            if let Err(error) = std::fs::remove_file(file.path()) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("Removing upload temporary file: {error}");
-                }
+            if let Err(error) = std::fs::remove_file(file.path())
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("Removing upload temporary file: {error}");
             }
         }
     }
@@ -71,12 +72,23 @@ pub async fn parse(request: &mut WebrootRequest) -> Result<()> {
         let bytes = field.bytes().await.context("Malformed multipart field")?;
         let empty_file = filename.as_ref().is_some_and(String::is_empty);
         let value = if let Some(filename) = filename.filter(|name| !name.is_empty()) {
-            let mut file = tempfile::Builder::new()
+            let file = tempfile::Builder::new()
                 .prefix("matchbox-upload-")
                 .tempfile()
                 .context("Creating upload temporary file")?;
-            file.write_all(&bytes)
+            let mut writer = tokio::fs::File::from_std(
+                file.as_file()
+                    .try_clone()
+                    .context("Opening upload temporary file")?,
+            );
+            writer
+                .write_all(&bytes)
+                .await
                 .context("Writing upload temporary file")?;
+            writer
+                .flush()
+                .await
+                .context("Flushing upload temporary file")?;
             let path = Arc::new(file.into_temp_path());
             let value = path.to_string_lossy().into_owned();
             uploads.push(UploadedFile {

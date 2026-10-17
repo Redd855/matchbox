@@ -398,7 +398,12 @@ impl<S: AssetStore + Send + Sync + 'static> WebrootEngine<S> {
 pub(crate) fn insert_scope(vm: &mut VM, name: &str, values: &HashMap<String, String>) -> usize {
     let scope_id = vm.struct_new();
     vm.insert_global(name.to_string(), BxValue::new_ptr(scope_id));
-    for (key, value) in values {
+    let mut entries: Vec<_> = values.iter().collect();
+    if name == "cgi" {
+        // Reuse shape transitions for identical CGI field sets across requests.
+        entries.sort_unstable_by_key(|(key, _)| *key);
+    }
+    for (key, value) in entries {
         let value_id = vm.string_new(value.clone());
         vm.struct_set(scope_id, key, BxValue::new_ptr(value_id));
     }

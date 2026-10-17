@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MATH_RNG: &str = "__matchboxMathRng";

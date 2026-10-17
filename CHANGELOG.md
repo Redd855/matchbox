@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WASM time traps**: The VM scheduler and `getTickCount()` used `std::time` clocks, which panic on `wasm32-unknown-unknown` (`time not implemented on this platform`). Calls such as `sleep()`, `getTickCount()` and member functions like `[1,2,3].map(...)` trapped in browser builds. They now use `web_time`, which is `std::time` on native targets.
+
 ## [0.11.0] - 2026-10-02
 
 ### Added

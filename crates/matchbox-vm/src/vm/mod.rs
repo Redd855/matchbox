@@ -29,7 +29,8 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 use std::vec;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);

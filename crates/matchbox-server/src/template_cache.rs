@@ -94,8 +94,7 @@ impl TemplateCache {
         // Budget serialized program weight plus retained source/key bytes, not a
         // claim of exact resident memory. Oversized programs execute uncached.
         let mut weight = Weight(source.len() + filename.len() + scope.len() + path.len());
-        // Literal includes/classes/interfaces can be compiled into this program.
-        // Without a dependency graph, compile those paths afresh rather than serving stale code.
+        // shortcut: source dependencies execute uncached, upgrade when dependency-graph invalidation exists.
         if !compiler.has_source_dependencies()
             && weight.0 <= MAX_BYTES
             && serde_json::to_writer(&mut weight, &chunk).is_ok()

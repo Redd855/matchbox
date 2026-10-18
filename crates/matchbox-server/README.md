@@ -136,6 +136,17 @@ runtime. Asset stores must be Send + Sync and can implement `source_path()` to
 supply a confined physical filename for native compilation and relative imports.
 The native frontend shares one runtime across its aliases.
 
+The owning runtime worker reuses compiled request templates (not responses or
+request values). Every load still reads through the asset store and compares
+source bytes and filename, so edits—including same-size/same-mtime changes—,
+deletions and store access checks remain visible. Mount identity, receiver/class
+context and module-class mode are separate cache keys; executions receive fresh
+runtime caches. Retention is LRU-bounded to 64 entries and 16 MiB of serialized
+program/source/key weight (not an exact resident-memory cap); oversized entries
+execute uncached. Literal includes and compiler-resolved source dependencies
+bypass reuse until dependency-graph invalidation exists. Dynamic includes load
+independently. `Application.bx` listener construction/compilation is unchanged.
+
 The VM's `with_isolated_globals()` restores bindings/output/control state on
 success, errors and panics. Escaping heap values require `retain_value()` roots.
 Global inline caches are cleared and unreachable request objects collected at

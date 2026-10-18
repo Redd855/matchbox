@@ -1,6 +1,7 @@
 mod app_server;
 mod application;
 mod application_runtime;
+mod template_cache;
 mod web_context;
 mod cookies;
 mod sessions;

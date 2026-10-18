@@ -14,7 +14,7 @@ use matchbox_vm::{
     vm::{AbortSignal, VM, chunk::Chunk, gc::RootedValue},
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::{Component, Path, PathBuf},
     rc::Rc,
@@ -38,6 +38,7 @@ struct ApplicationState {
 pub(crate) struct ApplicationRuntime {
     vm: VM,
     applications: HashMap<String, ApplicationState>,
+    templates: Rc<RefCell<crate::template_cache::TemplateCache>>,
     #[cfg(not(target_family = "wasm"))]
     modules: Option<matchbox_vm::bundle::LoadedModules>,
 }
@@ -46,6 +47,7 @@ impl ApplicationRuntime {
         Self {
             vm: VM::new(),
             applications: HashMap::new(),
+            templates: Rc::new(RefCell::new(Default::default())),
             #[cfg(not(target_family = "wasm"))]
             modules: None,
         }
@@ -77,9 +79,9 @@ impl ApplicationRuntime {
     pub(crate) fn render(&mut self, job: RenderJob) -> Result<RenderOutput> {
         self.expire();
         let Self {
-            vm, applications, ..
+            vm, applications, templates, ..
         } = self;
-        vm.with_isolated_globals(|vm| render(vm, applications, job))
+        vm.with_isolated_globals(|vm| render(vm, applications, templates.clone(), job))
     }
     pub(crate) fn expire(&mut self) {
         for app in self.applications.values() {
@@ -146,10 +148,11 @@ fn end_application(vm: &mut VM, app: ApplicationState) {
 fn render(
     vm: &mut VM,
     applications: &mut HashMap<String, ApplicationState>,
+    templates: Rc<RefCell<crate::template_cache::TemplateCache>>,
     job: RenderJob,
 ) -> Result<RenderOutput> {
     let debug = job.context.debug;
-    match render_request(vm, applications, job) {
+    match render_request(vm, applications, templates, job) {
         Ok(output) => Ok(output),
         Err(error) => {
             eprintln!("Request failed: {error}");
@@ -163,6 +166,7 @@ fn render(
 fn render_request(
     vm: &mut VM,
     applications: &mut HashMap<String, ApplicationState>,
+    templates: Rc<RefCell<crate::template_cache::TemplateCache>>,
     job: RenderJob,
 ) -> Result<RenderOutput> {
     vm.begin_output_capture();
@@ -205,6 +209,8 @@ fn render_request(
         .to_string();
     let store = job.store.clone();
     let include_depth = Rc::new(Cell::new(0));
+    let include_templates = templates.clone();
+    let include_scope = job.scope_id.clone();
     vm.register_callback(
         "include",
         NativeCallback {
@@ -230,7 +236,9 @@ fn render_request(
                     .map_err(|error| error.to_string())?;
                 let receiver = vm.current_receiver();
                 let chunk = load_template(
+                    &include_templates,
                     store.as_ref(),
+                    &include_scope,
                     &path,
                     receiver.is_some(),
                     vm.has_global_function("getModuleInfo"),
@@ -417,7 +425,9 @@ fn render_request(
                 if vm.instance_has_method(listener, "onRequest") {
                     hook(vm, listener, "onRequest", vec![target])?;
                 } else if let Some(chunk) = load_template(
+                    &templates,
                     job.store.as_ref(),
+                    &job.scope_id,
                     &job.asset_path,
                     true,
                     vm.has_global_function("getModuleInfo"),
@@ -442,7 +452,9 @@ fn render_request(
             }
             hook(vm, listener, "onRequestEnd", vec![target])?;
         } else if let Some(chunk) = load_template(
+            &templates,
             job.store.as_ref(),
+            &job.scope_id,
             &job.asset_path,
             false,
             vm.has_global_function("getModuleInfo"),
@@ -553,32 +565,16 @@ fn find_application(store: &dyn AssetStore, asset: &str) -> Result<Option<(Strin
         }
     }
 }
+// End the cache borrow before execution, which can recursively include templates.
 fn load_template(
+    templates: &RefCell<crate::template_cache::TemplateCache>,
     store: &dyn AssetStore,
+    scope: &str,
     path: &str,
     class_context: bool,
     module_classes: bool,
 ) -> Result<Option<Chunk>> {
-    if !class_context && let Some(chunk) = store.compiled_template(path)? {
-        return Ok(Some(chunk));
-    }
-    let Some(bytes) = store.read(path)? else {
-        return Ok(None);
-    };
-    let source = String::from_utf8(bytes)?;
-    let filename = store.source_path(path)?;
-    let ast = if path.ends_with(".bxm") {
-        parser::parse_bxm(&source, Some(&filename))?
-    } else {
-        parser::parse(&source, Some(&filename))?
-    };
-    let mut compiler = Compiler::new(&filename);
-    compiler.runtime_module_classes = module_classes;
-    Ok(Some(if class_context {
-        compiler.compile_class_template(&ast, &source)?
-    } else {
-        compiler.compile(&ast, &source)?
-    }))
+    templates.borrow_mut().load(store, scope, path, class_context, module_classes)
 }
 fn include_path(
     store: &dyn AssetStore,

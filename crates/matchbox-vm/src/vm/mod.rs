@@ -521,7 +521,7 @@ pub struct VM {
     pub fibers: Vec<BxFiber>,
     pub global_names: HashMap<u32, usize>,
     pub global_values: Vec<BxValue>,
-    global_bifs: HashSet<String>,
+    global_bifs: HashSet<Rc<str>>,
     struct_assignment_hooks: HashMap<usize, (Rc<gc::RootedValue>, crate::types::NativeCallback)>,
     pub script_variables: Rc<RefCell<HashMap<String, BxValue>>>,
     pub current_fiber_idx: Option<usize>,
@@ -1501,7 +1501,7 @@ impl BxVM for VM {
     }
 
     fn has_global_function(&self, name: &str) -> bool {
-        self.global_bifs.contains(&name.to_lowercase())
+        self.global_bifs.contains(name.to_lowercase().as_str())
     }
 
     fn append_interception_points(&mut self, names: Vec<String>) -> Result<(), String> { VM::append_interception_points(self, names); Ok(()) }
@@ -1518,7 +1518,7 @@ impl BxVM for VM {
     fn announce(&mut self, name: &str, data: BxValue) -> Result<(), String> { VM::announce(self, name, data) }
 
     fn global_function_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.global_bifs.iter().cloned().collect();
+        let mut names: Vec<_> = self.global_bifs.iter().map(|name| name.to_string()).collect();
         names.sort();
         names
     }
@@ -2724,7 +2724,7 @@ impl VM {
     }
 
     pub fn register_global_bif(&mut self, name: String, value: BxValue) {
-        self.global_bifs.insert(name.to_lowercase());
+        self.global_bifs.insert(Rc::from(name.to_lowercase()));
         let value = self.bif_function(value, &name, false);
         self.insert_global(name, value);
     }

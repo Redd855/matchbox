@@ -110,6 +110,7 @@ pub struct Heap {
     config: GCConfig,
     identity: Rc<()>,
     retained_values: Vec<Weak<RootedValue>>,
+    retained_value_sets: Vec<Weak<Vec<BxValue>>>,
 }
 
 impl Heap {
@@ -134,6 +135,7 @@ impl Heap {
             config,
             identity: Rc::new(()),
             retained_values: Vec::new(),
+            retained_value_sets: Vec::new(),
         }
     }
 
@@ -151,6 +153,17 @@ impl Heap {
         self.retained_values.push(Rc::downgrade(&root));
         self.alloc_count += 1;
         Ok(root)
+    }
+
+    pub(super) fn retain_values(&mut self, values: Vec<BxValue>) -> Result<Rc<Vec<BxValue>>, String> {
+        if values.iter().any(|value| value.as_gc_id().is_some_and(|id| self.get_opt(id).is_none())) {
+            return Err("Cannot retain a collected value".into());
+        }
+        // Preserve per-value collection pressure without one root allocation per binding.
+        self.alloc_count += values.len();
+        let roots = Rc::new(values);
+        self.retained_value_sets.push(Rc::downgrade(&roots));
+        Ok(roots)
     }
 
     pub fn read_retained_value(&self, root: &RootedValue) -> Result<BxValue, String> {
@@ -282,6 +295,7 @@ impl Heap {
 
     pub fn collect(&mut self, roots: &[BxValue]) {
         self.retained_values.retain(|root| root.strong_count() > 0);
+        self.retained_value_sets.retain(|root| root.strong_count() > 0);
         self.alloc_count = 0;
         self.external_pressure = false;
         self.minor_gc_count += 1;
@@ -316,6 +330,11 @@ impl Heap {
 
         for root in self.retained_values.iter().filter_map(Weak::upgrade) {
             self.add_to_worklist_young(&root.value, &mut worklist);
+        }
+        for roots in self.retained_value_sets.iter().filter_map(Weak::upgrade) {
+            for root in roots.iter() {
+                self.add_to_worklist_young(root, &mut worklist);
+            }
         }
 
         // Scan remembered set: old objects that were mutated may point to young objects
@@ -361,6 +380,11 @@ impl Heap {
         }
         for root in self.retained_values.iter().filter_map(Weak::upgrade) {
             self.add_to_worklist(&root.value, &mut worklist);
+        }
+        for roots in self.retained_value_sets.iter().filter_map(Weak::upgrade) {
+            for root in roots.iter() {
+                self.add_to_worklist(root, &mut worklist);
+            }
         }
 
         while let Some(id) = worklist.pop() {

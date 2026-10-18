@@ -19,13 +19,14 @@ impl VM {
         let bifs = self.global_bifs.clone();
         let assignment_hooks = self.struct_assignment_hooks.clone();
         let variables = self.script_variables.clone();
-        let retained = values
-            .iter()
-            .copied()
-            .chain(variables.borrow().values().copied())
-            .chain(pending.iter().copied().map(BxValue::new_ptr))
-            .map(|value| self.heap.retain_value(value).map_err(anyhow::Error::msg))
-            .collect::<Result<Vec<_>>>()?;
+        let retained = self.heap.retain_values(
+            values
+                .iter()
+                .copied()
+                .chain(variables.borrow().values().copied())
+                .chain(pending.iter().copied().map(BxValue::new_ptr))
+                .collect(),
+        ).map_err(anyhow::Error::msg)?;
         self.script_variables = Self::new_variables_scope();
         let output = self.output_buffer.take();
         let captures = std::mem::take(&mut self.output_capture_stack);

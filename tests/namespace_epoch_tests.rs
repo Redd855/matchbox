@@ -1,5 +1,9 @@
 use matchbox_compiler::{compiler::Compiler, parser};
-use matchbox_vm::{Chunk, types::BxValue, vm::VM};
+use matchbox_vm::{
+    Chunk,
+    types::{BxVM, BxValue},
+    vm::VM,
+};
 
 fn compile(source: &str) -> Chunk {
     let ast = parser::parse(source, Some("namespace_epoch.bxs")).unwrap();

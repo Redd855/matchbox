@@ -7850,8 +7850,8 @@ impl VM {
 
         let params: Vec<&str> = match function_name.to_ascii_lowercase().as_str() {
             "boxannounce" => vec!["state", "data", "poolname"],
-            "dateformat" | "datetimeformat" => vec!["date", "format", "timezone", "locale"],
-            "timeformat" => vec!["date", "format", "timezone"],
+            "dateformat" | "datetimeformat" | "timeformat" => vec!["date", "format", "timezone", "locale"],
+            "createdatetime" | "createdate" => vec!["year", "month", "day", "hour", "minute", "second", "millisecond", "timezone"],
             "parsedatetime" => vec!["date", "format", "timezone", "locale"],
             "gettoken" => vec!["list", "position", "delimiter"],
             "listavg" => vec!["list", "delimiter"],

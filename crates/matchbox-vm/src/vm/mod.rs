@@ -3169,9 +3169,9 @@ impl VM {
         // Borrowed execution path used by host tests. It still creates a
         // fresh Chunk wrapper so the caller's runtime caches are not mutated,
         // but the immutable program data is shared via Arc.
-        let mut chunk_for_func = chunk.clone_without_runtime_caches();
-        chunk_for_func.ensure_caches();
-        let chunk_rc = Rc::new(RefCell::new(chunk_for_func));
+        let mut route_chunk = chunk.fresh_route_chunk();
+        route_chunk.ensure_caches();
+        let chunk_rc = Rc::new(RefCell::new(route_chunk));
         let chunk_for_func = chunk.clone_without_runtime_caches();
         self.interpret_chunk_shared(chunk_for_func, chunk_rc)
     }
@@ -3182,7 +3182,7 @@ impl VM {
         // per-request runtime cache. This avoids the previous OOM-prone
         // `clone_without_runtime_caches()` path that duplicated the entire
         // route chunk on every HTTP request.
-        let mut route_chunk = chunk.clone_without_runtime_caches();
+        let mut route_chunk = chunk.fresh_route_chunk();
         route_chunk.ensure_caches();
         let chunk_rc = Rc::new(RefCell::new(route_chunk));
         let chunk_for_func = Chunk::default();
@@ -3191,7 +3191,7 @@ impl VM {
 
     pub fn interpret_chunk_with_receiver(&mut self, chunk: &Chunk, receiver: Option<BxValue>) -> Result<BxValue> {
         if let Some(receiver) = receiver { self.instance_class_name(receiver)?; }
-        let mut chunk = chunk.clone_without_runtime_caches();
+        let mut chunk = chunk.fresh_route_chunk();
         chunk.ensure_caches();
         let previous = self.current_fiber_idx;
         let result = self.interpret_chunk_shared_current_task(Chunk::default(), Rc::new(RefCell::new(chunk)), receiver);

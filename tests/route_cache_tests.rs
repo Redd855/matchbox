@@ -152,6 +152,49 @@ fn shared_source_routes_keep_vm_namespace_shapes_and_retained_closures_independe
 }
 
 #[test]
+fn fresh_route_entrypoints_preserve_top_level_shape_caches_and_error_recovery() {
+    let chunk = compile(
+        r#"
+        answer=input;
+        for(i=1;i<=60;i++) {
+            if(i%6==0) { s={value:1}; }
+            else if(i%6==1) { s={a:0,value:2}; }
+            else if(i%6==2) { s={b:0,value:3}; }
+            else if(i%6==3) { s={c:0,value:4}; }
+            else if(i%6==4) { s={d:0,value:5}; }
+            else { s={e:0,value:6}; }
+            answer=answer+s.value;
+        }
+        return answer;
+        "#,
+    );
+    let source_caches = chunk.cache_slice(0, chunk.code().len());
+    for entry in 0..3 {
+        let mut vm = VM::new();
+        for pass in 0..3 {
+            vm.with_isolated_globals(|vm| {
+                vm.insert_global("padding".into(), BxValue::new_bool(true));
+                vm.insert_global("input".into(), BxValue::new_number(pass as f64));
+                let value = match entry {
+                    0 => vm.interpret_chunk_borrowed(&chunk)?,
+                    1 => vm.interpret_chunk_borrowed_current_task(&chunk)?,
+                    _ => vm.interpret_chunk_with_receiver(&chunk, None)?,
+                };
+                assert_eq!(value.as_number(), 210.0 + pass as f64);
+                Ok(())
+            }).unwrap();
+            assert!(vm.get_global("answer").is_none());
+            let failure = compile("throw 'route failed';");
+            assert!(vm.with_isolated_globals(|vm| {
+                vm.interpret_chunk_with_receiver(&failure, None)
+            }).is_err());
+            vm.collect_garbage_now();
+        }
+    }
+    assert_eq!(chunk.cache_slice(0, chunk.code().len()), source_caches);
+}
+
+#[test]
 fn compiled_route_metadata_remains_thread_shareable_and_serializable() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Chunk>();

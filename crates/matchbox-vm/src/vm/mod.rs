@@ -5272,6 +5272,19 @@ impl VM {
                     let val = *self.fibers[fiber_idx].stack.last().unwrap();
                     self.fibers[fiber_idx].stack.push(val);
                 }
+                op::DUP_BELOW => {
+                    let stack = &mut self.fibers[fiber_idx].stack;
+                    let len = stack.len();
+                    let val = stack[len - 1 - op0 as usize];
+                    stack.insert(len - op0 as usize, val);
+                }
+                op::CTOR_FINISH => {
+                    let stack = &mut self.fibers[fiber_idx].stack;
+                    let result = stack.pop().unwrap();
+                    if !result.is_null() {
+                        *stack.last_mut().unwrap() = result;
+                    }
+                }
                 op::SWAP => {
                     let b = self.fibers[fiber_idx].stack.pop().unwrap();
                     let a = self.fibers[fiber_idx].stack.pop().unwrap();

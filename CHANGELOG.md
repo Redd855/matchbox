@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `variables.n++` / `++variables.n` inside classes and scripts no longer fail with "Fused increment only supported on structs and instances", and prefix `++`/`--` now accept member targets such as `++s.n`.
+
 ## [0.11.0] - 2026-10-02
 
 ### Added

@@ -1584,7 +1584,8 @@ impl<'a> Parser<'a> {
             }
             Some(TokenKind::PlusPlus) | Some(TokenKind::MinusMinus) => {
                 let op = self.advance_lexeme().unwrap_or_default();
-                let target = self.parse_assignment_target()?;
+                let operand = self.parse_postfix()?;
+                let target = expr_to_assignment_target(&operand)?;
                 Ok(Expression::new(ExpressionKind::Prefix { operator: op, target }, line))
             }
             _ => self.parse_postfix(),

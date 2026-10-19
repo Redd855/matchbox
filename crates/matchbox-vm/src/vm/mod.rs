@@ -517,10 +517,19 @@ pub enum HostFutureState {
     Failed(BxValue),
 }
 
+// Process-unique identities also distinguish independent VMs; never recycle on overflow.
+fn next_global_namespace() -> u64 {
+    static NEXT: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    let mut next = NEXT.lock().expect("global namespace allocator poisoned");
+    *next = next.checked_add(1).expect("global namespace identities exhausted");
+    *next
+}
+
 pub struct VM {
     pub fibers: Vec<BxFiber>,
-    pub global_names: HashMap<u32, usize>,
-    pub global_values: Vec<BxValue>,
+    global_names: HashMap<u32, usize>,
+    global_values: Vec<BxValue>,
+    global_namespace: u64,
     global_bifs: HashSet<Rc<str>>,
     struct_assignment_hooks: HashMap<usize, (Rc<gc::RootedValue>, crate::types::NativeCallback)>,
     pub script_variables: Rc<RefCell<HashMap<String, BxValue>>>,
@@ -2433,6 +2442,7 @@ impl VM {
             fibers: Vec::new(),
             global_names: HashMap::new(),
             global_values: Vec::new(),
+            global_namespace: next_global_namespace(),
             global_bifs: HashSet::new(),
             struct_assignment_hooks: HashMap::new(),
             script_variables: Self::new_variables_scope(),
@@ -2749,6 +2759,11 @@ impl VM {
         let global = self.get_global(global_name)?;
         let id = global.as_gc_id()?;
         Some(self.struct_get(id, member_name))
+    }
+
+    /// Read-only host roots; binding changes must go through VM APIs.
+    pub fn global_values(&self) -> &[BxValue] {
+        &self.global_values
     }
 
     fn insert_global_interned(&mut self, name_id: u32, val: BxValue) {
@@ -4394,7 +4409,10 @@ impl VM {
                                             let frame =
                                                 self.fibers[fiber_idx].frames.last().unwrap();
                                             let c = frame.chunk.borrow();
-                                            c.cache_slice(body_start, body_len)
+                                            // JIT specializes shapes only, never namespace-bound slots.
+                                            c.cache_slice(body_start, body_len).into_iter()
+                                                .map(|entry| entry.filter(|entry| !matches!(entry, IcEntry::Global { .. })))
+                                                .collect::<Vec<_>>()
                                         };
                                         for &word in &body_code {
                                             if (word & 0xFF) as u8 == op::CONSTANT {
@@ -4483,7 +4501,9 @@ impl VM {
                         chunk.cache_get(ip_at_start)
                     };
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         let val = self.global_values[index];
                         if val.is_number() {
                             self.global_values[index] = BxValue::new_number(val.as_number() + 1.0);
@@ -4503,7 +4523,7 @@ impl VM {
                                     BxValue::new_number(val.as_number() + 1.0);
                                 let frame = self.fibers[fiber_idx].frames.last().unwrap();
                                 let mut chunk = frame.chunk.borrow_mut();
-                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             } else {
                                 flush_ip!();
                                 self.throw_error(
@@ -4532,7 +4552,9 @@ impl VM {
                         chunk.cache_get(ip_at_start)
                     };
 
-                    let val = if let Some(IcEntry::Global { index }) = ic {
+                    let val = if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         self.global_values[index]
                     } else {
                         let name_id = self.read_intern_id(fiber_idx, name_idx as usize)?;
@@ -4540,7 +4562,7 @@ impl VM {
                             let v = self.global_values[global_idx];
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             v
                         } else {
                             BxValue::new_null()
@@ -5175,7 +5197,9 @@ impl VM {
                         chunk.cache_get(ip_at_start)
                     };
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         let val = self.global_values[index];
                         self.fibers[fiber_idx].stack.push(val);
                     } else {
@@ -5186,7 +5210,7 @@ impl VM {
 
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                         } else {
                             self.fibers[fiber_idx].stack.push(BxValue::new_null());
                         }
@@ -5202,7 +5226,9 @@ impl VM {
 
                     let val = *self.fibers[fiber_idx].stack.last().unwrap();
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         self.global_values[index] = val;
                     } else {
                         let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
@@ -5211,13 +5237,13 @@ impl VM {
 
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                         } else {
                             self.insert_global_interned(name_id, val);
                             if let Some(&global_idx) = self.global_names.get(&name_id) {
                                 let frame = self.fibers[fiber_idx].frames.last().unwrap();
                                 let mut chunk = frame.chunk.borrow_mut();
-                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             }
                         }
                     }
@@ -5232,7 +5258,9 @@ impl VM {
 
                     let val = self.fibers[fiber_idx].stack.pop().unwrap();
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         self.global_values[index] = val;
                     } else {
                         let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
@@ -5241,13 +5269,13 @@ impl VM {
 
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                         } else {
                             self.insert_global_interned(name_id, val);
                             if let Some(&global_idx) = self.global_names.get(&name_id) {
                                 let frame = self.fibers[fiber_idx].frames.last().unwrap();
                                 let mut chunk = frame.chunk.borrow_mut();
-                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             }
                         }
                     }

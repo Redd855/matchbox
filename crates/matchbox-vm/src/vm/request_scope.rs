@@ -12,6 +12,8 @@ impl VM {
     ) -> Result<T> {
         self.drain_native_completions();
         ensure!(self.fibers.is_empty() && self.pending_native_futures.keys().all(|id| matches!(self.heap.get(*id), GcObject::Future(future) if !matches!(future.status, FutureStatus::Pending))), "Cannot isolate globals while background work is active");
+        // Reserve before running user code: exhaustion must not interrupt restoration.
+        let restored_namespace = super::next_global_namespace();
         let pending: std::collections::HashSet<_> =
             self.pending_native_futures.keys().copied().collect();
         let names = self.global_names.clone();
@@ -73,8 +75,7 @@ impl VM {
         self.native_exception_depth = native_depth;
         self.automatic_event_depth = event_depth;
         self.gc_suspended = gc_suspended;
-        // shortcut: namespace restoration scans function caches, use namespace epochs if profiling shows this cost matters.
-        self.heap.clear_global_caches();
+        self.global_namespace = restored_namespace;
         drop(retained);
         // Release request callback captures (including large HTTP bodies) at the boundary.
         self.collect_garbage_now();

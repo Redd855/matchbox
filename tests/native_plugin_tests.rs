@@ -139,7 +139,7 @@ fn plugin_values_errors_and_object_lifetime() {
     let id = result.as_gc_id().unwrap();
     assert_eq!(vm.struct_get(id, "value").as_number(), 42.0);
     // Keep the callback globals and returned struct alive while collecting the temporary plugin object.
-    let mut roots = vm.global_values.clone();
+    let mut roots = vm.global_values().to_vec();
     roots.push(result);
     vm.heap.collect(&roots);
     assert_eq!(vm.struct_get(id, "value").as_number(), 42.0);

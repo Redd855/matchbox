@@ -156,8 +156,14 @@ fn retained_class_interface_and_closure_rebind_after_error_and_panic_in_independ
                 vm.with_isolated_globals(run)
             }));
             match pass % 3 {
-                0 => assert!(result.unwrap().is_err()),
-                1 => assert!(result.is_err()),
+                0 => assert_eq!(
+                    result.unwrap().unwrap_err().to_string(),
+                    "expected request error"
+                ),
+                1 => assert!(
+                    result.is_err(),
+                    "request must reach its deliberate panic, got {result:?}"
+                ),
                 _ => result.unwrap().unwrap(),
             }
             assert!(vm.get_global("Current").is_none());

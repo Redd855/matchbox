@@ -151,16 +151,6 @@ impl ChunkRuntime {
         }
     }
 
-    pub(crate) fn clear_global_caches(&self) {
-        let mut caches = self.caches.lock().unwrap();
-        #[cfg(not(target_os = "espidf"))]
-        for entry in caches.iter_mut() {
-            if matches!(entry, Some(IcEntry::Global { .. })) { *entry = None; }
-        }
-        #[cfg(target_os = "espidf")]
-        caches.retain(|(_, entry)| !matches!(entry, IcEntry::Global { .. }));
-    }
-
     pub fn cache_set(&mut self, ip: usize, entry: IcEntry) {
         Self::set_in(&mut self.caches.lock().unwrap(), ip, entry);
     }
@@ -499,5 +489,6 @@ pub enum IcEntry {
     Megamorphic,
     Global {
         index: usize,
+        namespace: u64,
     },
 }

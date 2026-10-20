@@ -2580,6 +2580,24 @@ impl Compiler {
             }
         }
 
+        // BoxLang: a `required` parameter without a default must be passed.
+        if kind != FunctionKind::ComponentBody {
+            for param in params.iter().filter(|p| p.required && p.default_value.is_none()) {
+                // Parameter and function names are identifiers: nothing to escape.
+                let message = format!(
+                    "Required argument [{}] is missing for function [{}]",
+                    param.name, name
+                );
+                let check = format!(
+                    "if ( isNull( {} ) ) {{ throw( type=\"Application\", message=\"{}\" ); }}",
+                    param.name, message
+                );
+                for stmt in matchbox_parser::parser::parse(&check, None)? {
+                    sub_compiler.compile_statement(&stmt, false)?;
+                }
+            }
+        }
+
         // The VM supplies the complete arguments scope; defaults update declared entries.
         sub_compiler.locals.push(Local {
             name: "arguments".to_string(),

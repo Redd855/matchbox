@@ -1214,3 +1214,35 @@ fn test_native_math_module() {
     ).unwrap_err();
     assert!(error.to_string().contains("Source-only native modules require --target native"));
 }
+
+#[test]
+fn test_native_fusion_uses_native_cargo_toml_dependencies() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("native_fusion_deps")
+        .join("script.bxs");
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join(if cfg!(windows) { "fusion_deps.exe" } else { "fusion_deps" });
+
+    process_file(
+        &source_path,
+        false,
+        Some("native"),
+        Vec::new(),
+        false,
+        false,
+        false,
+        Some(&output_path),
+        &[],
+        false,
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(&output_path).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "YWJj");
+}

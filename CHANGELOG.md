@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `dateFormat`, `timeFormat` and `dateTimeFormat` now mirror BoxLang's `DateTimeFormat` BIF: masks are Java `DateTimeFormatter` patterns (case sensitive, `mm` is minutes, `MM` is month, invalid letters and repeat counts raise Java's errors), with Java's default masks, named masks (`short`, `medium`, `long`, `full`, `iso`, `iso8601`, `odbc`, `javascript`, `epoch`, `epochms`), `timezone` and `locale` arguments and English, German, Spanish, French, Italian, Portuguese, Dutch, Russian, Japanese and Chinese locale text. Locales without bundled data fall back to `en_US`; named regions other than UTC/GMT use MatchBox's fixed-offset zone table (no tz database).
+- `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
+
 ### Fixed
 - CLI argument handling now follows BoxLang's `BoxRunner` and `CLIGetArgs`: options only count before the script file, everything after it goes to the script (`matchbox app.bxs -v` runs the script with `-v`), `-h`/`--help`/`-v`/`--version` are global only as the sole argument, unknown options fall through like BoxLang, and `cliGetArgs()` parses `--opt=value`, `--!opt`/`--no-opt`, `-o=value`, `-abc` and quoted values exactly like BoxLang (a value is never taken from the next token) and keeps the first script argument. **Breaking:** put MatchBox options before the file (`matchbox --target esp32 --chip esp32s3 --flash app.bxs`); the documentation is updated, and the old `--` separator is no longer special. Adds BoxLang's runtime flags: `--bx-debug`, `--bx-code <code>`, `--bx-printAST` (file, `--bx-code` or stdin) are implemented, `--bx-config`/`--bx-home` are accepted (never reach the script) with a warning that MatchBox ignores them, `--bx-transpile` is rejected clearly; and the `server.cli` scope (`args`, `parsed`, `executionPath`, `command`) with `server.boxlang.cliMode`.
 
 ### Fixed
+- `future.get()` inside a native callback (`map`, `filter`, ...) no longer hangs: the nested callback now lets other fibers run while it waits.
+- Array members `map`, `each`, `filter`, `reduce`, `some`, `every` and `none` no longer use the Set helpers: `map` kept only unique results, and callbacks now receive `(value, index, array)` (`(accumulator, value, index, array)` for `reduce`) like BoxLang.
+- `variables.n++` / `++variables.n` inside classes and scripts no longer fail with "Fused increment only supported on structs and instances", and prefix `++`/`--` now accept member targets such as `++s.n`.
+- `new C()` now evaluates to the instance when `init()` returns nothing or `null`, and to the returned value otherwise, matching BoxLang.
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

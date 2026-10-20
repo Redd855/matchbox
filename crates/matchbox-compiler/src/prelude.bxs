@@ -7,60 +7,6 @@
 // --- Array BIFs ---
 
 /**
- * Maps an array to a new array using a callback function.
- */
-function arrayMap(array, callback, parallel = false, maxThreads = 0, virtual = false) {
-    return _arrayMapWithIndex(array, callback);
-}
-
-/**
- * Iterates over an array and calls a callback for each item.
- */
-function arrayEach(array, callback, parallel = false, maxThreads = 0, virtual = false) {
-    _arrayEachWithIndex(array, callback);
-}
-
-function _arrayMapWithIndex(array, callback) {
-    var result = [];
-    var length = len(array);
-    for (var i = 1; i <= length; i++) {
-        arrayAppend(result, callback(array[i], i));
-    }
-    return result;
-}
-
-function _arrayEachWithIndex(array, callback) {
-    var length = len(array);
-    for (var i = 1; i <= length; i++) {
-        callback(array[i], i);
-    }
-}
-
-/**
- * Filters an array based on a predicate function.
- */
-function arrayFilter(array, predicate) {
-    var result = [];
-    for (item in array) {
-        if (predicate(item)) {
-            arrayAppend(result, item);
-        }
-    }
-    return result;
-}
-
-/**
- * Reduces an array to a single value using an accumulator function.
- */
-function arrayReduce(array, callback, initialValue) {
-    var result = initialValue;
-    for (item in array) {
-        result = callback(result, item);
-    }
-    return result;
-}
-
-/**
  * Converts an array to a string using a delimiter.
  */
 function arrayToList(array, delimiter = ",") {
@@ -194,37 +140,6 @@ function arrayMax(array) {
         }
     }
     return result;
-}
-
-/**
- * Determines if every element in an array satisfies a condition.
- */
-function arrayEvery(array, callback) {
-    for (item in array) {
-        if (!callback(item)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/**
- * Determines if at least one element in an array satisfies a condition.
- */
-function arraySome(array, callback) {
-    for (item in array) {
-        if (callback(item)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Determines if no elements in an array satisfy a condition.
- */
-function arrayNone(array, callback) {
-    return !arraySome(array, callback);
 }
 
 /**

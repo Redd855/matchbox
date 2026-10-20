@@ -632,7 +632,8 @@ impl<'a> Parser<'a> {
             String::new()
         };
         let mut extends = None;
-        let mut accessors = false;
+        // BoxLang generates property accessors unless `accessors=false`.
+        let mut accessors = true;
         let mut implements = Vec::new();
 
         while matches!(self.peek_kind(),
@@ -649,6 +650,17 @@ impl<'a> Parser<'a> {
                     match part { StringPart::Text(text) => Some(text.as_str()), _ => None }
                 }).collect::<Option<String>>(),
                 ExpressionKind::Literal(Literal::Boolean(value)) => Some(value.to_string()),
+                // BoxLang annotation values may be a bare fqn: `class extends=Base implements=models.Y`.
+                ExpressionKind::Identifier(_) | ExpressionKind::MemberAccess { .. } => {
+                    fn path(expr: &Expression) -> Option<String> {
+                        match &expr.kind {
+                            ExpressionKind::Identifier(name) => Some(name.clone()),
+                            ExpressionKind::MemberAccess { base, member } => Some(format!("{}.{}", path(base)?, member)),
+                            _ => None,
+                        }
+                    }
+                    path(v)
+                }
                 _ => None,
             });
             match attr_name.to_ascii_lowercase().as_str() {

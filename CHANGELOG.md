@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Tree-shaking no longer drops prelude functions that are only reached through member calls (`[3,1,2].sort()`, `.first()`, `.reverse()`, `.sum()`, ... failed with "BIF arraysort not found" outside `--no-shaking`).
+- Removed prelude copies of `abs`, `min`, `max`, `arrayIsEmpty`, `arrayPrepend`, `arrayContains` and `arrayContainsNoCase` that shadowed the native BIFs depending on tree-shaking; `arrayPrepend` now returns the array and `arrayContains` is case-sensitive for arrays and case-aware for sets.
 
 ### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.

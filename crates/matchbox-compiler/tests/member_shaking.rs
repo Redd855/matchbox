@@ -46,7 +46,7 @@ fn member_table_is_parsed() {
 fn shaking_keeps_every_prelude_bif_reachable_through_a_member_call() {
     let prelude = prelude_functions();
     let reachable = member_table().into_iter().filter(|(_, bif)| prelude.contains(bif)).count();
-    assert!(reachable > 40, "expected many prelude BIFs behind members, got {reachable}");
+    assert!(reachable > 30, "expected many prelude BIFs behind members, got {reachable}");
     let missing: Vec<String> = member_table()
         .into_iter()
         .filter(|(_, bif)| prelude.contains(bif))

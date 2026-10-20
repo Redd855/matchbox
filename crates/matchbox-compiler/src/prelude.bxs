@@ -4,36 +4,6 @@
 
 // --- Math BIFs ---
 
-/**
- * Returns the absolute value of a number.
- */
-function abs(number) {
-    if (number < 0) {
-        return 0 - number;
-    }
-    return number;
-}
-
-/**
- * Returns the smaller of two numbers.
- */
-function min(n1, n2) {
-    if (n1 < n2) {
-        return n1;
-    }
-    return n2;
-}
-
-/**
- * Returns the larger of two numbers.
- */
-function max(n1, n2) {
-    if (n1 > n2) {
-        return n1;
-    }
-    return n2;
-}
-
 // --- Array BIFs ---
 
 /**
@@ -158,14 +128,6 @@ function arrayLast(array, defaultValue = null) {
 }
 
 /**
- * Prepends a value to the beginning of an array.
- */
-function arrayPrepend(array, value) {
-    arrayInsertAt(array, 1, value);
-    return true;
-}
-
-/**
  * Finds the index of a value in an array. Returns 0 if not found.
  */
 function arrayFind(array, value) {
@@ -176,13 +138,6 @@ function arrayFind(array, value) {
         }
     }
     return 0;
-}
-
-/**
- * Determines if an array contains a specific value.
- */
-function arrayContains(array, value) {
-    return arrayFind(array, value) > 0;
 }
 
 /**
@@ -393,13 +348,6 @@ function arrayFindNoCase(array, value) {
 }
 
 /**
- * Determines if an array contains a specific value (case-insensitive).
- */
-function arrayContainsNoCase(array, value) {
-    return arrayFindNoCase(array, value) > 0;
-}
-
-/**
  * Deletes a value from an array using case-insensitive string equality.
  */
 function arrayDeleteNoCase(array, value, scope = "one") {
@@ -504,13 +452,6 @@ function arraySort(array, sortType = "text", sortOrder = "asc") {
 function arrayPush(array, value) {
     arrayAppend(array, value);
     return len(array);
-}
-
-/**
- * Returns true if the array is empty.
- */
-function arrayIsEmpty(array) {
-    return len(array) == 0;
 }
 
 /**

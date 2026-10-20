@@ -172,6 +172,40 @@ impl<'a> TemplateParser<'a> {
         }
     }
 
+    /// The expression after `=` in a tag attribute (`a="#x#"` is the expression `x`).
+    fn parse_attribute_value(&mut self) -> Result<Expression> {
+        let text = self.advance_lexeme().ok_or_else(|| anyhow::anyhow!("Missing component attribute value"))?;
+        let ast = crate::parser::parse(&format!("{text};"), self.filename)?;
+        let Some(Statement {kind: StatementKind::Expression(mut expression), ..}) = ast.into_iter().next() else { anyhow::bail!("Invalid component attribute value"); };
+        if let ExpressionKind::Literal(Literal::String(parts)) = &expression.kind {
+            if let [StringPart::Expression(value)] = parts.as_slice() { expression = value.clone(); }
+        }
+        Ok(expression)
+    }
+
+    /// `key=value` attributes up to the end of the opening tag, which is consumed.
+    /// Returns the attributes (keys lowercased) and whether the tag was self-closing.
+    fn parse_tag_attributes(&mut self, line: u32) -> Result<(Vec<(String, Expression)>, bool)> {
+        let mut attributes = Vec::new();
+        while self.peek_kind() == Some(TokenKind::Identifier) {
+            let key = self.advance_lexeme().unwrap().to_ascii_lowercase();
+            let value = if self.peek_kind() == Some(TokenKind::Equal) {
+                self.pos += 1;
+                self.parse_attribute_value()?
+            } else {
+                Expression::new(ExpressionKind::Literal(Literal::Boolean(true)), line)
+            };
+            attributes.push((key, value));
+        }
+        let self_closing = match self.peek_kind() {
+            Some(TokenKind::ComponentSelfClose) => true,
+            Some(TokenKind::ComponentClose) => false,
+            _ => anyhow::bail!("Invalid component tag"),
+        };
+        self.pos += 1;
+        Ok((attributes, self_closing))
+    }
+
     fn parse_module_component(&mut self, name: &str) -> Result<Option<Statement>> {
         let line = self.peek_line();
         let mut attributes = Vec::new();
@@ -399,18 +433,93 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_loop_tag(&mut self) -> Result<Option<Statement>> {
-        // <bx:loop array="#arr#" item="val"> body </bx:loop>
-        // <bx:loop condition="expr"> body </bx:loop>
+        // <bx:loop from="1" to="3" index="i"> / array="#a#" item="x" / list="a,b" item="x" /
+        // collection="#struct#" item="key" / condition="expr"
         let line = self.peek_line();
-        self.skip_to_close();
-        let body = self.parse_template_body(&["loop"])?;
-        // Skip closing </bx:loop>
-        self.skip_closing("loop");
-        // For now, just wrap in a stub
-        Ok(Some(Statement::new(StatementKind::WhileLoop {
-            condition: Expression::new(ExpressionKind::Literal(Literal::Boolean(true)), line),
-            body,
-        }, line)))
+        let (attributes, self_closing) = self.parse_tag_attributes(line)?;
+        let body = if self_closing {
+            Vec::new()
+        } else {
+            let body = self.parse_template_body(&["loop"])?;
+            self.skip_closing("loop");
+            body
+        };
+        let attribute = |name: &str| attributes.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        let variable = |name: &str| attribute(name).and_then(|value| literal_text(&value));
+        let ident = |name: &str| Expression::new(ExpressionKind::Identifier(name.to_string()), line);
+
+        if let Some(condition) = attribute("condition") {
+            let condition = match literal_text(&condition) {
+                Some(text) => script_expression(&text, self.filename)?,
+                None => condition,
+            };
+            return Ok(Some(Statement::new(StatementKind::WhileLoop { condition, body }, line)));
+        }
+
+        if let (Some(from), Some(to)) = (attribute("from"), attribute("to")) {
+            let index = variable("index").ok_or_else(|| anyhow::anyhow!("<bx:loop from/to> requires an index attribute"))?;
+            let from = number_literal(from);
+            let to = number_literal(to);
+            let step = attribute("step").map(number_literal);
+            let descending = matches!(&step, Some(Expression { kind: ExpressionKind::Literal(Literal::Number(n)), .. }) if *n < 0.0);
+            let step = step.unwrap_or_else(|| Expression::new(ExpressionKind::Literal(Literal::Number(1.0)), line));
+            let init = Statement::new(
+                StatementKind::Expression(Expression::new(
+                    ExpressionKind::Assignment { target: AssignmentTarget::Identifier(index.clone()), value: Box::new(from) },
+                    line,
+                )),
+                line,
+            );
+            let condition = Expression::new(
+                ExpressionKind::Binary {
+                    left: Box::new(ident(&index)),
+                    operator: if descending { ">=" } else { "<=" }.to_string(),
+                    right: Box::new(to),
+                },
+                line,
+            );
+            let update = Expression::new(
+                ExpressionKind::Assignment {
+                    target: AssignmentTarget::Identifier(index.clone()),
+                    value: Box::new(Expression::new(
+                        ExpressionKind::Binary { left: Box::new(ident(&index)), operator: "+".to_string(), right: Box::new(step) },
+                        line,
+                    )),
+                },
+                line,
+            );
+            return Ok(Some(Statement::new(
+                StatementKind::ForClassic { init: Some(Box::new(init)), condition: Some(condition), update: Some(update), body },
+                line,
+            )));
+        }
+
+        let collection = if let Some(array) = attribute("array").or_else(|| attribute("collection")) {
+            Some(array)
+        } else if let Some(list) = attribute("list") {
+            let delimiters = attribute("delimiters").unwrap_or_else(|| {
+                Expression::new(ExpressionKind::Literal(Literal::String(vec![StringPart::Text(",".to_string())])), line)
+            });
+            Some(Expression::new(
+                ExpressionKind::FunctionCall {
+                    base: Box::new(ident("listToArray")),
+                    args: vec![
+                        Argument { name: None, value: list },
+                        Argument { name: None, value: delimiters },
+                    ],
+                },
+                line,
+            ))
+        } else {
+            None
+        };
+        if let Some(collection) = collection {
+            let item = variable("item").or_else(|| variable("index")).ok_or_else(|| anyhow::anyhow!("<bx:loop> requires an item attribute"))?;
+            let index = if variable("item").is_some() { variable("index") } else { None };
+            return Ok(Some(Statement::new(StatementKind::ForLoop { item, index, collection, body }, line)));
+        }
+
+        anyhow::bail!("Unsupported <bx:loop> attributes: use from/to, array, list, collection or condition")
     }
 
     fn parse_return_tag(&mut self) -> Result<Option<Statement>> {
@@ -612,6 +721,34 @@ impl<'a> TemplateParser<'a> {
 
 pub(super) fn component_statement(name: &str, attributes: Vec<(Expression, Expression)>, body: Option<Vec<Statement>>, line: u32) -> Result<Statement> {
     Ok(Statement::new(StatementKind::Component { name: name.into(), attributes, body }, line))
+}
+
+/// The text of a plain string literal such as `"i"` in `index="i"`.
+fn literal_text(expression: &Expression) -> Option<String> {
+    match &expression.kind {
+        ExpressionKind::Literal(Literal::String(parts)) => match parts.as_slice() {
+            [StringPart::Text(text)] => Some(text.clone()),
+            [] => Some(String::new()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `from="1"` is the number 1; interpolated or computed values pass through.
+fn number_literal(expression: Expression) -> Expression {
+    match literal_text(&expression).and_then(|text| text.trim().parse::<f64>().ok()) {
+        Some(number) => Expression::new(ExpressionKind::Literal(Literal::Number(number)), expression.line),
+        None => expression,
+    }
+}
+
+fn script_expression(text: &str, filename: Option<&str>) -> Result<Expression> {
+    let ast = crate::parser::parse(&format!("{text};"), filename)?;
+    match ast.into_iter().next() {
+        Some(Statement { kind: StatementKind::Expression(expression), .. }) => Ok(expression),
+        _ => anyhow::bail!("Invalid expression: {text}"),
+    }
 }
 
 fn decode_template_text(text: &str) -> String {

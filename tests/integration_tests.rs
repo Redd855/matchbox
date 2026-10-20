@@ -230,6 +230,7 @@ script_test!(vm_instanceof_castas, "vm_instanceof_castas.bxs");
 script_test!(vm_assert_param_rethrow, "vm_assert_param_rethrow.bxs");
 script_test!(vm_contains, "vm_contains.bxs");
 script_test!(vm_array_bifs, "vm_array_bifs.bxs");
+script_test!(vm_word_operators, "vm_word_operators.bxs");
 script_test!(vm_array_callbacks, "vm_array_callbacks.bxs");
 script_test!(vm_repeat_string, "vm_repeat_string.bxs");
 script_test!(vm_char, "vm_char.bxs");

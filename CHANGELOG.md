@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `for ( row in query )` iterates the rows of a query (it failed with "Iteration only supported for arrays and structs"). A BIF that is compiled out now says which build feature provides it, and the QoQ error names the `qoq` feature.
 - `for ( row in query )` iterates the rows of a query (it failed with "Iteration only supported for arrays and structs"). A BIF that is compiled out now says which build feature provides it, and the QoQ error names the `qoq` feature.
+- Calling a function without a `required` argument now throws `Required argument [a] is missing for function [f]` (type `Application`) like BoxLang, instead of silently passing null.
 - Tree-shaking no longer drops prelude functions that are only reached through member calls (`[3,1,2].sort()`, `.first()`, `.reverse()`, `.sum()`, ... failed with "BIF arraysort not found" outside `--no-shaking`).
 - Removed prelude copies of `abs`, `min`, `max`, `arrayIsEmpty`, `arrayPrepend`, `arrayContains` and `arrayContainsNoCase` that shadowed the native BIFs depending on tree-shaking; `arrayPrepend` now returns the array and `arrayContains` is case-sensitive for arrays and case-aware for sets.
 - Closures at script level can now see the `for ( n in ... )` loop variable (and index) instead of failing with "Variable 'n' not found"; assignments to the loop variable in the body are shared with closures.

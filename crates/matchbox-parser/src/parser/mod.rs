@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::tokenizer::*;
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 pub mod template;
 
@@ -1275,7 +1275,7 @@ impl<'a> Parser<'a> {
         let open = self.tokens[start].kind;
         let close = if open == TokenKind::LeftBrace { TokenKind::RightBrace } else { TokenKind::RightBracket };
         if i >= self.tokens.len() { return false; }
-        if self.tokens[i].kind != TokenKind::Identifier { return false; }
+        if !matches!(self.tokens[i].kind, TokenKind::Identifier | TokenKind::DotDotDot) { return false; }
         // Find the matching closing brace/bracket
         while i < self.tokens.len() && self.tokens[i].kind != close {
             i += 1;
@@ -1292,12 +1292,19 @@ impl<'a> Parser<'a> {
         let close = if is_object { TokenKind::RightBrace } else { TokenKind::RightBracket };
 
         let mut bindings: Vec<(String, Option<String>)> = Vec::new(); // (source_name, local_name)
+        let mut rest: Option<String> = None;
         loop {
             if self.peek_is(close) { self.pos += 1; break; }
             if self.peek_is(TokenKind::DotDotDot) {
+                if rest.is_some() {
+                    bail!("Destructuring patterns may only contain one rest binding");
+                }
                 self.pos += 1;
-                let _rest = self.expect_get(TokenKind::Identifier)?;
+                rest = Some(self.expect_get(TokenKind::Identifier)?);
                 if self.peek_is(TokenKind::Comma) { self.pos += 1; }
+                if !self.peek_is(close) {
+                    bail!("The rest binding must be the last element of a destructuring pattern");
+                }
                 continue;
             }
             let source_name = self.expect_get(TokenKind::Identifier)?;
@@ -1327,6 +1334,7 @@ impl<'a> Parser<'a> {
                 kind: if is_object { DestructureKind::Object } else { DestructureKind::Array },
                 source,
                 bindings,
+                rest,
             },
             line,
         ))

@@ -697,8 +697,16 @@ impl Compiler {
                 kind,
                 source,
                 bindings,
+                rest,
             } => {
                 self.compile_expression(source)?;
+                // The rest helper reads the source through a hidden local that aliases the stack slot.
+                if rest.is_some() {
+                    self.locals.push(Local {
+                        name: "$destructure".to_string(),
+                        depth: self.scope_depth,
+                    });
+                }
                 for (idx, (src_name, local_name)) in bindings.iter().enumerate() {
                     self.chunk.emit0(op::DUP, source.line);
                     match kind {
@@ -725,6 +733,56 @@ impl Compiler {
                             .add_constant(Constant::String(BoxString::new(bind_name.as_str())));
                         self.chunk.emit1(op::DEFINE_GLOBAL, bind_idx, source.line);
                     }
+                }
+                if let Some(rest_name) = rest {
+                    let line = source.line;
+                    let ident = |name: &str| Expression::new(ExpressionKind::Identifier(name.to_string()), line);
+                    let argument = |value: Expression| crate::ast::Argument { name: None, value };
+                    let (helper, second) = match kind {
+                        crate::ast::DestructureKind::Array => (
+                            "_destructureArrayRest",
+                            Expression::new(
+                                ExpressionKind::Literal(crate::ast::Literal::Number((bindings.len() + 1) as f64)),
+                                line,
+                            ),
+                        ),
+                        crate::ast::DestructureKind::Object => (
+                            "_destructureObjectRest",
+                            Expression::new(
+                                ExpressionKind::Literal(crate::ast::Literal::Array(
+                                    bindings
+                                        .iter()
+                                        .map(|(src_name, _)| {
+                                            Expression::new(
+                                                ExpressionKind::Literal(crate::ast::Literal::String(vec![
+                                                    crate::ast::StringPart::Text(src_name.clone()),
+                                                ])),
+                                                line,
+                                            )
+                                        })
+                                        .collect(),
+                                )),
+                                line,
+                            ),
+                        ),
+                    };
+                    let call = Expression::new(
+                        ExpressionKind::FunctionCall {
+                            base: Box::new(ident(helper)),
+                            args: vec![argument(ident("$destructure")), argument(second)],
+                        },
+                        line,
+                    );
+                    self.compile_expression(&call)?;
+                    if let Some(local_idx) = self.resolve_local(rest_name) {
+                        self.chunk.emit1(op::SET_LOCAL_POP, local_idx as u32, line);
+                    } else {
+                        let bind_idx = self
+                            .chunk
+                            .add_constant(Constant::String(BoxString::new(rest_name.as_str())));
+                        self.chunk.emit1(op::DEFINE_GLOBAL, bind_idx, line);
+                    }
+                    self.locals.pop();
                 }
                 self.chunk.emit0(op::POP, source.line);
                 Ok(())
@@ -3346,9 +3404,14 @@ impl DependencyTracker {
             StatementKind::Destructure {
                 source,
                 bindings: _,
+                rest,
                 ..
             } => {
                 self.track_expression(source);
+                if rest.is_some() {
+                    self.used_symbols.insert("_destructurearrayrest".to_string());
+                    self.used_symbols.insert("_destructureobjectrest".to_string());
+                }
             }
             StatementKind::VariableDecl { value, .. } => {
                 self.track_expression(value);

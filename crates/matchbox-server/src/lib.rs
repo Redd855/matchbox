@@ -1,7 +1,16 @@
 mod app_server;
 mod application;
 mod application_runtime;
+mod template_cache;
 mod web_context;
+mod cookies;
+mod sessions;
+#[cfg(not(target_family = "wasm"))]
+pub mod multipart;
+#[cfg(not(target_family = "wasm"))]
+mod uploads;
+#[cfg(not(target_family = "wasm"))]
+pub mod static_files;
 pub mod webroot_core;
 mod websocket;
 #[cfg(test)]
@@ -98,14 +107,9 @@ pub fn request_data_from_parts(
 
 pub fn parse_cookie_header(raw: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for part in raw.split(';') {
-        let mut kv = part.splitn(2, '=');
-        if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
-            let key = k.trim().to_string();
-            let val = v.trim().to_string();
-            map.insert(key.clone(), val.clone());
-            map.insert(key.to_lowercase(), val);
-        }
+    for (key, value) in webroot_core::parse_cookie_header(raw) {
+        map.insert(key.clone(), value.clone());
+        map.insert(key.to_lowercase(), value);
     }
     map
 }
@@ -519,6 +523,7 @@ pub async fn run_server(args: Args) {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .tcp_nodelay(true)
     .await
     .unwrap();
 }
@@ -552,7 +557,7 @@ async fn handler(
         server_port: state.port,
         ..Default::default()
     };
-    let request = WebrootRequest {
+    let mut request = WebrootRequest {
         method: parts.method.to_string(),
         path,
         query: url::form_urlencoded::parse(context.query_string.as_bytes())
@@ -572,7 +577,9 @@ async fn handler(
             })
             .collect(),
         body,
+        ..Default::default()
     };
+    if multipart::parse(&mut request).await.is_err() {return StatusCode::BAD_REQUEST.into_response();}
     match tokio::task::spawn_blocking(move || state.engine.handle_with_context(request, context))
         .await
     {
@@ -764,6 +771,7 @@ mod tests {
             .handle(WebrootRequest {
                 method: "GET".to_string(),
                 path: "/missing".to_string(),
+                form_arrays: Default::default(), uploads: Default::default(),
                 query: Default::default(),
                 form: Default::default(),
                 headers: Default::default(),

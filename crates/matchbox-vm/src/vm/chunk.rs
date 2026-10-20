@@ -91,8 +91,6 @@ impl ChunkProgram {
 /// On ESP32 the caches use a compact sparse representation.
 #[derive(Debug, Clone)]
 pub struct ChunkRuntime {
-    // ponytail: per-function cache mutex preserves Send/Sync program metadata;
-    // use a separate VM-owned lock-free holder if locking becomes a measured bottleneck.
     pub caches: Arc<Mutex<RuntimeCaches>>,
     constant_map: HashMap<ConstantKey, u32>,
     cache_program: Option<Weak<ChunkProgram>>,
@@ -136,7 +134,10 @@ impl ChunkRuntime {
     }
 
     pub fn cache_get(&self, ip: usize) -> Option<IcEntry> {
-        let caches = self.caches.lock().unwrap();
+        Self::get_from(&self.caches.lock().unwrap(), ip)
+    }
+
+    fn get_from(caches: &RuntimeCaches, ip: usize) -> Option<IcEntry> {
         #[cfg(not(target_os = "espidf"))]
         {
             caches.get(ip).and_then(|entry| entry.clone())
@@ -150,18 +151,11 @@ impl ChunkRuntime {
         }
     }
 
-    pub(crate) fn clear_global_caches(&self) {
-        let mut caches = self.caches.lock().unwrap();
-        #[cfg(not(target_os = "espidf"))]
-        for entry in caches.iter_mut() {
-            if matches!(entry, Some(IcEntry::Global { .. })) { *entry = None; }
-        }
-        #[cfg(target_os = "espidf")]
-        caches.retain(|(_, entry)| !matches!(entry, IcEntry::Global { .. }));
+    pub fn cache_set(&mut self, ip: usize, entry: IcEntry) {
+        Self::set_in(&mut self.caches.lock().unwrap(), ip, entry);
     }
 
-    pub fn cache_set(&mut self, ip: usize, entry: IcEntry) {
-        let mut caches = self.caches.lock().unwrap();
+    fn set_in(caches: &mut RuntimeCaches, ip: usize, entry: IcEntry) {
         #[cfg(not(target_os = "espidf"))]
         {
             if caches.len() <= ip {
@@ -181,41 +175,41 @@ impl ChunkRuntime {
     }
 
     pub fn cache_add_shape(&mut self, ip: usize, shape_id: usize, index: usize) {
-        match self.cache_get(ip) {
-            None => self.cache_set(ip, IcEntry::Monomorphic { shape_id, index }),
+        if let Some(entry) = Self::shape_entry(self.cache_get(ip), shape_id, index) {
+            self.cache_set(ip, entry);
+        }
+    }
+
+    fn shape_entry(cached: Option<IcEntry>, shape_id: usize, index: usize) -> Option<IcEntry> {
+        match cached {
+            None => Some(IcEntry::Monomorphic { shape_id, index }),
             Some(IcEntry::Monomorphic {
                 shape_id: cached_shape,
                 index: cached_index,
             }) => {
                 if cached_shape == shape_id {
-                    return;
+                    return None;
                 }
                 let mut entries = [(0, 0); 4];
                 entries[0] = (cached_shape, cached_index);
                 entries[1] = (shape_id, index);
-                self.cache_set(ip, IcEntry::Polymorphic { entries, count: 2 });
+                Some(IcEntry::Polymorphic { entries, count: 2 })
             }
             Some(IcEntry::Polymorphic { mut entries, count }) => {
                 if entries[..count]
                     .iter()
                     .any(|(cached_shape, _)| *cached_shape == shape_id)
                 {
-                    return;
+                    return None;
                 }
                 if count < entries.len() {
                     entries[count] = (shape_id, index);
-                    self.cache_set(
-                        ip,
-                        IcEntry::Polymorphic {
-                            entries,
-                            count: count + 1,
-                        },
-                    );
+                    Some(IcEntry::Polymorphic { entries, count: count + 1 })
                 } else {
-                    self.cache_set(ip, IcEntry::Megamorphic);
+                    Some(IcEntry::Megamorphic)
                 }
             }
-            Some(IcEntry::Megamorphic | IcEntry::Global { .. }) => {}
+            Some(IcEntry::Megamorphic | IcEntry::Global { .. }) => None
         }
     }
 
@@ -235,6 +229,9 @@ pub struct Chunk {
     pub program: Arc<ChunkProgram>,
     #[serde(skip)]
     pub runtime: ChunkRuntime,
+    // Frame clones copy this vector; promotion/function metadata uses only ChunkRuntime.
+    #[serde(skip)]
+    owned_route_caches: Option<RuntimeCaches>,
 }
 
 impl Default for Chunk {
@@ -242,6 +239,7 @@ impl Default for Chunk {
         Chunk {
             program: Arc::new(ChunkProgram::default()),
             runtime: ChunkRuntime::default(),
+            owned_route_caches: None,
         }
     }
 }
@@ -256,6 +254,7 @@ impl Chunk {
         Chunk {
             program: Arc::new(ChunkProgram::new(filename)),
             runtime: ChunkRuntime::default(),
+            owned_route_caches: None,
         }
     }
 
@@ -264,6 +263,7 @@ impl Chunk {
         Chunk {
             program: Arc::new(self.program.new_sub_program()),
             runtime: ChunkRuntime::default(),
+            owned_route_caches: None,
         }
     }
 
@@ -343,23 +343,36 @@ impl Chunk {
     }
 
     pub fn ensure_caches(&mut self) {
-        self.runtime.ensure_caches(self.program.code.len());
+        if let Some(_caches) = &mut self.owned_route_caches {
+            #[cfg(not(target_os = "espidf"))]
+            _caches.resize(_caches.len().max(self.program.code.len()), None);
+        } else {
+            self.runtime.ensure_caches(self.program.code.len());
+        }
     }
 
     pub fn cache_get(&self, ip: usize) -> Option<IcEntry> {
-        self.runtime.cache_get(ip)
+        match &self.owned_route_caches {
+            Some(caches) => ChunkRuntime::get_from(caches, ip),
+            None => self.runtime.cache_get(ip),
+        }
     }
 
     pub fn cache_set(&mut self, ip: usize, entry: IcEntry) {
-        self.runtime.cache_set(ip, entry);
+        match &mut self.owned_route_caches {
+            Some(caches) => ChunkRuntime::set_in(caches, ip, entry),
+            None => self.runtime.cache_set(ip, entry),
+        }
     }
 
     pub fn cache_add_shape(&mut self, ip: usize, shape_id: usize, index: usize) {
-        self.runtime.cache_add_shape(ip, shape_id, index);
+        if let Some(entry) = ChunkRuntime::shape_entry(self.cache_get(ip), shape_id, index) {
+            self.cache_set(ip, entry);
+        }
     }
 
     pub fn cache_slice(&self, start: usize, len: usize) -> Vec<Option<IcEntry>> {
-        self.runtime.cache_slice(start, len)
+        (start..start + len).map(|ip| self.cache_get(ip)).collect()
     }
 
     /// Share VM-owned function cache state, not per-invocation scopes/constants.
@@ -380,6 +393,7 @@ impl Chunk {
                 constant_map: HashMap::new(),
                 cache_program: Some(Arc::downgrade(&self.program)),
             },
+            owned_route_caches: None,
         }))
     }
 
@@ -390,7 +404,15 @@ impl Chunk {
                 cache_program: Some(Arc::downgrade(&self.program)),
                 ..ChunkRuntime::default()
             },
+            owned_route_caches: None,
         }
+    }
+
+    /// Route frames are not function metadata; their caches die with the frame.
+    pub(super) fn fresh_route_chunk(&self) -> Self {
+        let mut chunk = self.clone_without_runtime_caches();
+        chunk.owned_route_caches = Some(Vec::new());
+        chunk
     }
 
     pub fn reconstruct_functions(&mut self) {
@@ -467,5 +489,6 @@ pub enum IcEntry {
     Megamorphic,
     Global {
         index: usize,
+        namespace: u64,
     },
 }

@@ -139,7 +139,7 @@ fn plugin_values_errors_and_object_lifetime() {
     let id = result.as_gc_id().unwrap();
     assert_eq!(vm.struct_get(id, "value").as_number(), 42.0);
     // Keep the callback globals and returned struct alive while collecting the temporary plugin object.
-    let mut roots = vm.global_values.clone();
+    let mut roots = vm.global_values().to_vec();
     roots.push(result);
     vm.heap.collect(&roots);
     assert_eq!(vm.struct_get(id, "value").as_number(), 42.0);
@@ -1011,6 +1011,7 @@ fn native_class_provider_callbacks_and_references_survive_gc_and_owner_cleanup()
     let mut vm = VM::new();
     unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
     let module = matchbox_vm::bundle::Module {
+        parent_module:None,nested_modules:vec![],
         name:"module".into(), path:"/module".into(), dependencies:vec![], instance:"config".into(),
         descriptor:compile(r#"
 class Config {
@@ -1062,6 +1063,7 @@ fn class_provider_registration_unwinds_partial_startup_and_preserves_original_er
             let on_load = if failing && phase == "startup" { "throw 'original startup error';" } else { "" };
             let on_unload = if failing { "throw 'secondary unload error';" } else { "" };
             matchbox_vm::bundle::Module {
+                parent_module:None,nested_modules:vec![],
                 name:"module".into(), path:"/module".into(), dependencies:vec![], instance:"config".into(),
                 descriptor:compile(&format!(r#"
 class Config {{
@@ -1719,6 +1721,7 @@ class Config {{
 config = new Config();
 "#));
         let module = matchbox_vm::bundle::Module {
+            parent_module:None,nested_modules:vec![],
             name:"module".into(), path:"/module".into(), dependencies:vec![],
             instance:"config".into(), descriptor, bifs:compile(""), bif_registrations:vec![], classes:vec![], components:vec![],
             settings:serde_json::json!({}), artifact:None,

@@ -89,7 +89,7 @@ mod jni {
 }
 mod binary;
 mod cache;
-mod cli;
+pub(crate) mod cli;
 mod conversion;
 mod crypto;
 mod array_callbacks;

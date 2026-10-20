@@ -2475,8 +2475,42 @@ impl VM {
 
     pub fn new_with_args(args: Vec<String>) -> Self {
         let mut vm = Self::new();
-        vm.cli_args = args;
+        vm.set_cli_args(args);
         vm
+    }
+
+    /// Records the command line (executable first) and exposes it like BoxLang's CLI mode:
+    /// `server.cli` (`args`, `parsed`, `executionPath`, `command`) and `server.boxlang.cliMode`.
+    pub fn set_cli_args(&mut self, args: Vec<String>) {
+        use crate::types::BxVM as _;
+        let user_args: Vec<String> = args.iter().skip(1).cloned().collect();
+        let command = args.join(" ");
+        self.cli_args = args;
+        let Some(server_id) = self.get_global("server").and_then(|server| server.as_gc_id()) else {
+            return;
+        };
+        let vm: &mut dyn crate::types::BxVM = self;
+        let raw = vm.array_new();
+        for arg in &user_args {
+            let value = BxValue::new_ptr(vm.string_new(arg.clone()));
+            vm.array_push(raw, value);
+        }
+        let parsed = crate::bifs::cli::parsed_arguments_value(vm, &user_args);
+        #[cfg(not(target_arch = "wasm32"))]
+        let execution_path = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        let execution_path = String::new();
+        let cli = vm.struct_new();
+        vm.struct_set(cli, "args", BxValue::new_ptr(raw));
+        vm.struct_set(cli, "parsed", parsed);
+        let execution_path = BxValue::new_ptr(vm.string_new(execution_path));
+        vm.struct_set(cli, "executionPath", execution_path);
+        let command = BxValue::new_ptr(vm.string_new(command));
+        vm.struct_set(cli, "command", command);
+        vm.struct_set(server_id, "cli", BxValue::new_ptr(cli));
+        let boxlang = vm.struct_new();
+        vm.struct_set(boxlang, "cliMode", BxValue::new_bool(true));
+        vm.struct_set(server_id, "boxlang", BxValue::new_ptr(boxlang));
     }
 
     pub fn new_with_bifs(

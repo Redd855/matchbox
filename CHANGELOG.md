@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- `<bx:loop>` works: `from`/`to`/`step`/`index` counting loops, `array`, `list`, `collection` and `condition` loops no longer run forever or print `null` (`#93`).
 - Security: ESP32 firmware no longer ships default Wi-Fi credentials. Without `MATCHBOX_ESP32_WIFI_SSID` / `MATCHBOX_ESP32_WIFI_PASSWORD` at build time Wi-Fi stays off and the boot log says so (the credentials that were in the source should be considered public).
 - Destructuring rest elements (`[ a, ...rest ] = arr`, `{ a, ...others } = struct`) are now assigned instead of silently dropped.
 - `arraySlice` now follows BoxLang: `start` defaults to 1, `length` is a count (0 or omitted means to the end, negative trims from the end) and a negative `start` counts from the end.

@@ -427,7 +427,7 @@ impl<'a> Parser<'a> {
         let bare_abort = self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("abort"))
             && (self.kind(1) == Some(TokenKind::Semicolon)
                 || self.tokens.get(self.pos + 1).is_some_and(|token| { let name = &self.source[token.span.start..token.span.end]; name.eq_ignore_ascii_case("type") || name.eq_ignore_ascii_case("showerror") }));
-        if bare_abort || (self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon)) {
+        if bare_abort || self.is_script_component_start() || (self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon)) {
             return self.parse_component_statement(line);
         }
         if self.kind(1) == Some(TokenKind::Colon)
@@ -574,6 +574,15 @@ impl<'a> Parser<'a> {
     }
 
     // ---- Statement parsers ----
+
+    /// `lock name="a" { ... }` and `thread name="t" { ... }`: a component name followed by
+    /// an attribute or a body, so plain variables named `lock` or `thread` still work.
+    fn is_script_component_start(&self) -> bool {
+        self.kind(0) == Some(TokenKind::Identifier)
+            && self.token_text_lower(0).as_deref().is_some_and(|name| name == "lock" || name == "thread")
+            && (self.kind(1) == Some(TokenKind::LeftBrace)
+                || (self.kind(1) == Some(TokenKind::Identifier) && self.kind(2) == Some(TokenKind::Equal)))
+    }
 
     fn parse_component_statement(&mut self, line: u32) -> Result<Statement> {
         let name = self.expect_get(TokenKind::Identifier)?;

@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dateFormat`, `timeFormat` and `dateTimeFormat` now mirror BoxLang's `DateTimeFormat` BIF: masks are Java `DateTimeFormatter` patterns (case sensitive, `mm` is minutes, `MM` is month, invalid letters and repeat counts raise Java's errors), with Java's default masks, named masks (`short`, `medium`, `long`, `full`, `iso`, `iso8601`, `odbc`, `javascript`, `epoch`, `epochms`), `timezone` and `locale` arguments and English, German, Spanish, French, Italian, Portuguese, Dutch, Russian, Japanese and Chinese locale text. Locales without bundled data fall back to `en_US`; named regions other than UTC/GMT use MatchBox's fixed-offset zone table (no tz database).
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
+### Fixed
+- Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
+
+### Documentation
+- Documented which BIF groups exist in WASM builds: `hash()` needs the `bif-crypto` feature, `http()` is not usable in the browser.
+
 ## [0.11.0] - 2026-10-02
 
 ### Added

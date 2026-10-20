@@ -3170,6 +3170,12 @@ pub fn member_function_candidates(member: &str) -> Vec<String> {
         .iter()
         .map(|prefix| format!("{prefix}{member}"))
         .collect();
+    // Members whose BIF does not follow the `<type><member>` naming.
+    match member.as_str() {
+        "join" => candidates.push("arraytolist".to_string()),
+        "isdefined" => candidates.push("arrayindexexists".to_string()),
+        _ => {}
+    }
     candidates.push(member);
     candidates
 }

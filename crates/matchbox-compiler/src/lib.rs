@@ -1,5 +1,5 @@
 pub mod compiler;
-pub use matchbox_parser::{ast, cst, parser, tokenizer};
+pub use matchbox_parser::{ast, cst, inspect, parser, tokenizer};
 #[cfg(all(feature = "qoq", not(target_arch = "wasm32")))]
 pub use matchbox_vm::qoq;
 

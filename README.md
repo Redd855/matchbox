@@ -133,7 +133,7 @@ CLI must not prevent packaging web code that does not use ZIP.
 ### ESP32 Embedded
 MatchBox can flash BoxLang bytecode directly to ESP32 microcontrollers, enabling high-level language features on low-power hardware.
 ```bash
-matchbox --target esp32 --chip esp32s3 app.bxs --flash
+matchbox --target esp32 --chip esp32s3 --flash app.bxs
 ```
 
 ## Technical Architecture

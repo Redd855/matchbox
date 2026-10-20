@@ -1,0 +1,27 @@
+// Closures at script level must see the for-in loop variable (shared, like BoxLang).
+function expect( actual, expected, label ) {
+    if ( actual != expected ) { throw "#label# failed: expected [#expected#], got [#actual#]"; }
+}
+
+fs = [];
+for ( n in [ 1, 2, 3 ] ) { fs.append( () => n * 10 ); }
+expect( fs[ 1 ](), 30, "closure sees shared loop variable" );
+
+seen = [];
+for ( n in [ 1, 2 ] ) { seen.append( runAsync( () => n * n ).get() ); }
+expect( seen.toList(), "1,4", "runAsync sees loop variable" );
+
+pairs = [];
+for ( v, i in [ 5, 6 ] ) { f = () => v & i; pairs.append( f() ); }
+expect( pairs.toList(), "51,62", "item and index visible" );
+
+for ( n in [ 7, 8 ] ) { }
+expect( n, 8, "loop variable after loop" );
+
+// inside a function it already worked: keep it covered
+function inFunction() {
+    var out = [];
+    for ( n in [ 1, 2 ] ) { out.append( ( () => n * 2 )() ); }
+    return out.toList();
+}
+expect( inFunction(), "2,4", "function loop variable" );

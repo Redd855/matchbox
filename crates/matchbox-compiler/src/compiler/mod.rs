@@ -1389,8 +1389,10 @@ impl Compiler {
                 );
 
                 self.add_local(item.clone());
+                self.publish_script_loop_variable(item, stmt.line as u32);
                 if let Some(index_name) = index {
                     self.add_local(index_name.clone());
+                    self.publish_script_loop_variable(index_name, stmt.line as u32);
                 }
 
                 self.continue_patches.push(Vec::new());
@@ -2928,6 +2930,20 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+
+    /// Script-level loop variables live in stack slots, which closures cannot reach.
+    /// Mirror the newest local into the script `variables` scope like BoxLang does.
+    fn publish_script_loop_variable(&mut self, name: &str, line: u32) {
+        if self.is_function || name.is_empty() {
+            return;
+        }
+        let slot = (self.locals.len() - 1) as u32;
+        let name_idx = self
+            .chunk
+            .add_constant(Constant::String(BoxString::new(name)));
+        self.chunk.emit1(op::GET_LOCAL, slot, line);
+        self.chunk.emit1(op::SET_GLOBAL_POP, name_idx as u32, line);
     }
 
     fn add_local(&mut self, name: String) {

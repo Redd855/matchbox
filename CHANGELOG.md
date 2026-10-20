@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Labeled loops: `outer: for ( ... )` with `continue outer` / `break outer` (also `while` and `do`) now work like BoxLang. Labels were parsed and silently ignored, so `continue outer` only continued the inner loop.
+- Security: ESP32 firmware no longer ships default Wi-Fi credentials. Without `MATCHBOX_ESP32_WIFI_SSID` / `MATCHBOX_ESP32_WIFI_PASSWORD` at build time Wi-Fi stays off and the boot log says so (the credentials that were in the source should be considered public).
 - Destructuring rest elements (`[ a, ...rest ] = arr`, `{ a, ...others } = struct`) are now assigned instead of silently dropped.
 - `arraySlice` now follows BoxLang: `start` defaults to 1, `length` is a count (0 or omitted means to the end, negative trims from the end) and a negative `start` counts from the end.
 - Calling a function without a `required` argument now throws `Required argument [a] is missing for function [f]` (type `Application`) like BoxLang, instead of silently passing null.

@@ -37,17 +37,23 @@ function arrayReverse(array) {
 /**
  * Returns a slice of an array.
  */
-function arraySlice(array, offset, length) {
+function arraySlice(array, start = 1, length = 0) {
     var result = [];
-    var arrayLen = len(array);
-    if (offset < 1) {
-        offset = 1;
+    var size = len(array);
+    var from = start - 1;
+    if (from < 0) {
+        from = size + start;
     }
-    if (length > arrayLen) {
-        length = arrayLen;
+    var count = length;
+    if (count < 0) {
+        count = (size + count) - from;
+    } else if (count == 0) {
+        count = size - from;
     }
-    for (var i = offset; i <= length; i++) {
-        arrayAppend(result, array[i]);
+    for (var i = from; i < from + count; i++) {
+        if (i < size) {
+            arrayAppend(result, array[i + 1]);
+        }
     }
     return result;
 }
@@ -1042,4 +1048,31 @@ function structSort(struct, sortType = "text", sortOrder = "asc", path = "", cal
         width = doubledWidth;
     }
     return work;
+}
+
+// --- Destructuring ---
+
+/**
+ * Elements of an array from position `from` on (the `...rest` of `[ a, ...rest ] = source`).
+ */
+function _destructureArrayRest(source, from) {
+    var result = [];
+    var size = len(source);
+    for (var i = from; i <= size; i++) {
+        arrayAppend(result, source[i]);
+    }
+    return result;
+}
+
+/**
+ * Struct with every key of `source` that is not in `used` (the `...rest` of `{ a, ...rest } = source`).
+ */
+function _destructureObjectRest(source, used) {
+    var result = {};
+    for (key in structKeyArray(source)) {
+        if (!arrayContainsNoCase(used, key)) {
+            result[key] = source[key];
+        }
+    }
+    return result;
 }

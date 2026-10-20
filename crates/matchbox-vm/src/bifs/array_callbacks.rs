@@ -13,9 +13,12 @@ pub fn register_array_callback_bifs(bifs: &mut HashMap<String, BxNativeFunction>
     bifs.insert("arraynone".to_string(), array_none as BxNativeFunction);
 }
 
-fn array_arg(args: &[BxValue], name: &str) -> Result<usize, String> {
+fn array_arg(vm: &dyn BxVM, args: &[BxValue], name: &str) -> Result<usize, String> {
     if args.len() < 2 {
         return Err(format!("{}() expects an array and callback", name));
+    }
+    if !vm.is_array_value(args[0]) {
+        return Err(format!("{}() expects an array as the first argument", name));
     }
     args[0]
         .as_gc_id()
@@ -29,7 +32,7 @@ fn each_element(
     name: &str,
     mut visit: impl FnMut(&mut dyn BxVM, BxValue, BxValue) -> bool,
 ) -> Result<(), String> {
-    let array_id = array_arg(args, name)?;
+    let array_id = array_arg(vm, args, name)?;
     let chunk = vm
         .current_chunk()
         .ok_or_else(|| format!("{}() requires an active execution chunk", name))?;
@@ -55,7 +58,7 @@ fn array_each(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
 fn array_filter(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let result_id = vm.array_new();
     each_element(vm, args, "arrayFilter", |vm, value, keep| {
-        if keep.as_bool() {
+        if vm.is_truthy(keep) {
             vm.array_push(result_id, value);
         }
         false
@@ -65,8 +68,8 @@ fn array_filter(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> 
 
 fn array_some(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let mut found = false;
-    each_element(vm, args, "arraySome", |_, _, hit| {
-        found = hit.as_bool();
+    each_element(vm, args, "arraySome", |vm, _, hit| {
+        found = vm.is_truthy(hit);
         found
     })?;
     Ok(BxValue::new_bool(found))
@@ -74,8 +77,8 @@ fn array_some(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
 
 fn array_every(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let mut all = true;
-    each_element(vm, args, "arrayEvery", |_, _, hit| {
-        all = hit.as_bool();
+    each_element(vm, args, "arrayEvery", |vm, _, hit| {
+        all = vm.is_truthy(hit);
         !all
     })?;
     Ok(BxValue::new_bool(all))
@@ -83,15 +86,15 @@ fn array_every(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
 
 fn array_none(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let mut any = false;
-    each_element(vm, args, "arrayNone", |_, _, hit| {
-        any = hit.as_bool();
+    each_element(vm, args, "arrayNone", |vm, _, hit| {
+        any = vm.is_truthy(hit);
         any
     })?;
     Ok(BxValue::new_bool(!any))
 }
 
 fn array_reduce(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let array_id = array_arg(args, "arrayReduce")?;
+    let array_id = array_arg(vm, args, "arrayReduce")?;
     let chunk = vm
         .current_chunk()
         .ok_or_else(|| "arrayReduce() requires an active execution chunk".to_string())?;

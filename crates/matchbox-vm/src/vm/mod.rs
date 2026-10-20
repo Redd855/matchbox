@@ -734,6 +734,10 @@ impl BxVM for VM {
         }
     }
 
+    fn is_truthy(&self, val: BxValue) -> bool {
+        VM::is_truthy(self, val)
+    }
+
     fn is_array_value(&self, val: BxValue) -> bool {
         val.as_gc_id()
             .map(|id| matches!(self.heap.get(id), GcObject::Array(_)))
@@ -7982,6 +7986,10 @@ impl VM {
         };
 
         let params: Vec<&str> = match function_name.to_ascii_lowercase().as_str() {
+            "arrayeach" | "arraymap" | "arrayfilter" | "arraysome" | "arrayevery" | "arraynone" => {
+                vec!["array", "callback", "parallel", "maxthreads", "virtual"]
+            }
+            "arrayreduce" => vec!["array", "callback", "initialvalue"],
             "boxannounce" => vec!["state", "data", "poolname"],
             "dateformat" | "datetimeformat" => vec!["date", "format", "timezone", "locale"],
             "timeformat" => vec!["date", "format", "timezone"],

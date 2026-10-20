@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `class extends=Base implements=Speaker` (and `extends:Base`) accept an unquoted class name like BoxLang; only the quoted form parsed before.
+
+### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

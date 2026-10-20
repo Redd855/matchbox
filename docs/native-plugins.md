@@ -228,9 +228,9 @@ All root operations, including destruction, must remain on the VM thread. The Ru
 ## Packaging / cache
 
 ```bash
-matchbox app.bxs --module /path/to/package
-matchbox --build app.bxs --module /path/to/package --output app.bxb
-matchbox --target native app.bxs --module /path/to/package --output app
+matchbox --module /path/to/package app.bxs
+matchbox --build --module /path/to/package --output app.bxb app.bxs
+matchbox --target native --module /path/to/package --output app app.bxs
 ```
 
 Native libraries are extracted into a private content-addressed cache by target/library-group hash. Each file is published atomically across concurrent launches; every selected cached file is verified before loading. Tampered entries fail rather than being silently trusted. Set `MATCHBOX_NATIVE_CACHE` to choose the directory. Otherwise use the platform's user cache directory (or a process-specific temporary directory when no home/cache directory is available).

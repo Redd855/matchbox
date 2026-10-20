@@ -500,6 +500,19 @@ impl Compiler {
                 }
                 Ok(())
             }
+            StatementKind::Component { name, body, .. } if name.eq_ignore_ascii_case("lock") => {
+                // The VM runs one thread, so a lock never contends: run the body in place.
+                let Some(body) = body else { bail!("The lock component requires a body") };
+                self.begin_scope();
+                for inner in body {
+                    self.compile_statement(inner, false)?;
+                }
+                self.end_scope();
+                Ok(())
+            }
+            StatementKind::Component { name, .. } if name.eq_ignore_ascii_case("thread") => {
+                bail!("The thread component is not supported yet in MatchBox")
+            }
             StatementKind::Component { name, attributes, body } => {
                 self.compile_component(name, attributes, body.as_deref(), stmt.line)
             }

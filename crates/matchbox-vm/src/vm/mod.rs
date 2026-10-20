@@ -5838,6 +5838,16 @@ impl VM {
                                     let name = self.interner.resolve(name_id).to_string();
                                     if let Ok(value) = self.method_reference(base_val, &name) {
                                         self.fibers[fiber_idx].stack.push(value);
+                                    } else if let Some(getter) = Self::accessor_method_name("get", &name)
+                                        .filter(|getter| self.instance_has_method(base_val, getter))
+                                    {
+                                        // BoxLang invokeImplicitAccessor: `obj.name` calls `getName()`.
+                                        flush_ip!();
+                                        match self.call_method_value(base_val, &getter, Vec::new()) {
+                                            Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                                            Err(error) => self.throw_error(fiber_idx, &error.to_string())?,
+                                        }
+                                        frame_changed = true; continue 'quantum;
                                     } else {
                                         self.fibers[fiber_idx].stack.push(BxValue::new_null());
                                     }
@@ -6030,6 +6040,23 @@ impl VM {
                         } else {
                             None
                         };
+
+                        // BoxLang invokeImplicitAccessor: `obj.name = v` calls `setName( v )` unless `name` is a field.
+                        if let Some(GcObject::Instance(inst)) = self.heap.get_opt(id) {
+                            if self.shapes.get_index(inst.shape_id, name_id).is_none() {
+                                let name = self.interner.resolve(name_id).to_string();
+                                if let Some(setter) = Self::accessor_method_name("set", &name)
+                                    .filter(|setter| self.instance_has_method(base_val, setter))
+                                {
+                                    flush_ip!();
+                                    match self.call_method_value(base_val, &setter, vec![val]) {
+                                        Ok(_) => self.fibers[fiber_idx].stack.push(val),
+                                        Err(error) => self.throw_error(fiber_idx, &error.to_string())?,
+                                    }
+                                    frame_changed = true; continue 'quantum;
+                                }
+                            }
+                        }
 
                         match self.heap.get_mut(id) {
                             GcObject::Struct(s) => {
@@ -7845,6 +7872,13 @@ impl VM {
         let GcObject::Instance(instance) = self.heap.get_opt(receiver.as_gc_id()?)? else { return None; };
         let index = self.shapes.get_index(instance.shape_id, self.interner.get_id(name)?)?;
         instance.properties.get(index as usize).copied()
+    }
+
+    /// `get`/`set` + capitalized property name, e.g. ("get", "title") -> "getTitle".
+    fn accessor_method_name(prefix: &str, name: &str) -> Option<String> {
+        let mut chars = name.chars();
+        let first = chars.next()?;
+        Some(format!("{prefix}{}{}", first.to_uppercase(), chars.as_str()))
     }
 
     pub fn instance_has_method(&self, receiver: BxValue, name: &str) -> bool {

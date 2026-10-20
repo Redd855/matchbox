@@ -625,7 +625,8 @@ impl<'a> Parser<'a> {
             String::new()
         };
         let mut extends = None;
-        let mut accessors = false;
+        // BoxLang generates property accessors unless `accessors=false`.
+        let mut accessors = true;
         let mut implements = Vec::new();
 
         while matches!(self.peek_kind(),

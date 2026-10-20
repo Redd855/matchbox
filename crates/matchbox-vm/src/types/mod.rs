@@ -146,6 +146,10 @@ pub trait BxVM {
     fn get_shape_index(&self, shape_id: u32, field_name: &str) -> Option<u32>;
     fn get_len(&self, id: usize) -> usize;
     fn is_array_value(&self, val: BxValue) -> bool;
+    /// BoxLang boolean conversion (numbers, "true"/"false", "yes"/"no", empty and null are falsy).
+    fn is_truthy(&self, val: BxValue) -> bool {
+        val.as_bool()
+    }
     fn is_struct_value(&self, val: BxValue) -> bool;
     fn is_string_value(&self, val: BxValue) -> bool;
     fn is_bytes(&self, val: BxValue) -> bool;

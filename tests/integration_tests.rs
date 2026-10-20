@@ -230,6 +230,7 @@ script_test!(vm_instanceof_castas, "vm_instanceof_castas.bxs");
 script_test!(vm_assert_param_rethrow, "vm_assert_param_rethrow.bxs");
 script_test!(vm_contains, "vm_contains.bxs");
 script_test!(vm_array_bifs, "vm_array_bifs.bxs");
+script_test!(vm_private_methods, "vm_private_methods.bxs");
 script_test!(vm_class_accessors, "vm_class_accessors.bxs");
 script_test!(vm_class_annotation_names, "vm_class_annotation_names.bxs");
 script_test!(vm_variables_request_scope, "vm_variables_request_scope.bxs");

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- `private` class methods are enforced: calling one from outside the class (or an unrelated class) throws, while calls from the class, its subclasses and its closures keep working.
 - Class properties generate `getX()`/`setX()` by default (`accessors=false` opts out), generated setters return the instance so calls chain, and `obj.name` / `obj.name = v` use the accessors when there is no such field, as in BoxLang.
 - `<bx:include template="...">` includes the named template instead of an empty path (`#93`).
 - `class extends=Base implements=Speaker` (and `extends:Base`) accept an unquoted class name like BoxLang; only the quoted form parsed before.

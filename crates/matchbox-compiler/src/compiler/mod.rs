@@ -1604,7 +1604,11 @@ impl Compiler {
                     == Some(true);
 
                 // Call init() if args were passed or if the class is known to define init().
+                // BoxLang yields the instance unless init() returns a non-null value, so
+                // keep a copy of the instance below the receiver and settle it afterwards.
                 if (!args.is_empty() || class_has_init) && !is_js_import {
+                    self.chunk
+                        .emit1(op::DUP_BELOW, args.len() as u32, expr.line);
                     let name_idx = self
                         .chunk
                         .add_constant(Constant::String(BoxString::new("init")));
@@ -1621,6 +1625,7 @@ impl Compiler {
                         self.chunk
                             .emit2(op::INVOKE, name_idx as u32, args.len() as u32, expr.line);
                     }
+                    self.chunk.emit0(op::CTOR_FINISH, expr.line);
                 }
 
                 Ok(())

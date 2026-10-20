@@ -94,6 +94,7 @@ script_test!(structs, "structs.bxs");
 script_test!(top_level_return, "top_level_return.bxs");
 script_test!(vm_basic, "vm_basic.bxs");
 script_test!(vm_classes, "vm_classes.bxs");
+script_test!(vm_new_init_result, "vm_new_init_result.bxs");
 script_test!(vm_complex_types, "vm_complex_types.bxs");
 script_test!(vm_exceptions, "vm_exceptions.bxs");
 script_test!(vm_try_finally, "vm_try_finally.bxs");

@@ -44,10 +44,18 @@ so embedded hosts/tests do not silently scan the host filesystem.
 boxlang_modules, box.json local dependencies, matchbox.toml selections and home
 modules use the existing name/dependency/enable/settings rules. Project selections
 win over same-directory-name home packages. Configuration defaults to project
-boxlang.json; an explicit configuration accepts only modules enabled/settings.
+boxlang.json; an explicit configuration accepts modules enabled/settings and
+modulesDirectory (an array of directory strings). Additional directories resolve
+against the startup project/CWD, not the configuration file's parent. Project and
+explicit selections win, followed by home packages, then additional directories in
+listed order; blank/missing/non-directory paths are ignored. Invalid types fail
+before listening, rather than being coerced/ignored as on the JVM.
 The MiniServer-compatible frontend wires configPath/BOXLANG_CONFIG/.boxlang.json
-and serverHome precedence. Other runtime configuration and modulesDirectory remain
-unsupported; home config/boxlang.json is not applied and emits a warning.
+and serverHome precedence. Other runtime configuration remains unsupported;
+home config/boxlang.json is not applied and emits a warning. Discovery reports
+all installation roots and physical package paths for HTTP privacy, including
+disabled/shadowed packages and symlink targets. Use dedicated installation folders;
+these paths remain private even through aliases.
 
 The VM's `LoadedModules` separates initialization from reverse-order unload;
 `Application::run()` uses that same lifetime API. Descriptors configure once,
@@ -63,8 +71,17 @@ enable JNI; the root CLI's explicitly selected JNI feature remains unchanged.
 Modules can supply bounded Java facades, not arbitrary JVM classes/JAR support.
 
 Hosts must protect `module_paths()` (including aliases) from direct HTTP serving.
-Module public mappings/assets, nested module discovery and hot reload are not wired
-here. Module BIFs/classes and component bodies execute with process privileges.
+Nested modules under package modules/ directories are discovered recursively.
+Records expose parentModule/nestedModules. Parent constructors/classes precede
+children; children configure/activate/unload before parents. Literal this.modules
+child overrides merge before global settings; disabled parents suppress descendants.
+Dynamic metadata/child overrides and hot reload remain unsupported.
+module_mappings() exports resolved mapping snapshots without VM values crossing
+threads. HTTP hosts may publish external mappings as confined mounts; all other
+package paths stay private. The native frontend supports default public/ and custom
+publicMapping roots, templates, static streaming/ranges and public CGI prefixes.
+Mapped mounts retain existing mount-scoped descriptor lookup; arbitrary application
+source/include mappings remain separate work. Module code has process privileges.
 
 ## Application.bx lifecycle
 
@@ -119,6 +136,17 @@ runtime. Asset stores must be Send + Sync and can implement `source_path()` to
 supply a confined physical filename for native compilation and relative imports.
 The native frontend shares one runtime across its aliases.
 
+The owning runtime worker reuses compiled request templates (not responses or
+request values). Every load still reads through the asset store and compares
+source bytes and filename, so edits—including same-size/same-mtime changes—,
+deletions and store access checks remain visible. Mount identity, receiver/class
+context and module-class mode are separate cache keys; executions receive fresh
+runtime caches. Retention is LRU-bounded to 64 entries and 16 MiB of serialized
+program/source/key weight (not an exact resident-memory cap); oversized entries
+execute uncached. Literal includes and compiler-resolved source dependencies
+bypass reuse until dependency-graph invalidation exists. Dynamic includes load
+independently. `Application.bx` listener construction/compilation is unchanged.
+
 The VM's `with_isolated_globals()` restores bindings/output/control state on
 success, errors and panics. Escaping heap values require `retain_value()` roots.
 Global inline caches are cleared and unreachable request objects collected at
@@ -140,14 +168,33 @@ Unknown web component names still delegate to the existing component dispatcher.
 
 ## Scope and checks
 
-This is **not** full MiniServer runtime parity. Module public/source mappings,
-nested discovery, Application.bxm, full application configuration/output modifiers, session lifecycle,
-cookie-scope writes, multipart and
-SocketBox remain follow-up work. Dynamic include failures do not yet carry the
+This is **not** full MiniServer runtime parity. Arbitrary source/include mappings,
+Application.bxm, full application configuration/output modifiers,
+external session-cache providers and SocketBox remain
+follow-up work. Native HTTP hosts can call multipart::parse after enforcing their
+body limit: repeated fields/arrays and private temporary files populate form.
+Files are removed at request completion, not deferred until VM garbage collection.
+Multipart parsing is native-only and accepts UTF-8 text, at most 1000 parts and
+RFC-length boundaries. FileUpload/FileUploadAll support field selection, metadata,
+extension/MIME filters, strict handling and error/skip/overwrite/makeunique conflicts.
+Original filenames must be portable basenames. Destination writes are staged and
+committed atomically; errors never truncate an existing file. Unknown MIME uses
+application/octet-stream. attributes/mode are explicitly unsupported. Relative
+non-dot destinations resolve under the OS temp directory; dot-relative paths use
+the current source. Full runtime security configuration remains pending; listener
+allowedFileOperationExtensions/disallowedFileOperationExtensions are respected. apply_proxy_headers is an explicit opt-in for hosts behind
+proxies that overwrite X-Forwarded-*; it never infers trust from header presence. Dynamic include failures do not yet carry the
 full JVM missing-include exception taxonomy. Descriptor lookup stops at each
 mount, without falling back from an alias to the primary webroot's descriptor.
 
-Responses remain buffered, not streamed. Binary content with reset=false is
+Native hosts can use `static_files::static_file_response()` after authorizing a
+filesystem path. It streams with 64 KiB read chunks, Last-Modified/date preconditions,
+single byte ranges, If-Range and HEAD lengths. POST retains MiniServer's static
+behavior. ETags and multipart ranges are not provided. The native frontend uses
+this helper after its existing path/source/config checks, including aliases and
+static welcome files. This is not a path-confinement API.
+
+Template/content responses remain buffered. Binary content with reset=false is
 emitted before the retained text buffer (matching current MiniServer). Native
 file paths are relative to the current source, mount-relative for /paths, or
 existing absolute filesystem paths. Custom application/alias mappings are not
@@ -162,11 +209,14 @@ finally when the same try also has catches; its Java backend runs finally. We
 preserve cleanup rather than reproducing that ASM defect. Abort types other than
 request/page fail explicitly; exit-tag/template/loop are not implemented.
 
-Application.bx defaults to sessions disabled. `sessionManagement=true` fails
-explicitly until application-isolated sessions exist; it must not silently use
-the legacy session map. Sites without a descriptor retain the previous
-process-local string sessions, still without expiry/size bounds. Persistent VM
-symbol/shape tables also lack a bounded eviction policy. This is not recommended
+Sessions default off. `sessionManagement=true` enables live typed native/memory
+state with application isolation and sharing across same-name mounts. jsessionid,
+sessionCookie/setClientCookies, start/end/expiry, rotate/invalidate/startTime are
+supported. Session-end precedes application-end; failed starts retry and preserve
+the cookie on a redacted 500 response. JEE/external cache storage is rejected.
+The obsolete string/MBX_SESSION_ID path is removed. Cookies support validated
+scope assignments and bx:cookie, including repeated response fields. Persistent
+VM symbol/shape tables and session entry counts lack a bounded eviction policy. This is not recommended
 for internet-facing production traffic. CFML and `.bx` remote class execution
 are excluded from the native frontend's release requirements.
 

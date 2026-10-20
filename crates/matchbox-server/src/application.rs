@@ -3,8 +3,8 @@ use crate::{
     application_runtime::{RenderJob, RenderOutput},
     web_context::install_web_context,
     webroot_core::{
-        AssetStore, cgi_scope_from_request, form_scope_from_request, insert_scope,
-        parse_cookie_header,
+        AssetStore, cgi_scope_from_request, form_scope_from_request, insert_parameter_scope,
+        insert_scope, parameter_values, parse_cookie_header,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -14,7 +14,7 @@ use matchbox_vm::{
     vm::{AbortSignal, VM, chunk::Chunk, gc::RootedValue},
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::{Component, Path, PathBuf},
     rc::Rc,
@@ -33,10 +33,12 @@ struct ApplicationState {
     listener: Option<Rc<RootedValue>>,
     touched: Instant,
     timeout: Option<Duration>,
+    sessions: crate::sessions::Store,
 }
 pub(crate) struct ApplicationRuntime {
     vm: VM,
     applications: HashMap<String, ApplicationState>,
+    templates: Rc<RefCell<crate::template_cache::TemplateCache>>,
     #[cfg(not(target_family = "wasm"))]
     modules: Option<matchbox_vm::bundle::LoadedModules>,
 }
@@ -45,6 +47,7 @@ impl ApplicationRuntime {
         Self {
             vm: VM::new(),
             applications: HashMap::new(),
+            templates: Rc::new(RefCell::new(Default::default())),
             #[cfg(not(target_family = "wasm"))]
             modules: None,
         }
@@ -55,23 +58,13 @@ impl ApplicationRuntime {
         project: &Path,
         home: Option<&Path>,
         config: Option<&Path>,
-    ) -> Result<Vec<PathBuf>> {
-        let sources =
-            matchbox_modules::discovery::discover_modules_with_config(project, &[], home, config)?;
-        let mut paths: Vec<_> = sources.iter().map(|module| module.path.clone()).collect();
-        for directory in [
-            Some(project.join("boxlang_modules")),
-            home.map(|home| home.join("modules")),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if directory.is_dir() {
-                paths.push(directory.canonicalize()?);
-            }
-        }
-        let modules =
-            matchbox_modules::programs::prepare_installed(&sources, matchbox_vm::bundle::TARGET)?;
+    ) -> Result<(Vec<PathBuf>, Vec<matchbox_vm::bundle::ModuleMapping>)> {
+        let discovered =
+            matchbox_modules::discovery::discover_module_installations(project, &[], home, config)?;
+        let modules = matchbox_modules::programs::prepare_installed(
+            &discovered.modules,
+            matchbox_vm::bundle::TARGET,
+        )?;
         // Install even an empty registry so module inventory/settings APIs remain real, not missing BIFs.
         self.modules = Some(matchbox_vm::bundle::LoadedModules::load(
             &mut self.vm,
@@ -80,16 +73,20 @@ impl ApplicationRuntime {
         )?);
         // Validate idle startup using the same boundary that will guard actual requests.
         self.vm.with_isolated_globals(|_| Ok(()))?;
-        Ok(paths)
+        let mappings = self.modules.as_ref().unwrap().mappings(&self.vm)?;
+        Ok((discovered.private_paths, mappings))
     }
     pub(crate) fn render(&mut self, job: RenderJob) -> Result<RenderOutput> {
         self.expire();
         let Self {
-            vm, applications, ..
+            vm, applications, templates, ..
         } = self;
-        vm.with_isolated_globals(|vm| render(vm, applications, job))
+        vm.with_isolated_globals(|vm| render(vm, applications, templates.clone(), job))
     }
     pub(crate) fn expire(&mut self) {
+        for app in self.applications.values() {
+            crate::sessions::expire(&mut self.vm, &app.scope, &app.sessions, false);
+        }
         let expired: Vec<_> = self
             .applications
             .iter()
@@ -122,6 +119,7 @@ impl ApplicationRuntime {
     }
 }
 fn end_application(vm: &mut VM, app: ApplicationState) {
+    crate::sessions::expire(vm, &app.scope, &app.sessions, true);
     let Some(listener) = app.listener else {
         return;
     };
@@ -150,6 +148,25 @@ fn end_application(vm: &mut VM, app: ApplicationState) {
 fn render(
     vm: &mut VM,
     applications: &mut HashMap<String, ApplicationState>,
+    templates: Rc<RefCell<crate::template_cache::TemplateCache>>,
+    job: RenderJob,
+) -> Result<RenderOutput> {
+    let debug = job.context.debug;
+    match render_request(vm, applications, templates, job) {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            eprintln!("Request failed: {error}");
+            match crate::web_context::error_response(vm, &error.to_string(), debug) {
+                Ok(response) => Ok(RenderOutput { response }),
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+fn render_request(
+    vm: &mut VM,
+    applications: &mut HashMap<String, ApplicationState>,
+    templates: Rc<RefCell<crate::template_cache::TemplateCache>>,
     job: RenderJob,
 ) -> Result<RenderOutput> {
     vm.begin_output_capture();
@@ -160,14 +177,20 @@ fn render(
         &job.context,
         job.store.source_path("")?,
     )?;
-    insert_scope(vm, "url", &request.query);
-    insert_scope(vm, "form", &form_scope_from_request(&request));
-    let mut cookies = request
+    let query = if job.context.query_string.is_empty() {
+        (request.query.clone(), Default::default())
+    } else {
+        parameter_values(job.context.query_string.as_bytes(), true)
+    };
+    insert_parameter_scope(vm, "url", query);
+    insert_parameter_scope(vm, "form", form_scope_from_request(&request));
+    let cookies = request
         .headers
         .get("cookie")
         .map(|value| parse_cookie_header(value))
         .unwrap_or_default();
-    insert_scope(vm, "cookie", &cookies);
+    let cookie_jar = crate::web_context::cookie_jar(vm).map_err(anyhow::Error::msg)?;
+    crate::cookies::install(vm, &cookies, cookie_jar.clone()).map_err(anyhow::Error::msg)?;
     insert_scope(
         vm,
         "cgi",
@@ -186,6 +209,8 @@ fn render(
         .to_string();
     let store = job.store.clone();
     let include_depth = Rc::new(Cell::new(0));
+    let include_templates = templates.clone();
+    let include_scope = job.scope_id.clone();
     vm.register_callback(
         "include",
         NativeCallback {
@@ -211,7 +236,9 @@ fn render(
                     .map_err(|error| error.to_string())?;
                 let receiver = vm.current_receiver();
                 let chunk = load_template(
+                    &include_templates,
                     store.as_ref(),
+                    &include_scope,
                     &path,
                     receiver.is_some(),
                     vm.has_global_function("getModuleInfo"),
@@ -250,32 +277,39 @@ fn render(
                         bail!("{cause}");
                     }
                     let mut response = response.borrow_mut();
+                    response.headers.extend(
+                        cookie_jar
+                            .borrow()
+                            .headers()
+                            .map(|value| ("set-cookie".into(), value)),
+                    );
                     response
                         .body
                         .extend(vm.end_output_capture().unwrap_or_default().into_bytes());
                     return Ok(RenderOutput {
                         response: response.clone(),
-                        session: None,
                     });
                 }
                 return Err(error);
             }
         };
         vm.insert_global("__mb_web_listener".into(), listener);
+        for (property, global) in [
+            ("allowedFileOperationExtensions", "__mb_upload_allowed"),
+            ("disallowedFileOperationExtensions", "__mb_upload_blocked"),
+        ] {
+            if let Some(value) = vm
+                .instance_property(listener, property)
+                .filter(|value| !value.is_null())
+            {
+                vm.insert_global(global.into(), value);
+            }
+        }
         Some(listener)
     } else {
         None
     };
     let (key, timeout) = if let Some(listener) = listener {
-        if let Some(setting) = vm.instance_property(listener, "sessionManagement") {
-            let enabled = vm
-                .cast_value_to_type(setting, "boolean")
-                .map_err(anyhow::Error::msg)?;
-            ensure!(
-                !enabled.as_bool(),
-                "Application sessionManagement=true requires the pending MiniServer session runtime; legacy unnamed sessions are not application-isolated"
-            );
-        }
         let name = vm
             .instance_property(listener, "name")
             .filter(|value| !value.is_null())
@@ -328,6 +362,7 @@ fn render(
                     .transpose()?,
                 touched: Instant::now(),
                 timeout,
+                sessions: Default::default(),
             },
         );
     }
@@ -339,19 +374,16 @@ fn render(
         vm.read_retained_value(&app.scope)
             .map_err(anyhow::Error::msg)?,
     );
-    let session = if listener.is_none() {
-        cookies.insert("MBX_SESSION_ID".into(), job.session_id.clone());
-        insert_scope(vm, "cookie", &cookies);
-        Some(insert_scope(vm, "session", &job.session))
-    } else {
-        None
-    };
-    let _session_root = session
-        .map(|id| {
-            vm.retain_value(BxValue::new_ptr(id))
-                .map_err(anyhow::Error::msg)
-        })
-        .transpose()?;
+    let session_settings = crate::sessions::Settings::from_listener(vm, listener)?;
+    let session_id = session_settings.id(&cookies);
+    if session_settings.enabled {
+        session_settings
+            .emit(&cookie_jar, &session_id)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let session_store = app.sessions.clone();
+    let app_scope = app.scope.clone();
+    let end_listener = app.listener.clone();
     let execution = (|| -> Result<()> {
         if first
             && let Some(listener) = listener
@@ -361,6 +393,23 @@ fn render(
             return Err(error);
         }
         if let Some(listener) = listener {
+            if session_settings.enabled {
+                let name = vm
+                    .instance_property(listener, "name")
+                    .map(|value| vm.to_string(value))
+                    .unwrap_or_else(|| key.clone());
+                crate::sessions::attach(
+                    vm,
+                    session_store,
+                    app_scope,
+                    listener,
+                    end_listener.unwrap(),
+                    name,
+                    session_id,
+                    session_settings,
+                    cookie_jar.clone(),
+                )?;
+            }
             let target = BxValue::new_ptr(vm.string_new(public_path.clone()));
             vm.insert_global("__mb_web_target".into(), target);
             let start = hook(vm, listener, "onRequestStart", vec![target])?;
@@ -376,7 +425,9 @@ fn render(
                 if vm.instance_has_method(listener, "onRequest") {
                     hook(vm, listener, "onRequest", vec![target])?;
                 } else if let Some(chunk) = load_template(
+                    &templates,
                     job.store.as_ref(),
+                    &job.scope_id,
                     &job.asset_path,
                     true,
                     vm.has_global_function("getModuleInfo"),
@@ -401,7 +452,9 @@ fn render(
             }
             hook(vm, listener, "onRequestEnd", vec![target])?;
         } else if let Some(chunk) = load_template(
+            &templates,
             job.store.as_ref(),
+            &job.scope_id,
             &job.asset_path,
             false,
             vm.has_global_function("getModuleInfo"),
@@ -468,24 +521,18 @@ fn render(
             return Err(error);
         }
     }
-    let session = session.map(|id| {
-        let mut session = HashMap::new();
-        for key in vm.struct_key_array(id) {
-            session.insert(key.clone(), vm.to_string(vm.struct_get(id, &key)));
-        }
-        response.borrow_mut().headers.push((
-            "set-cookie".into(),
-            format!("MBX_SESSION_ID={}; Path=/; HttpOnly", job.session_id),
-        ));
-        session
-    });
     let mut response = response.borrow_mut();
+    response.headers.extend(
+        cookie_jar
+            .borrow()
+            .headers()
+            .map(|value| ("set-cookie".into(), value)),
+    );
     response
         .body
         .extend(vm.end_output_capture().unwrap_or_default().into_bytes());
     Ok(RenderOutput {
         response: response.clone(),
-        session,
     })
 }
 
@@ -518,32 +565,16 @@ fn find_application(store: &dyn AssetStore, asset: &str) -> Result<Option<(Strin
         }
     }
 }
+// End the cache borrow before execution, which can recursively include templates.
 fn load_template(
+    templates: &RefCell<crate::template_cache::TemplateCache>,
     store: &dyn AssetStore,
+    scope: &str,
     path: &str,
     class_context: bool,
     module_classes: bool,
 ) -> Result<Option<Chunk>> {
-    if !class_context && let Some(chunk) = store.compiled_template(path)? {
-        return Ok(Some(chunk));
-    }
-    let Some(bytes) = store.read(path)? else {
-        return Ok(None);
-    };
-    let source = String::from_utf8(bytes)?;
-    let filename = store.source_path(path)?;
-    let ast = if path.ends_with(".bxm") {
-        parser::parse_bxm(&source, Some(&filename))?
-    } else {
-        parser::parse(&source, Some(&filename))?
-    };
-    let mut compiler = Compiler::new(&filename);
-    compiler.runtime_module_classes = module_classes;
-    Ok(Some(if class_context {
-        compiler.compile_class_template(&ast, &source)?
-    } else {
-        compiler.compile(&ast, &source)?
-    }))
+    templates.borrow_mut().load(store, scope, path, class_context, module_classes)
 }
 fn include_path(
     store: &dyn AssetStore,

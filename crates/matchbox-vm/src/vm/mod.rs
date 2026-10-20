@@ -534,6 +534,8 @@ pub struct VM {
     struct_assignment_hooks: HashMap<usize, (Rc<gc::RootedValue>, crate::types::NativeCallback)>,
     pub script_variables: Rc<RefCell<HashMap<String, BxValue>>>,
     pub current_fiber_idx: Option<usize>,
+    /// Futures of fibers suspended on the Rust stack inside a synchronous native-to-script call.
+    stacked_futures: Vec<usize>,
     pub shapes: ShapeRegistry,
     pub heap: Heap,
     pub native_classes: HashMap<String, BxNativeFunction>,
@@ -2447,6 +2449,7 @@ impl VM {
             struct_assignment_hooks: HashMap::new(),
             script_variables: Self::new_variables_scope(),
             current_fiber_idx: None,
+            stacked_futures: Vec::new(),
             shapes: ShapeRegistry::new(),
             heap: Heap::new(),
             config: GCConfig::default(),
@@ -3856,6 +3859,47 @@ impl VM {
         }
 
         Ok(last_result)
+    }
+
+    /// Runs one timeslice of every fiber that is not suspended on the Rust stack.
+    fn run_other_fibers(&mut self) -> Result<()> {
+        self.drain_native_completions();
+        let mut ran = false;
+        let mut i = 0;
+        while i < self.fibers.len() {
+            if self.stacked_futures.contains(&self.fibers[i].future_id) {
+                i += 1;
+                continue;
+            }
+            if let Some(until) = self.fibers[i].wait_until {
+                if Instant::now() < until {
+                    i += 1;
+                    continue;
+                }
+                self.fibers[i].wait_until = None;
+            }
+            ran = true;
+            self.current_fiber_idx = Some(i);
+            match self.run_fiber(i, Some(Instant::now() + Duration::from_millis(2))) {
+                Ok(Some(result)) => {
+                    let fiber = self.fibers.swap_remove(i);
+                    self.settle_future_success(fiber.future_id, result)?;
+                }
+                Ok(None) => i += 1,
+                Err(e) => {
+                    let fiber = self.fibers.swap_remove(i);
+                    let error = self.string_new(e.to_string());
+                    self.settle_future_error(fiber.future_id, BxValue::new_ptr(error))?;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !ran {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = ran;
+        Ok(())
     }
 
     fn settle_future_success(&mut self, future_id: usize, result: BxValue) -> Result<()> {
@@ -7531,8 +7575,15 @@ impl VM {
                 GcObject::CompiledFunction(f) => {
                     let f = Rc::clone(f);
                     let _future = self.enqueue_function_call(func, f, args, 0, None, names);
-                    let fiber_idx = self.fibers.len() - 1;
+                    let mut fiber_idx = self.fibers.len() - 1;
+                    let nested_future = self.fibers[fiber_idx].future_id;
                     let previous_fiber_idx = self.current_fiber_idx;
+                    let stacked_before = self.stacked_futures.len();
+                    if let Some(previous) = previous_fiber_idx.and_then(|idx| self.fibers.get(idx)) {
+                        let previous_future = previous.future_id;
+                        self.stacked_futures.push(previous_future);
+                    }
+                    self.stacked_futures.push(nested_future);
                     self.current_fiber_idx = Some(fiber_idx);
                     // Loop until the fiber completes — this is a synchronous blocking call.
                     let result = loop {
@@ -7540,10 +7591,22 @@ impl VM {
                             .run_fiber(fiber_idx, Some(Instant::now() + Duration::from_millis(2)))
                         {
                             Ok(Some(val)) => break Ok(val),
-                            Ok(None) => continue, // timeslice expired, keep running
+                            Ok(None) => {
+                                // Timeslice expired or the callback is waiting (e.g. `future.get()`):
+                                // let the other fibers progress, or it would wait forever.
+                                if let Err(e) = self.run_other_fibers() {
+                                    break Err(e);
+                                }
+                                match self.fibers.iter().position(|fiber| fiber.future_id == nested_future) {
+                                    Some(idx) => fiber_idx = idx,
+                                    None => break Err(anyhow::anyhow!("Callback fiber disappeared while waiting")),
+                                }
+                                self.current_fiber_idx = Some(fiber_idx);
+                            }
                             Err(e) => break Err(e),
                         }
                     };
+                    self.stacked_futures.truncate(stacked_before);
                     self.current_fiber_idx = previous_fiber_idx;
                     let _ = self.fibers.swap_remove(fiber_idx);
                     result

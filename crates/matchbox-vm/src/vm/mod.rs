@@ -13,6 +13,9 @@ mod interceptors;
 pub(crate) mod components;
 mod component_runtime;
 mod request_scope;
+mod struct_scope;
+mod abort;
+pub use abort::AbortSignal;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod opcode;
@@ -514,11 +517,21 @@ pub enum HostFutureState {
     Failed(BxValue),
 }
 
+// Process-unique identities also distinguish independent VMs; never recycle on overflow.
+fn next_global_namespace() -> u64 {
+    static NEXT: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    let mut next = NEXT.lock().expect("global namespace allocator poisoned");
+    *next = next.checked_add(1).expect("global namespace identities exhausted");
+    *next
+}
+
 pub struct VM {
     pub fibers: Vec<BxFiber>,
-    pub global_names: HashMap<u32, usize>,
-    pub global_values: Vec<BxValue>,
-    global_bifs: HashSet<String>,
+    global_names: HashMap<u32, usize>,
+    global_values: Vec<BxValue>,
+    global_namespace: u64,
+    global_bifs: HashSet<Rc<str>>,
+    struct_assignment_hooks: HashMap<usize, (Rc<gc::RootedValue>, crate::types::NativeCallback)>,
     pub script_variables: Rc<RefCell<HashMap<String, BxValue>>>,
     pub current_fiber_idx: Option<usize>,
     pub shapes: ShapeRegistry,
@@ -677,8 +690,10 @@ impl BxVM for VM {
         args: Vec<BxValue>,
         _chunk: Rc<RefCell<crate::vm::chunk::Chunk>>,
     ) -> Result<BxValue, String> {
-        self.call_method_value(receiver, name, args)
-            .map_err(|e| e.to_string())
+        let previous=self.current_fiber_idx;
+        let result=self.native_exception_scope(|vm| vm.call_method_value(receiver,name,args).map_err(|error|error.to_string()));
+        self.current_fiber_idx=previous;
+        result
     }
 
     fn yield_fiber(&mut self) {
@@ -1280,6 +1295,8 @@ impl BxVM for VM {
         self.struct_set_and_key(id, key, val);
     }
 
+    fn struct_assign(&mut self, id: usize, key: &str, value: BxValue) -> Result<(), String> { self.assign_struct(id, key, value) }
+
     fn struct_get(&self, id: usize, key: &str) -> BxValue {
         let key_id = self.struct_key_lookup_id(id, key).unwrap_or(u32::MAX);
         if let GcObject::Struct(s) = self.heap.get(id) {
@@ -1493,7 +1510,7 @@ impl BxVM for VM {
     }
 
     fn has_global_function(&self, name: &str) -> bool {
-        self.global_bifs.contains(&name.to_lowercase())
+        self.global_bifs.contains(name.to_lowercase().as_str())
     }
 
     fn append_interception_points(&mut self, names: Vec<String>) -> Result<(), String> { VM::append_interception_points(self, names); Ok(()) }
@@ -1510,11 +1527,13 @@ impl BxVM for VM {
     fn announce(&mut self, name: &str, data: BxValue) -> Result<(), String> { VM::announce(self, name, data) }
 
     fn global_function_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.global_bifs.iter().cloned().collect();
+        let mut names: Vec<_> = self.global_bifs.iter().map(|name| name.to_string()).collect();
         names.sort();
         names
     }
 
+    fn is_native_abort(&self, message: &str) -> bool { VM::is_native_abort(self, message) }
+    fn raise_abort(&mut self, kind: &str, cause: Option<String>) -> String { VM::raise_abort(self, kind, cause) }
     fn register_callback(&mut self, name: &str, callback: crate::types::NativeCallback) -> Result<(), String> {
         let id = self.heap.alloc(GcObject::NativeCallback(callback));
         self.register_global_bif(name.to_string(), BxValue::new_ptr(id));
@@ -2423,7 +2442,9 @@ impl VM {
             fibers: Vec::new(),
             global_names: HashMap::new(),
             global_values: Vec::new(),
+            global_namespace: next_global_namespace(),
             global_bifs: HashSet::new(),
+            struct_assignment_hooks: HashMap::new(),
             script_variables: Self::new_variables_scope(),
             current_fiber_idx: None,
             shapes: ShapeRegistry::new(),
@@ -2713,7 +2734,7 @@ impl VM {
     }
 
     pub fn register_global_bif(&mut self, name: String, value: BxValue) {
-        self.global_bifs.insert(name.to_lowercase());
+        self.global_bifs.insert(Rc::from(name.to_lowercase()));
         let value = self.bif_function(value, &name, false);
         self.insert_global(name, value);
     }
@@ -2738,6 +2759,11 @@ impl VM {
         let global = self.get_global(global_name)?;
         let id = global.as_gc_id()?;
         Some(self.struct_get(id, member_name))
+    }
+
+    /// Read-only host roots; binding changes must go through VM APIs.
+    pub fn global_values(&self) -> &[BxValue] {
+        &self.global_values
     }
 
     fn insert_global_interned(&mut self, name_id: u32, val: BxValue) {
@@ -3158,9 +3184,9 @@ impl VM {
         // Borrowed execution path used by host tests. It still creates a
         // fresh Chunk wrapper so the caller's runtime caches are not mutated,
         // but the immutable program data is shared via Arc.
-        let mut chunk_for_func = chunk.clone_without_runtime_caches();
-        chunk_for_func.ensure_caches();
-        let chunk_rc = Rc::new(RefCell::new(chunk_for_func));
+        let mut route_chunk = chunk.fresh_route_chunk();
+        route_chunk.ensure_caches();
+        let chunk_rc = Rc::new(RefCell::new(route_chunk));
         let chunk_for_func = chunk.clone_without_runtime_caches();
         self.interpret_chunk_shared(chunk_for_func, chunk_rc)
     }
@@ -3171,7 +3197,7 @@ impl VM {
         // per-request runtime cache. This avoids the previous OOM-prone
         // `clone_without_runtime_caches()` path that duplicated the entire
         // route chunk on every HTTP request.
-        let mut route_chunk = chunk.clone_without_runtime_caches();
+        let mut route_chunk = chunk.fresh_route_chunk();
         route_chunk.ensure_caches();
         let chunk_rc = Rc::new(RefCell::new(route_chunk));
         let chunk_for_func = Chunk::default();
@@ -3180,11 +3206,16 @@ impl VM {
 
     pub fn interpret_chunk_with_receiver(&mut self, chunk: &Chunk, receiver: Option<BxValue>) -> Result<BxValue> {
         if let Some(receiver) = receiver { self.instance_class_name(receiver)?; }
-        let mut chunk = chunk.clone_without_runtime_caches();
+        let mut chunk = chunk.fresh_route_chunk();
         chunk.ensure_caches();
         let previous = self.current_fiber_idx;
         let result = self.interpret_chunk_shared_current_task(Chunk::default(), Rc::new(RefCell::new(chunk)), receiver);
         self.current_fiber_idx = previous;
+        // Page aborts stop this template, not its including caller or request hooks.
+        if result.as_ref().err().and_then(|error| error.downcast_ref::<AbortSignal>()).is_some_and(|signal| signal.kind == "page") {
+            self.native_callback_exception = None;
+            return Ok(BxValue::new_null());
+        }
         result
     }
 
@@ -4378,7 +4409,10 @@ impl VM {
                                             let frame =
                                                 self.fibers[fiber_idx].frames.last().unwrap();
                                             let c = frame.chunk.borrow();
-                                            c.cache_slice(body_start, body_len)
+                                            // JIT specializes shapes only, never namespace-bound slots.
+                                            c.cache_slice(body_start, body_len).into_iter()
+                                                .map(|entry| entry.filter(|entry| !matches!(entry, IcEntry::Global { .. })))
+                                                .collect::<Vec<_>>()
                                         };
                                         for &word in &body_code {
                                             if (word & 0xFF) as u8 == op::CONSTANT {
@@ -4467,7 +4501,9 @@ impl VM {
                         chunk.cache_get(ip_at_start)
                     };
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         let val = self.global_values[index];
                         if val.is_number() {
                             self.global_values[index] = BxValue::new_number(val.as_number() + 1.0);
@@ -4487,7 +4523,7 @@ impl VM {
                                     BxValue::new_number(val.as_number() + 1.0);
                                 let frame = self.fibers[fiber_idx].frames.last().unwrap();
                                 let mut chunk = frame.chunk.borrow_mut();
-                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             } else {
                                 flush_ip!();
                                 self.throw_error(
@@ -4516,7 +4552,9 @@ impl VM {
                         chunk.cache_get(ip_at_start)
                     };
 
-                    let val = if let Some(IcEntry::Global { index }) = ic {
+                    let val = if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         self.global_values[index]
                     } else {
                         let name_id = self.read_intern_id(fiber_idx, name_idx as usize)?;
@@ -4524,7 +4562,7 @@ impl VM {
                             let v = self.global_values[global_idx];
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             v
                         } else {
                             BxValue::new_null()
@@ -5159,7 +5197,9 @@ impl VM {
                         chunk.cache_get(ip_at_start)
                     };
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         let val = self.global_values[index];
                         self.fibers[fiber_idx].stack.push(val);
                     } else {
@@ -5170,7 +5210,7 @@ impl VM {
 
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                         } else {
                             self.fibers[fiber_idx].stack.push(BxValue::new_null());
                         }
@@ -5186,7 +5226,9 @@ impl VM {
 
                     let val = *self.fibers[fiber_idx].stack.last().unwrap();
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         self.global_values[index] = val;
                     } else {
                         let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
@@ -5195,13 +5237,13 @@ impl VM {
 
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                         } else {
                             self.insert_global_interned(name_id, val);
                             if let Some(&global_idx) = self.global_names.get(&name_id) {
                                 let frame = self.fibers[fiber_idx].frames.last().unwrap();
                                 let mut chunk = frame.chunk.borrow_mut();
-                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             }
                         }
                     }
@@ -5216,7 +5258,9 @@ impl VM {
 
                     let val = self.fibers[fiber_idx].stack.pop().unwrap();
 
-                    if let Some(IcEntry::Global { index }) = ic {
+                    if let Some(IcEntry::Global { index, namespace }) = ic
+                        && namespace == self.global_namespace
+                    {
                         self.global_values[index] = val;
                     } else {
                         let name_id = self.read_intern_id(fiber_idx, idx as usize)?;
@@ -5225,13 +5269,13 @@ impl VM {
 
                             let frame = self.fibers[fiber_idx].frames.last().unwrap();
                             let mut chunk = frame.chunk.borrow_mut();
-                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                            chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                         } else {
                             self.insert_global_interned(name_id, val);
                             if let Some(&global_idx) = self.global_names.get(&name_id) {
                                 let frame = self.fibers[fiber_idx].frames.last().unwrap();
                                 let mut chunk = frame.chunk.borrow_mut();
-                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx });
+                                chunk.cache_set(ip_at_start, IcEntry::Global { index: global_idx, namespace: self.global_namespace });
                             }
                         }
                     }
@@ -5544,6 +5588,14 @@ impl VM {
 
                     if let Some(id) = base_val.as_gc_id() {
                         let index_string = self.to_string(index_val);
+                        if self.struct_assignment_hooks.contains_key(&id) {
+                            flush_ip!();
+                            match self.assign_struct(id, &index_string, val) {
+                                Ok(()) => self.fibers[fiber_idx].stack.push(val),
+                                Err(error) => self.throw_error(fiber_idx, &error)?,
+                            }
+                            frame_changed = true; continue 'quantum;
+                        }
                         let key_id = if !index_val.is_number() && !index_val.is_int() {
                             Some(self.struct_key_id(id, &index_string))
                         } else {
@@ -5963,6 +6015,15 @@ impl VM {
                             }
                         }
 
+                        if self.struct_assignment_hooks.contains_key(&id) {
+                            let name = self.read_string_constant(fiber_idx, idx as usize)?.to_string();
+                            flush_ip!();
+                            match self.assign_struct(id, &name, val) {
+                                Ok(()) => self.fibers[fiber_idx].stack.push(val),
+                                Err(error) => self.throw_error(fiber_idx, &error)?,
+                            }
+                            frame_changed = true; continue 'quantum;
+                        }
                         let struct_name_id = if matches!(self.heap.get_opt(id), Some(GcObject::Struct(_))) {
                             let mut name = self.read_string_constant(fiber_idx, idx as usize)?;
                             Some(self.struct_key_id(id, name.as_flat_str()))
@@ -6104,6 +6165,19 @@ impl VM {
                     let base_val = self.fibers[fiber_idx].stack.pop().unwrap();
 
                     if let Some(id) = base_val.as_gc_id() {
+                        if self.struct_assignment_hooks.contains_key(&id) {
+                            let name = self.read_string_constant(fiber_idx, idx as usize)?.to_string();
+                            let old = self.struct_get(id, &name);
+                            flush_ip!();
+                            match self.cast_value_to_type(old, "numeric").and_then(|old| {
+                                let value = BxValue::new_number(old.as_number() + 1.0);
+                                self.assign_struct(id, &name, value).map(|_| value)
+                            }) {
+                                Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                                Err(error) => self.throw_error(fiber_idx, &error)?,
+                            }
+                            frame_changed = true; continue 'quantum;
+                        }
                         if let GcObject::NativeObject(object) = self.heap.get(id) {
                             let object = object.clone();
                             if object.borrow().native_data("matchbox.variables_scope").is_some() {
@@ -7377,6 +7451,7 @@ impl VM {
 
         let val = if preserve && self.is_exception_object(val) { val } else { self.normalize_thrown_value(val, &stack_trace) };
         let _root = self.heap.retain_value(val).map_err(anyhow::Error::msg)?;
+        let abort = self.abort_signal(val);
 
         while !self.fibers[fiber_idx].frames.is_empty() {
             let frame_idx = self.fibers[fiber_idx].frames.len() - 1;
@@ -7386,7 +7461,7 @@ impl VM {
                 .copied();
 
             if let Some(handler) = handler {
-                if handler.catch_enabled {
+                if handler.catch_enabled && abort.is_none() {
                     let catch_ip = handler.catch_ip.unwrap();
                     let frame = &mut self.fibers[fiber_idx].frames[frame_idx];
                     frame.handlers.last_mut().unwrap().catch_enabled = false;
@@ -7421,10 +7496,11 @@ impl VM {
             }
         }
         let val_str = self.exception_summary(val);
-        let message = format!("VM Runtime Error: {}{}\n\nStack trace:\n{}", val_str, source_context, stack_trace);
+        let message = abort.as_ref().map(ToString::to_string).unwrap_or_else(|| format!("VM Runtime Error: {}{}\n\nStack trace:\n{}", val_str, source_context, stack_trace));
         if self.native_exception_depth > 0 {
             self.native_callback_exception = Some((message.clone(), _root));
         }
+        if let Some(abort) = abort { return Err(abort.into()); }
         bail!(message);
     }
 

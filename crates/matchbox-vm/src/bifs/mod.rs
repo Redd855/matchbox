@@ -2427,6 +2427,46 @@ fn regex_match(vm: &mut dyn BxVM, args: &[BxValue], no_case: bool) -> Result<BxV
     Ok(BxValue::new_ptr(array_id))
 }
 
+thread_local! {
+    // Compiled programs only: never retain request text, captures or VM values.
+    static FIND_REGEX_CACHE: RefCell<std::collections::VecDeque<(String, bool, Rc<regex::Regex>)>> = RefCell::new(std::collections::VecDeque::new());
+}
+
+fn compiled_find_regex(pattern: &str, no_case: bool) -> Result<Rc<regex::Regex>, String> {
+    if let Some(regex) = FIND_REGEX_CACHE.with(|cache| {
+        cache.borrow().iter().find(|(key, flag, _)| key == pattern && *flag == no_case)
+            .map(|(_, _, regex)| Rc::clone(regex))
+    }) {
+        return Ok(regex);
+    }
+    if pattern.len() <= 256 {
+        if let Ok(regex) = regex::RegexBuilder::new(pattern)
+            .case_insensitive(no_case)
+            .dot_matches_new_line(true)
+            .size_limit(64 * 1024)
+            .dfa_size_limit(16 * 1024)
+            .build()
+        {
+            let regex = Rc::new(regex);
+            FIND_REGEX_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if cache.len() == 8 {
+                    cache.pop_front();
+                }
+                cache.push_back((pattern.to_owned(), no_case, Rc::clone(&regex)));
+            });
+            return Ok(regex);
+        }
+    }
+    // Cache admission must not reject patterns accepted by the original builder.
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(no_case)
+        .dot_matches_new_line(true)
+        .build()
+        .map(Rc::new)
+        .map_err(|e| format!("Invalid regex: {}", e))
+}
+
 fn regex_find(vm: &mut dyn BxVM, args: &[BxValue], no_case: bool) -> Result<BxValue, String> {
     if args.len() < 2 {
         return Err("reFind() expects at least 2 arguments: (regex, string)".to_string());
@@ -2454,11 +2494,7 @@ fn regex_find(vm: &mut dyn BxVM, args: &[BxValue], no_case: bool) -> Result<BxVa
     }
     let start_idx = (start - 1) as usize;
     let start_byte_idx = char_to_byte_index(&text, start_idx);
-    let regex = regex::RegexBuilder::new(&pattern)
-        .case_insensitive(no_case)
-        .dot_matches_new_line(true)
-        .build()
-        .map_err(|e| format!("Invalid regex: {}", e))?;
+    let regex = compiled_find_regex(&pattern, no_case)?;
     let region = &text[start_byte_idx..];
     let mut matches = Vec::new();
     for cap in regex.captures_iter(region) {
@@ -3407,7 +3443,7 @@ fn struct_insert_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
         if vm.struct_key_exists(id, &key) && !overwrite {
             return Err(format!("Key '{}' already exists in struct", key));
         }
-        vm.struct_set(id, &key, args[2]);
+        vm.struct_assign(id, &key, args[2])?;
         Ok(args[0])
     } else {
         Err("structInsert() expects a struct as the first argument".to_string())
@@ -3420,7 +3456,7 @@ fn struct_update_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
     }
     if let Some(id) = args[0].as_gc_id() {
         let key = vm.to_string(args[1]);
-        vm.struct_set(id, &key, args[2]);
+        vm.struct_assign(id, &key, args[2])?;
         Ok(args[0])
     } else {
         Err("structUpdate() expects a struct as the first argument".to_string())

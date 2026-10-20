@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- CLI options now only count before the script file name: `matchbox app.bxs -v` runs the script with `-v` as an argument instead of printing the version. Unknown options before the file are an error that prints the help text, and `cliGetArgs()` no longer drops the first script argument. **Breaking:** put options before the file (`matchbox --target esp32 --chip esp32s3 --flash app.bxs`, not `matchbox app.bxs --target esp32 ...`); the documentation is updated.
+- CLI argument handling now follows BoxLang's `BoxRunner` and `CLIGetArgs`: options only count before the script file, everything after it goes to the script (`matchbox app.bxs -v` runs the script with `-v`), `-h`/`--help`/`-v`/`--version` are global only as the sole argument, unknown options fall through like BoxLang, and `cliGetArgs()` parses `--opt=value`, `--!opt`/`--no-opt`, `-o=value`, `-abc` and quoted values exactly like BoxLang (a value is never taken from the next token) and keeps the first script argument. **Breaking:** put MatchBox options before the file (`matchbox --target esp32 --chip esp32s3 --flash app.bxs`); the documentation is updated, and the old `--` separator is no longer special.
 
 ### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.

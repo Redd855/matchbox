@@ -945,8 +945,11 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Options and script arguments of a `matchbox` invocation. Options only count before the
-/// script file name; everything after it (or after `--`) belongs to the script.
+/// Options and script arguments of a `matchbox` invocation, parsed like BoxLang's `BoxRunner`:
+/// MatchBox options are consumed in order; the first token that is not one of them is the target
+/// (file); everything after it belongs to the script. `-h/--help` and `-v/--version` only mean help
+/// and version when they are the sole token left, so `matchbox app.bxs -v` runs `app.bxs` with `-v`.
+/// Unknown options are not rejected: like BoxLang they fall through as positionals.
 #[derive(Debug, Default, PartialEq)]
 struct CliOptions {
     help: bool,
@@ -979,10 +982,7 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
     let mut i = 1;
     while i < args.len() {
         let arg = args[i].as_str();
-        match arg {
-            "--" => {}
-            "-h" | "--help" => cli.help = true,
-            "-v" | "--version" => cli.version = true,
+        match arg.to_ascii_lowercase().as_str() {
             "--verbose" => cli.verbose = true,
             "--build" => cli.build = true,
             "--flash" => cli.flash = true,
@@ -994,14 +994,14 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
             "--no-std-lib" => cli.no_std_lib = true,
             "--strip-source" => cli.strip_source = true,
             "--serve" => cli.serve = true,
-            "--target" | "--chip" | "--keep" | "--output" | "--webroot" | "--port" | "--host"
-            | "--module" => {
+            option @ ("--target" | "--chip" | "--keep" | "--output" | "--webroot" | "--port"
+            | "--host" | "--module") => {
                 i += 1;
                 let value = args
                     .get(i)
                     .ok_or_else(|| format!("Option '{arg}' requires a value"))?
                     .clone();
-                match arg {
+                match option {
                     "--target" => cli.target = Some(value),
                     "--chip" => cli.chip = Some(value),
                     "--keep" => cli.keep = Some(value),
@@ -1012,18 +1012,27 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
                     _ => cli.modules.push(value),
                 }
             }
-            _ if arg.len() > 1 && arg.starts_with('-') => {
-                return Err(format!("Unknown option '{arg}'"));
-            }
             _ => {
                 cli.file = Some(arg.to_string());
-                let rest = &args[i + 1..];
-                let rest = if rest.first().map(|a| a.as_str()) == Some("--") { &rest[1..] } else { rest };
-                cli.script_args = rest.to_vec();
+                cli.script_args = args[i + 1..].to_vec();
                 break;
             }
         }
         i += 1;
+    }
+    // Help and version are global only when nothing else is left (BoxLang: `cliArgs.size() == 1`).
+    if cli.script_args.is_empty() {
+        match cli.file.as_deref().map(|f| f.to_ascii_lowercase()).as_deref() {
+            Some("-h" | "--help") => {
+                cli.help = true;
+                cli.file = None;
+            }
+            Some("-v" | "--version") => {
+                cli.version = true;
+                cli.file = None;
+            }
+            _ => {}
+        }
     }
     Ok(cli)
 }
@@ -1034,8 +1043,8 @@ fn usage_text() -> String {
     let _ = writeln!(out, "Usage: matchbox [options] [file.bxs|file.bxb|directory] [script arguments]");
     let _ = writeln!(out, "       matchbox esp32-doctor");
     let _ = writeln!(out, "\nOptions:");
-    let _ = writeln!(out, "  -h, --help          Show this help message");
-    let _ = writeln!(out, "  -v, --version       Show version information");
+    let _ = writeln!(out, "  -h, --help          Show this help message (when it is the only argument)");
+    let _ = writeln!(out, "  -v, --version       Show version information (when it is the only argument)");
     let _ = writeln!(out, "  --verbose           Emit verbose build logging");
     let _ = writeln!(out, "  --build             Compile to bytecode (.bxb)");
     let _ = writeln!(out, "  --target <native>   Produce a standalone native binary");
@@ -1057,7 +1066,6 @@ fn usage_text() -> String {
     let _ = writeln!(out, "  --no-shaking        Disable tree-shaking and include all prelude BIFs");
     let _ = writeln!(out, "  --no-std-lib        Exclude the standard library (prelude) entirely");
     let _ = writeln!(out, "  --output <path>     Set the output file path for compiled artifacts");
-    let _ = writeln!(out, "  --                  Pass remaining arguments only to the application");
     let _ = writeln!(out, "  --strip-source      Strip embedded source text from compiled output");
     let _ = writeln!(out, 
         "                      Errors still report file:line; native binaries fall back to disk for snippets"
@@ -1075,7 +1083,8 @@ fn usage_text() -> String {
     let _ = writeln!(out, 
         "  lambda deploy <path> --function <name> --bootstrap <path> [--role <arn>] [--public] [--url]"
     );
-    let _ = writeln!(out, "\nOptions must come before the file name; everything after it is passed to the script.");
+    let _ = writeln!(out, "\nOptions must come before the file name; everything after it is passed to the script");
+    let _ = writeln!(out, "and read with cliGetArgs(), exactly like BoxLang.");
     let _ = writeln!(out, "If no file is provided, matchbox starts in REPL mode.");
     out
 }
@@ -3572,39 +3581,45 @@ mod cli_tests {
     }
 
     #[test]
-    fn flags_before_the_file_are_options() {
-        let cli = parse(&["-v"]).unwrap();
-        assert!(cli.version && cli.file.is_none());
+    fn matchbox_options_before_the_file_are_consumed() {
         let cli = parse(&["--build", "--target", "native", "app.bxs"]).unwrap();
         assert!(cli.build);
         assert_eq!(cli.target.as_deref(), Some("native"));
         assert_eq!(cli.file.as_deref(), Some("app.bxs"));
+        assert!(cli.script_args.is_empty());
     }
 
     #[test]
     fn everything_after_the_file_belongs_to_the_script() {
-        let cli = parse(&["app.bxs", "-v", "--build", "-h", "--bogus", "x"]).unwrap();
+        let cli = parse(&["app.bxs", "-v", "--build", "-h", "--bogus", "--", "x"]).unwrap();
         assert!(!cli.version && !cli.build && !cli.help);
         assert_eq!(cli.file.as_deref(), Some("app.bxs"));
-        assert_eq!(cli.script_args, ["-v", "--build", "-h", "--bogus", "x"]);
+        assert_eq!(cli.script_args, ["-v", "--build", "-h", "--bogus", "--", "x"]);
     }
 
     #[test]
-    fn a_separator_after_the_file_is_dropped() {
-        let cli = parse(&["app.bxs", "--", "one", "--verbose"]).unwrap();
-        assert_eq!(cli.script_args, ["one", "--verbose"]);
-        assert!(!cli.verbose);
+    fn help_and_version_only_count_as_the_sole_token() {
+        assert!(parse(&["-h"]).unwrap().help);
+        assert!(parse(&["--help"]).unwrap().help);
+        assert!(parse(&["-v"]).unwrap().version);
+        assert!(parse(&["--version"]).unwrap().version);
+        assert!(parse(&["--verbose", "--version"]).unwrap().version);
+        let cli = parse(&["--help", "app.bxs"]).unwrap();
+        assert!(!cli.help);
+        assert_eq!(cli.file.as_deref(), Some("--help"));
+        assert_eq!(cli.script_args, ["app.bxs"]);
     }
 
     #[test]
-    fn unknown_options_before_the_file_are_errors() {
-        assert_eq!(parse(&["--bogus", "app.bxs"]).unwrap_err(), "Unknown option '--bogus'");
-        assert_eq!(parse(&["-x", "app.bxs"]).unwrap_err(), "Unknown option '-x'");
+    fn unknown_options_are_not_rejected_they_fall_through_like_boxlang() {
+        let cli = parse(&["--bogus", "app.bxs"]).unwrap();
+        assert_eq!(cli.file.as_deref(), Some("--bogus"));
+        assert_eq!(cli.script_args, ["app.bxs"]);
     }
 
     #[test]
-    fn value_options_need_a_value_and_may_repeat() {
-        assert_eq!(parse(&["app.bxs", "--target"]).unwrap().script_args, ["--target"]);
+    fn options_are_case_insensitive_and_value_options_need_a_value() {
+        assert!(parse(&["--BUILD", "app.bxs"]).unwrap().build);
         assert_eq!(parse(&["--target"]).unwrap_err(), "Option '--target' requires a value");
         let cli = parse(&["--module", "a", "--module", "b", "--keep", "x,y", "app.bxs"]).unwrap();
         assert_eq!(cli.modules, ["a", "b"]);

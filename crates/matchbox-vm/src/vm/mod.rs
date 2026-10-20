@@ -429,6 +429,12 @@ pub struct BxFiber {
     pub future_id: usize,
     pub wait_until: Option<Instant>,
     pub yield_requested: bool,
+    /// Inside `run_fiber` right now: a suspended caller of a nested synchronous call.
+    pub running: bool,
+    /// Set when the fiber yielded in `future.get()` on a pending future.
+    pub blocked_on_future: bool,
+    /// Completed by a nested scheduler; removed at the next safe point (indexes must stay stable).
+    pub finished: bool,
     pub priority: u8,
     pub root_stack: Vec<BxValue>,
 }
@@ -534,8 +540,6 @@ pub struct VM {
     struct_assignment_hooks: HashMap<usize, (Rc<gc::RootedValue>, crate::types::NativeCallback)>,
     pub script_variables: Rc<RefCell<HashMap<String, BxValue>>>,
     pub current_fiber_idx: Option<usize>,
-    /// Futures of fibers suspended on the Rust stack inside a synchronous native-to-script call.
-    stacked_futures: Vec<usize>,
     pub shapes: ShapeRegistry,
     pub heap: Heap,
     pub native_classes: HashMap<String, BxNativeFunction>,
@@ -2137,6 +2141,9 @@ impl VM {
             future_id,
             wait_until: None,
             yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
             priority,
             root_stack: Vec::new(),
         };
@@ -2449,7 +2456,6 @@ impl VM {
             struct_assignment_hooks: HashMap::new(),
             script_variables: Self::new_variables_scope(),
             current_fiber_idx: None,
-            stacked_futures: Vec::new(),
             shapes: ShapeRegistry::new(),
             heap: Heap::new(),
             config: GCConfig::default(),
@@ -3272,6 +3278,9 @@ impl VM {
             future_id,
             wait_until: None,
             yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
             priority: 0,
             root_stack: Vec::new(),
         };
@@ -3333,6 +3342,9 @@ impl VM {
             future_id,
             wait_until: None,
             yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
             priority: 0,
             root_stack: Vec::new(),
         };
@@ -3408,9 +3420,14 @@ impl VM {
 
     pub fn pump_until_blocked(&mut self) -> Result<()> {
         self.drain_native_completions();
+        self.sweep_finished_fibers();
         let mut i = 0;
 
         while i < self.fibers.len() {
+            if self.fibers[i].finished {
+                i += 1;
+                continue;
+            }
             if let Some(until) = self.fibers[i].wait_until {
                 if Instant::now() < until {
                     i += 1;
@@ -3492,6 +3509,9 @@ impl VM {
             future_id,
             wait_until: None,
             yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
             priority: 0,
             root_stack: Vec::new(),
         };
@@ -3733,6 +3753,9 @@ impl VM {
             future_id,
             wait_until: None,
             yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
             priority,
             root_stack: Vec::new(),
         };
@@ -3744,7 +3767,11 @@ impl VM {
     fn run_all(&mut self) -> Result<BxValue> {
         let mut last_result = BxValue::new_null();
 
-        while !self.fibers.is_empty() {
+        loop {
+            self.sweep_finished_fibers();
+            if self.fibers.is_empty() {
+                break;
+            }
             self.drain_native_completions();
             let mut i = 0;
             let mut all_waiting = true;
@@ -3753,7 +3780,7 @@ impl VM {
             // 1. Find the highest priority among non-waiting fibers
             let mut max_priority = 0;
             let now = Instant::now();
-            for f in &self.fibers {
+            for f in self.fibers.iter().filter(|f| !f.finished) {
                 if let Some(until) = f.wait_until {
                     if now < until {
                         if earliest_wait.is_none() || until < earliest_wait.unwrap() {
@@ -3768,6 +3795,10 @@ impl VM {
             }
 
             while i < self.fibers.len() {
+                if self.fibers[i].finished {
+                    i += 1;
+                    continue;
+                }
                 let now = Instant::now();
                 if let Some(until) = self.fibers[i].wait_until {
                     if now < until {
@@ -3862,12 +3893,14 @@ impl VM {
     }
 
     /// Runs one timeslice of every fiber that is not suspended on the Rust stack.
+    /// Finished fibers are only marked: removing them would move the fibers whose indexes
+    /// the suspended callers still hold.
     fn run_other_fibers(&mut self) -> Result<()> {
         self.drain_native_completions();
         let mut ran = false;
         let mut i = 0;
         while i < self.fibers.len() {
-            if self.stacked_futures.contains(&self.fibers[i].future_id) {
+            if self.fibers[i].running || self.fibers[i].finished {
                 i += 1;
                 continue;
             }
@@ -3880,18 +3913,23 @@ impl VM {
             }
             ran = true;
             self.current_fiber_idx = Some(i);
-            match self.run_fiber(i, Some(Instant::now() + Duration::from_millis(2))) {
+            let outcome = self.run_fiber(i, Some(Instant::now() + Duration::from_millis(2)));
+            self.current_fiber_idx = None;
+            match outcome {
                 Ok(Some(result)) => {
-                    let fiber = self.fibers.swap_remove(i);
-                    self.settle_future_success(fiber.future_id, result)?;
+                    self.fibers[i].finished = true;
+                    let future_id = self.fibers[i].future_id;
+                    self.settle_future_success(future_id, result)?;
                 }
-                Ok(None) => i += 1,
+                Ok(None) => {}
                 Err(e) => {
-                    let fiber = self.fibers.swap_remove(i);
+                    self.fibers[i].finished = true;
+                    let future_id = self.fibers[i].future_id;
                     let error = self.string_new(e.to_string());
-                    self.settle_future_error(fiber.future_id, BxValue::new_ptr(error))?;
+                    self.settle_future_error(future_id, BxValue::new_ptr(error))?;
                 }
             }
+            i += 1;
         }
         #[cfg(not(target_arch = "wasm32"))]
         if !ran {
@@ -4003,6 +4041,35 @@ impl VM {
     }
 
     fn run_fiber(
+        &mut self,
+        fiber_idx: usize,
+        timeslice_end: Option<Instant>,
+    ) -> Result<Option<BxValue>> {
+        let future_id = self.fibers[fiber_idx].future_id;
+        self.fibers[fiber_idx].running = true;
+        let result = self.run_fiber_inner(fiber_idx, timeslice_end);
+        // Removal of other fibers is deferred while any fiber runs, so the index is still ours.
+        if let Some(fiber) = self.fibers.get_mut(fiber_idx) {
+            if fiber.future_id == future_id {
+                fiber.running = false;
+            }
+        }
+        result
+    }
+
+    /// Drops fibers finished by a nested scheduler. Only call where no scheduler index is held.
+    fn sweep_finished_fibers(&mut self) {
+        let mut i = 0;
+        while i < self.fibers.len() {
+            if self.fibers[i].finished && !self.fibers[i].running {
+                self.fibers.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn run_fiber_inner(
         &mut self,
         fiber_idx: usize,
         timeslice_end: Option<Instant>,
@@ -7578,12 +7645,6 @@ impl VM {
                     let mut fiber_idx = self.fibers.len() - 1;
                     let nested_future = self.fibers[fiber_idx].future_id;
                     let previous_fiber_idx = self.current_fiber_idx;
-                    let stacked_before = self.stacked_futures.len();
-                    if let Some(previous) = previous_fiber_idx.and_then(|idx| self.fibers.get(idx)) {
-                        let previous_future = previous.future_id;
-                        self.stacked_futures.push(previous_future);
-                    }
-                    self.stacked_futures.push(nested_future);
                     self.current_fiber_idx = Some(fiber_idx);
                     // Loop until the fiber completes — this is a synchronous blocking call.
                     let result = loop {
@@ -7592,10 +7653,13 @@ impl VM {
                         {
                             Ok(Some(val)) => break Ok(val),
                             Ok(None) => {
-                                // Timeslice expired or the callback is waiting (e.g. `future.get()`):
-                                // let the other fibers progress, or it would wait forever.
-                                if let Err(e) = self.run_other_fibers() {
-                                    break Err(e);
+                                // The callback waits in `future.get()`: let the other fibers
+                                // progress, or the producer never runs. A plain timeslice expiry
+                                // just resumes the callback.
+                                if std::mem::take(&mut self.fibers[fiber_idx].blocked_on_future) {
+                                    if let Err(e) = self.run_other_fibers() {
+                                        break Err(e);
+                                    }
                                 }
                                 match self.fibers.iter().position(|fiber| fiber.future_id == nested_future) {
                                     Some(idx) => fiber_idx = idx,
@@ -7606,7 +7670,6 @@ impl VM {
                             Err(e) => break Err(e),
                         }
                     };
-                    self.stacked_futures.truncate(stacked_before);
                     self.current_fiber_idx = previous_fiber_idx;
                     let _ = self.fibers.swap_remove(fiber_idx);
                     result
@@ -7715,6 +7778,9 @@ impl VM {
                         future_id,
                         wait_until: None,
                         yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
                         priority: 0,
                         root_stack: Vec::new(),
                     };
@@ -7844,6 +7910,9 @@ impl VM {
             future_id,
             wait_until: None,
             yield_requested: false,
+            running: false,
+            blocked_on_future: false,
+            finished: false,
             priority: 0,
             root_stack: Vec::new(),
         };
@@ -8439,6 +8508,7 @@ impl VM {
                                 let fiber = &mut self.fibers[fiber_idx];
                                 fiber.frames.last_mut().unwrap().ip = ip_at_start;
                                 fiber.yield_requested = true;
+                                fiber.blocked_on_future = true;
                                 return Ok(());
                             }
                             FutureStatus::Completed => {
@@ -8550,6 +8620,7 @@ impl VM {
                                 let fiber = &mut self.fibers[fiber_idx];
                                 fiber.frames.last_mut().unwrap().ip = ip_at_start;
                                 fiber.yield_requested = true;
+                                fiber.blocked_on_future = true;
                                 return Ok(());
                             }
                             FutureStatus::Completed => {
@@ -8815,6 +8886,7 @@ impl VM {
                                 }
                             }
                             self.fibers[fiber_idx].yield_requested = true;
+                            self.fibers[fiber_idx].blocked_on_future = true;
                             return Ok(());
                         }
                         FutureStatus::Completed => {

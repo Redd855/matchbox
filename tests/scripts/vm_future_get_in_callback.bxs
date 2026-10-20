@@ -23,3 +23,15 @@ expect( nested.toList( "|" ), "11,21|12,22", "get inside nested callbacks" );
 caught = "";
 try { [ 1 ].map( x => runAsync( () => { throw "boom"; } ).get() ); } catch ( any e ) { caught = "caught"; }
 expect( caught, "caught", "error propagates" );
+
+// producer queued before nested callbacks that all wait on it (fiber slots must stay stable)
+producer = runAsync( () => 4 );
+waiting = [ 1, 2 ].map( x => [ 1, 2 ].map( y => producer.get() ).toList() );
+expect( waiting.toList( "|" ), "4,4|4,4", "nested callbacks waiting on one producer" );
+
+// a callback that waits on a future whose handler waits on another future
+a = runAsync( () => 1 );
+b = runAsync( () => 2 );
+chained = a.then( v => b.get() + v );
+expect( [ 1 ].map( x => chained.get() ).toList(), "3", "then handler waiting on another future" );
+expect( [ 1 ].map( x => a.get() + b.get() ).toList(), "3", "two producers" );

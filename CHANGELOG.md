@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Member functions that map to existing BIFs now resolve: struct `keyArray`, `keyList`, `valueArray`, `filter`, `map`, `reduce`, `some`, `every`, `none`, `delete`, `insert`, `update`, `clear`, `copy`, `sort`, `findValue`, `hash`; string `listToArray`, `listPrepend`, `listInsertAt`, `listSetAt`, `listReduce`, `jsonDeserialize`, `toBase64`, `toBinary`, `yesNoFormat` and other list/string members; array `join`, `findNoCase`, `isDefined`; number `max`, `min`, `formatBaseN`; date `hash`; future `isDone`.
+- Security: ESP32 firmware no longer ships default Wi-Fi credentials. Without `MATCHBOX_ESP32_WIFI_SSID` / `MATCHBOX_ESP32_WIFI_PASSWORD` at build time Wi-Fi stays off and the boot log says so (the credentials that were in the source should be considered public).
 - Destructuring rest elements (`[ a, ...rest ] = arr`, `{ a, ...others } = struct`) are now assigned instead of silently dropped.
 - `arraySlice` now follows BoxLang: `start` defaults to 1, `length` is a count (0 or omitted means to the end, negative trims from the end) and a negative `start` counts from the end.
 - Calling a function without a `required` argument now throws `Required argument [a] is missing for function [f]` (type `Application`) like BoxLang, instead of silently passing null.

@@ -3157,6 +3157,23 @@ impl Compiler {
     }
 }
 
+/// Receiver prefixes the VM member table maps `x.name()` onto (`array` + `sort` = `arraysort`).
+const MEMBER_BIF_PREFIXES: &[&str] = &[
+    "array", "struct", "string", "list", "date", "query", "boxset", "future", "number",
+];
+
+/// Prelude functions a member call `.name` can resolve to at runtime. The receiver type is
+/// unknown at compile time, so every plausible BIF is kept by tree-shaking.
+pub fn member_function_candidates(member: &str) -> Vec<String> {
+    let member = member.to_lowercase();
+    let mut candidates: Vec<String> = MEMBER_BIF_PREFIXES
+        .iter()
+        .map(|prefix| format!("{prefix}{member}"))
+        .collect();
+    candidates.push(member);
+    candidates
+}
+
 pub struct DependencyTracker {
     pub used_symbols: HashSet<String>,
 }
@@ -3339,10 +3356,9 @@ impl DependencyTracker {
             ExpressionKind::Assignment { value, .. } => {
                 self.track_expression(value);
             }
-            ExpressionKind::MemberAccess { base, .. } => {
-                self.track_expression(base);
-            }
-            ExpressionKind::SafeMemberAccess { base, .. } => {
+            ExpressionKind::MemberAccess { base, member }
+            | ExpressionKind::SafeMemberAccess { base, member } => {
+                self.used_symbols.extend(member_function_candidates(member));
                 self.track_expression(base);
             }
             ExpressionKind::ArrayAccess { base, index } => {

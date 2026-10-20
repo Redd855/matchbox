@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Array members `map`, `each`, `filter`, `reduce`, `some`, `every` and `none` no longer use the Set helpers: `map` kept only unique results, and callbacks now receive `(value, index, array)` (`(accumulator, value, index, array)` for `reduce`) like BoxLang.
 - `variables.n++` / `++variables.n` inside classes and scripts no longer fail with "Fused increment only supported on structs and instances", and prefix `++`/`--` now accept member targets such as `++s.n`.
 - `new C()` now evaluates to the instance when `init()` returns nothing or `null`, and to the returned value otherwise, matching BoxLang.
+- Tree-shaking no longer drops prelude functions that are only reached through member calls (`[3,1,2].sort()`, `.first()`, `.reverse()`, `.sum()`, ... failed with "BIF arraysort not found" outside `--no-shaking`).
+- Removed prelude copies of `abs`, `min`, `max`, `arrayIsEmpty`, `arrayPrepend`, `arrayContains` and `arrayContainsNoCase` that shadowed the native BIFs depending on tree-shaking; `arrayPrepend` now returns the array and `arrayContains` is case-sensitive for arrays and case-aware for sets.
+
+### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

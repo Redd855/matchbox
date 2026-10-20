@@ -232,6 +232,7 @@ script_test!(vm_contains, "vm_contains.bxs");
 script_test!(vm_array_bifs, "vm_array_bifs.bxs");
 script_test!(vm_future_get_in_callback, "vm_future_get_in_callback.bxs");
 script_test!(vm_array_callbacks, "vm_array_callbacks.bxs");
+script_test!(vm_member_shaking, "vm_member_shaking.bxs");
 script_test!(vm_repeat_string, "vm_repeat_string.bxs");
 script_test!(vm_char, "vm_char.bxs");
 script_test!(vm_amp_equal, "vm_amp_equal.bxs");

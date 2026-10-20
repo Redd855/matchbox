@@ -786,84 +786,67 @@ pub fn run() -> Result<()> {
     }
 
     let all_args: Vec<String> = std_env::args().collect();
-    let separator = all_args.iter().position(|arg| arg == "--");
-    let args = &all_args[..separator.unwrap_or(all_args.len())];
-    if args.get(1).map(|s| s.as_str()) == Some("esp32-doctor") {
+    if all_args.get(1).map(|s| s.as_str()) == Some("esp32-doctor") {
         run_esp32_doctor()?;
         return Ok(());
     }
-    if args.get(1).map(|s| s.as_str()) == Some("lambda") {
-        run_lambda_command(&args[2..])?;
+    if all_args.get(1).map(|s| s.as_str()) == Some("lambda") {
+        run_lambda_command(&all_args[2..])?;
         return Ok(());
     }
-    if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
-        print_usage();
+    let cli = match parse_cli(&all_args) {
+        Ok(cli) => cli,
+        Err(message) => {
+            eprint!("{}", usage_text());
+            bail!("{message}");
+        }
+    };
+    if cli.help {
+        print!("{}", usage_text());
         return Ok(());
     }
 
-    if args.contains(&"--version".to_string()) || args.contains(&"-v".to_string()) {
+    if cli.version {
         print_version();
         return Ok(());
     }
 
-    if args.contains(&"--verbose".to_string()) {
+    if cli.verbose {
         enable_logging();
     }
 
-    let is_build = args.contains(&"--build".to_string());
-    let mut is_flash = args.contains(&"--flash".to_string());
-    let is_full_flash = args.contains(&"--full-flash".to_string());
-    let is_watch = args.contains(&"--watch".to_string());
-    let esp32_web = args.contains(&"--esp32-web".to_string());
+    let is_build = cli.build;
+    let mut is_flash = cli.flash;
+    let is_full_flash = cli.full_flash;
+    let is_watch = cli.watch;
+    let esp32_web = cli.esp32_web;
     if is_full_flash || is_watch {
         is_flash = true;
     }
-    let mut is_fast_deploy = args.contains(&"--fast-deploy".to_string());
-    let chip = if let Some(idx) = args.iter().position(|a| a == "--chip") {
-        args.get(idx + 1).map(|s| s.as_str())
-    } else {
-        None
-    };
-    let target = if let Some(idx) = args.iter().position(|a| a == "--target") {
-        args.get(idx + 1).map(|s| s.as_str())
-    } else {
-        None
-    };
+    let mut is_fast_deploy = cli.fast_deploy;
+    let chip = cli.chip.as_deref();
+    let target = cli.target.as_deref();
 
     // For ESP32, --flash defaults to fast deploy unless --full-flash is present.
     if target == Some("esp32") && is_flash && !is_full_flash {
         is_fast_deploy = true;
     }
 
-    let no_shaking = args.contains(&"--no-shaking".to_string());
-    let no_std_lib = args.contains(&"--no-std-lib".to_string());
-    let strip_source = args.contains(&"--strip-source".to_string());
-    let is_serve = args.contains(&"--serve".to_string());
-    let webroot = if let Some(idx) = args.iter().position(|a| a == "--webroot") {
-        args.get(idx + 1)
-            .cloned()
-            .unwrap_or_else(|| ".".to_string())
-    } else {
-        ".".to_string()
-    };
+    let no_shaking = cli.no_shaking;
+    let no_std_lib = cli.no_std_lib;
+    let strip_source = cli.strip_source;
+    let is_serve = cli.serve;
+    let webroot = cli.webroot.clone().unwrap_or_else(|| ".".to_string());
 
     if is_serve {
         #[cfg(feature = "server")]
         {
-            let port = if let Some(idx) = args.iter().position(|a| a == "--port") {
-                args.get(idx + 1)
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .unwrap_or(8080)
-            } else {
-                8080
-            };
-            let host = if let Some(idx) = args.iter().position(|a| a == "--host") {
-                args.get(idx + 1)
-                    .cloned()
-                    .unwrap_or_else(|| "127.0.0.1".to_string())
-            } else {
-                "127.0.0.1".to_string()
-            };
+            let port = cli
+                .port
+                .as_deref()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(8080);
+            let host = cli.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
             let server_args = matchbox_server::Args {
                 port,
                 host,
@@ -884,18 +867,13 @@ pub fn run() -> Result<()> {
         }
     }
 
-    let mut keep_symbols = Vec::new();
-    if let Some(idx) = args.iter().position(|a| a == "--keep") {
-        if let Some(val) = args.get(idx + 1) {
-            keep_symbols = val.split(',').map(|s| s.trim().to_string()).collect();
-        }
-    }
+    let keep_symbols: Vec<String> = cli
+        .keep
+        .as_deref()
+        .map(|val| val.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
 
-    let output: Option<PathBuf> = if let Some(idx) = args.iter().position(|a| a == "--output") {
-        args.get(idx + 1).map(|s| PathBuf::from(s))
-    } else {
-        None
-    };
+    let output: Option<PathBuf> = cli.output.as_ref().map(PathBuf::from);
 
     if target == Some("wasi-http") {
         let out_path = output
@@ -905,58 +883,17 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Collect --module <path> flags.
-    let extra_module_paths: Vec<PathBuf> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| *a == "--module")
-        .filter_map(|(i, _)| args.get(i + 1).map(|p| PathBuf::from(p)))
-        .collect();
+    let extra_module_paths: Vec<PathBuf> = cli.modules.iter().map(PathBuf::from).collect();
 
-    let filename = args.iter().skip(1).find(|a| {
-        !a.starts_with("--")
-            && *a != "native"
-            && *a != "wasm"
-            && *a != "wasi"
-            && *a != "wasi-http"
-            && *a != "js"
-            && *a != "esp32"
-            && (args
-                .iter()
-                .position(|arg| arg == *a)
-                .map(|pos| pos == 0 || args[pos - 1] != "--target")
-                .unwrap_or(true))
-            && (args
-                .iter()
-                .position(|arg| arg == *a)
-                .map(|pos| pos == 0 || args[pos - 1] != "--keep")
-                .unwrap_or(true))
-            && (args
-                .iter()
-                .position(|arg| arg == *a)
-                .map(|pos| pos == 0 || args[pos - 1] != "--output")
-                .unwrap_or(true))
-            && (args
-                .iter()
-                .position(|arg| arg == *a)
-                .map(|pos| pos == 0 || args[pos - 1] != "--module")
-                .unwrap_or(true))
-            && (args
-                .iter()
-                .position(|arg| arg == *a)
-                .map(|pos| pos == 0 || args[pos - 1] != "--chip")
-                .unwrap_or(true))
-    });
+    // `cliGetArgs()` skips element 0, which is the executable (as in a native binary).
+    let script_args: Vec<String> = std::iter::once(all_args[0].clone())
+        .chain(cli.script_args.iter().cloned())
+        .collect();
+    let filename = cli.file.as_ref();
 
     match filename {
         Some(name) => {
             let path = Path::new(name);
-            let script_args = if let Some(separator) = separator {
-                all_args[separator + 1..].to_vec()
-            } else {
-                args.iter().position(|arg| arg == name)
-                    .map(|position| args[position + 1..].to_vec()).unwrap_or_default()
-            };
             if path.is_dir() {
                 process_directory(
                     path,
@@ -1008,52 +945,139 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn print_usage() {
-    println!("Usage: matchbox [options] [file.bxs|file.bxb|directory]");
-    println!("       matchbox esp32-doctor");
-    println!("\nOptions:");
-    println!("  -h, --help          Show this help message");
-    println!("  -v, --version       Show version information");
-    println!("  --verbose           Emit verbose build logging");
-    println!("  --build             Compile to bytecode (.bxb)");
-    println!("  --target <native>   Produce a standalone native binary");
-    println!("  --target <wasi>     Produce a standalone WASI container binary");
-    println!("  --target <wasi-http> Produce a WASI HTTP component from --webroot");
-    println!("  --target <wasm>     Produce a standalone WASM binary (Web)");
-    println!("  --target <js>       Produce a JavaScript module wrapper");
-    println!("  --target <esp32>    Produce an ESP32 firmware binary");
-    println!("  --esp32-web         Enable the embedded routed web runtime build flavor for ESP32");
-    println!(
+/// Options and script arguments of a `matchbox` invocation. Options only count before the
+/// script file name; everything after it (or after `--`) belongs to the script.
+#[derive(Debug, Default, PartialEq)]
+struct CliOptions {
+    help: bool,
+    version: bool,
+    verbose: bool,
+    build: bool,
+    flash: bool,
+    full_flash: bool,
+    watch: bool,
+    esp32_web: bool,
+    fast_deploy: bool,
+    no_shaking: bool,
+    no_std_lib: bool,
+    strip_source: bool,
+    serve: bool,
+    target: Option<String>,
+    chip: Option<String>,
+    keep: Option<String>,
+    output: Option<String>,
+    webroot: Option<String>,
+    port: Option<String>,
+    host: Option<String>,
+    modules: Vec<String>,
+    file: Option<String>,
+    script_args: Vec<String>,
+}
+
+fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
+    let mut cli = CliOptions::default();
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--" => {}
+            "-h" | "--help" => cli.help = true,
+            "-v" | "--version" => cli.version = true,
+            "--verbose" => cli.verbose = true,
+            "--build" => cli.build = true,
+            "--flash" => cli.flash = true,
+            "--full-flash" => cli.full_flash = true,
+            "--watch" => cli.watch = true,
+            "--esp32-web" => cli.esp32_web = true,
+            "--fast-deploy" => cli.fast_deploy = true,
+            "--no-shaking" => cli.no_shaking = true,
+            "--no-std-lib" => cli.no_std_lib = true,
+            "--strip-source" => cli.strip_source = true,
+            "--serve" => cli.serve = true,
+            "--target" | "--chip" | "--keep" | "--output" | "--webroot" | "--port" | "--host"
+            | "--module" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| format!("Option '{arg}' requires a value"))?
+                    .clone();
+                match arg {
+                    "--target" => cli.target = Some(value),
+                    "--chip" => cli.chip = Some(value),
+                    "--keep" => cli.keep = Some(value),
+                    "--output" => cli.output = Some(value),
+                    "--webroot" => cli.webroot = Some(value),
+                    "--port" => cli.port = Some(value),
+                    "--host" => cli.host = Some(value),
+                    _ => cli.modules.push(value),
+                }
+            }
+            _ if arg.len() > 1 && arg.starts_with('-') => {
+                return Err(format!("Unknown option '{arg}'"));
+            }
+            _ => {
+                cli.file = Some(arg.to_string());
+                let rest = &args[i + 1..];
+                let rest = if rest.first().map(|a| a.as_str()) == Some("--") { &rest[1..] } else { rest };
+                cli.script_args = rest.to_vec();
+                break;
+            }
+        }
+        i += 1;
+    }
+    Ok(cli)
+}
+
+fn usage_text() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Usage: matchbox [options] [file.bxs|file.bxb|directory] [script arguments]");
+    let _ = writeln!(out, "       matchbox esp32-doctor");
+    let _ = writeln!(out, "\nOptions:");
+    let _ = writeln!(out, "  -h, --help          Show this help message");
+    let _ = writeln!(out, "  -v, --version       Show version information");
+    let _ = writeln!(out, "  --verbose           Emit verbose build logging");
+    let _ = writeln!(out, "  --build             Compile to bytecode (.bxb)");
+    let _ = writeln!(out, "  --target <native>   Produce a standalone native binary");
+    let _ = writeln!(out, "  --target <wasi>     Produce a standalone WASI container binary");
+    let _ = writeln!(out, "  --target <wasi-http> Produce a WASI HTTP component from --webroot");
+    let _ = writeln!(out, "  --target <wasm>     Produce a standalone WASM binary (Web)");
+    let _ = writeln!(out, "  --target <js>       Produce a JavaScript module wrapper");
+    let _ = writeln!(out, "  --target <esp32>    Produce an ESP32 firmware binary");
+    let _ = writeln!(out, "  --esp32-web         Enable the embedded routed web runtime build flavor for ESP32");
+    let _ = writeln!(out, 
         "  --flash             Flash to device. Defaults to fast bytecode-only flash for ESP32."
     );
-    println!("  --full-flash        Force a full firmware flash (includes VM/Runner)");
-    println!(
+    let _ = writeln!(out, "  --full-flash        Force a full firmware flash (includes VM/Runner)");
+    let _ = writeln!(out, 
         "  --fast-deploy       (Deprecated) Use --flash instead, which is now fast by default."
     );
-    println!("  --chip <name>       The target ESP32 chip (e.g. esp32, esp32s3, esp32c3)");
-    println!("  --keep <symbols>    Comma-separated list of BIFs to preserve");
-    println!("  --no-shaking        Disable tree-shaking and include all prelude BIFs");
-    println!("  --no-std-lib        Exclude the standard library (prelude) entirely");
-    println!("  --output <path>     Set the output file path for compiled artifacts");
-    println!("  --                  Pass remaining arguments only to the application");
-    println!("  --strip-source      Strip embedded source text from compiled output");
-    println!(
+    let _ = writeln!(out, "  --chip <name>       The target ESP32 chip (e.g. esp32, esp32s3, esp32c3)");
+    let _ = writeln!(out, "  --keep <symbols>    Comma-separated list of BIFs to preserve");
+    let _ = writeln!(out, "  --no-shaking        Disable tree-shaking and include all prelude BIFs");
+    let _ = writeln!(out, "  --no-std-lib        Exclude the standard library (prelude) entirely");
+    let _ = writeln!(out, "  --output <path>     Set the output file path for compiled artifacts");
+    let _ = writeln!(out, "  --                  Pass remaining arguments only to the application");
+    let _ = writeln!(out, "  --strip-source      Strip embedded source text from compiled output");
+    let _ = writeln!(out, 
         "                      Errors still report file:line; native binaries fall back to disk for snippets"
     );
-    println!("  --serve             Start the built-in web server");
-    println!("  --port <number>     Web server port (default: 8080)");
-    println!("  --host <address>    Web server host (default: 127.0.0.1)");
-    println!("  --webroot <path>    Web server root directory (default: .)");
-    println!(
+    let _ = writeln!(out, "  --serve             Start the built-in web server");
+    let _ = writeln!(out, "  --port <number>     Web server port (default: 8080)");
+    let _ = writeln!(out, "  --host <address>    Web server host (default: 127.0.0.1)");
+    let _ = writeln!(out, "  --webroot <path>    Web server root directory (default: .)");
+    let _ = writeln!(out, 
         "  --module <path>     Load a BoxLang module directory (may be specified multiple times)"
     );
-    println!("\nCommands:");
-    println!("  esp32-doctor        Check ESP32 build/flash prerequisites and print fixes");
-    println!("  lambda invoke <path> --event <event.json>");
-    println!(
+    let _ = writeln!(out, "\nCommands:");
+    let _ = writeln!(out, "  esp32-doctor        Check ESP32 build/flash prerequisites and print fixes");
+    let _ = writeln!(out, "  lambda invoke <path> --event <event.json>");
+    let _ = writeln!(out, 
         "  lambda deploy <path> --function <name> --bootstrap <path> [--role <arn>] [--public] [--url]"
     );
-    println!("\nIf no file is provided, matchbox starts in REPL mode.");
+    let _ = writeln!(out, "\nOptions must come before the file name; everything after it is passed to the script.");
+    let _ = writeln!(out, "If no file is provided, matchbox starts in REPL mode.");
+    out
 }
 
 fn run_lambda_command(args: &[String]) -> Result<()> {
@@ -3535,5 +3559,61 @@ mod tests {
         let len_offset = sentinel + 8;
         let payload_len = u32::from_le_bytes(wasm[len_offset..len_offset + 4].try_into().unwrap());
         assert!(payload_len > 0);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<CliOptions, String> {
+        let all: Vec<String> = std::iter::once("matchbox").chain(args.iter().copied()).map(String::from).collect();
+        parse_cli(&all)
+    }
+
+    #[test]
+    fn flags_before_the_file_are_options() {
+        let cli = parse(&["-v"]).unwrap();
+        assert!(cli.version && cli.file.is_none());
+        let cli = parse(&["--build", "--target", "native", "app.bxs"]).unwrap();
+        assert!(cli.build);
+        assert_eq!(cli.target.as_deref(), Some("native"));
+        assert_eq!(cli.file.as_deref(), Some("app.bxs"));
+    }
+
+    #[test]
+    fn everything_after_the_file_belongs_to_the_script() {
+        let cli = parse(&["app.bxs", "-v", "--build", "-h", "--bogus", "x"]).unwrap();
+        assert!(!cli.version && !cli.build && !cli.help);
+        assert_eq!(cli.file.as_deref(), Some("app.bxs"));
+        assert_eq!(cli.script_args, ["-v", "--build", "-h", "--bogus", "x"]);
+    }
+
+    #[test]
+    fn a_separator_after_the_file_is_dropped() {
+        let cli = parse(&["app.bxs", "--", "one", "--verbose"]).unwrap();
+        assert_eq!(cli.script_args, ["one", "--verbose"]);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn unknown_options_before_the_file_are_errors() {
+        assert_eq!(parse(&["--bogus", "app.bxs"]).unwrap_err(), "Unknown option '--bogus'");
+        assert_eq!(parse(&["-x", "app.bxs"]).unwrap_err(), "Unknown option '-x'");
+    }
+
+    #[test]
+    fn value_options_need_a_value_and_may_repeat() {
+        assert_eq!(parse(&["app.bxs", "--target"]).unwrap().script_args, ["--target"]);
+        assert_eq!(parse(&["--target"]).unwrap_err(), "Option '--target' requires a value");
+        let cli = parse(&["--module", "a", "--module", "b", "--keep", "x,y", "app.bxs"]).unwrap();
+        assert_eq!(cli.modules, ["a", "b"]);
+        assert_eq!(cli.keep.as_deref(), Some("x,y"));
+    }
+
+    #[test]
+    fn no_arguments_means_repl() {
+        let cli = parse(&[]).unwrap();
+        assert!(cli.file.is_none() && cli.script_args.is_empty());
     }
 }

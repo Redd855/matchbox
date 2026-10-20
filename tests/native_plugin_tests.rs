@@ -358,7 +358,7 @@ println("application");
 "#,
     )
     .unwrap();
-    let direct = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let direct = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&direct);
     assert_eq!(
         String::from_utf8_lossy(&direct.stdout).trim(),
@@ -367,9 +367,7 @@ println("application");
     // Build/packaging must not execute either lifecycle hook.
     let built = cli(
         dir.path(),
-        &[
-            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
-        ],
+        &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"],
     );
     success(&built);
     assert!(!String::from_utf8_lossy(&built.stdout).contains("loaded"));
@@ -377,15 +375,7 @@ println("application");
     success(&bytecode);
     let built = cli(
         dir.path(),
-        &[
-            "--target",
-            "native",
-            "app.bxs",
-            "--module",
-            "module",
-            "--output",
-            "application",
-        ],
+        &["--target", "native", "--module", "module", "--output", "application", "app.bxs"],
     );
     success(&built);
     assert!(!String::from_utf8_lossy(&built.stdout).contains("loaded"));
@@ -478,11 +468,11 @@ fn bundled_libraries_resolve_transitive_dependencies_without_the_source_package(
     let mut missing = metadata.clone();
     missing["matchbox"]["artifacts"][TARGET]["libraries"] = serde_json::json!([]);
     fs::write(module.join("box.json"), missing.to_string()).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("libmatchbox_fixture_codec.so"));
     fs::write(module.join("box.json"), metadata.to_string()).unwrap();
-    let direct = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let direct = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&direct);
     assert_eq!(
         String::from_utf8_lossy(&direct.stdout).trim(),
@@ -490,21 +480,11 @@ fn bundled_libraries_resolve_transitive_dependencies_without_the_source_package(
     );
     success(&cli(
         dir.path(),
-        &[
-            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
-        ],
+        &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"],
     ));
     success(&cli(
         dir.path(),
-        &[
-            "--target",
-            "native",
-            "app.bxs",
-            "--module",
-            "module",
-            "--output",
-            "application",
-        ],
+        &["--target", "native", "--module", "module", "--output", "application", "app.bxs"],
     ));
     fs::remove_dir_all(&module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
@@ -672,7 +652,7 @@ fn dependent_library_metadata_rejects_unverified_or_escaping_files_before_startu
     ] {
         metadata["matchbox"]["artifacts"][TARGET]["libraries"] = serde_json::json!([library]);
         fs::write(&manifest, metadata.to_string()).unwrap();
-        let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+        let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(error), "{stderr}");
@@ -685,7 +665,7 @@ fn missing_capability_and_error_shutdown_are_explicit() {
     let dir = tempfile::tempdir().unwrap();
     package(dir.path());
     fs::write(dir.path().join("app.bxs"), "throw 'application failure';").unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("unloaded"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("application failure"));
@@ -693,7 +673,7 @@ fn missing_capability_and_error_shutdown_are_explicit() {
         .current_dir(dir.path())
         .env("MATCHBOX_FIXTURE_MISSING_CAPABILITY", "1")
         .env("MATCHBOX_NATIVE_CACHE", dir.path().join("cache"))
-        .args(["app.bxs", "--module", "module"])
+        .args(["--module", "module", "app.bxs"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -726,14 +706,14 @@ class {
 }
 "#.replace("ALIAS_FILE", &alias.to_string_lossy().replace('\\', "/"))).unwrap();
     fs::write(dir.path().join("app.bxs"), "println('mapping contract OK');").unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "configured bxModules.runtimeOne\nmapping contract OK\n");
     // Packaging must not read runtime inputs or execute configure().
     fs::remove_file(&alias).unwrap();
     for args in [
-        vec!["--build", "app.bxs", "--module", "module", "--output", "app.bxb"],
-        vec!["--target", "native", "app.bxs", "--module", "module", "--output", "application"],
+        vec!["--build", "--module", "module", "--output", "app.bxb", "app.bxs"],
+        vec!["--target", "native", "--module", "module", "--output", "application", "app.bxs"],
     ] {
         let output = cli(dir.path(), &args); success(&output);
         assert!(!String::from_utf8_lossy(&output.stdout).contains("configured"));
@@ -781,7 +761,7 @@ class {{
 "#);
         fs::write(dir.path().join("module/ModuleConfig.bx"), source).unwrap();
         fs::write(dir.path().join("app.bxs"), "").unwrap();
-        let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+        let output = cli(dir.path(), &["--module", "module", "app.bxs"]); success(&output);
         assert_eq!(String::from_utf8_lossy(&output.stdout), "struct mappings OK\n");
     }
 }
@@ -838,11 +818,11 @@ assert visible.get() == 42;
 println("mapped class contracts OK");
 "#).unwrap();
     let expected = "configured mapped classes\nmapped class contracts OK\n";
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]); success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     fs::remove_file(&alias).unwrap();
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     fs::write(&alias, "One").unwrap();
@@ -862,8 +842,8 @@ fn embedding_module_classes_does_not_execute_neighboring_script_statements() {
     fs::write(dir.path().join("module/ModuleConfig.bx"), "class {}").unwrap();
     fs::write(dir.path().join("module/Program.bxs"), "class { function get() { return 8; } } throw 'neighboring script executed';").unwrap();
     fs::write(dir.path().join("app.bxs"), "import bxModules.module.Program; target = new Program(); assert target.get() == 8;").unwrap();
-    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--module", "module", "app.bxs"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "app.bxs"]));
     fs::remove_dir_all(dir.path().join("module")).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     success(&cli(dir.path(), &["app.bxb"]));
@@ -920,7 +900,7 @@ catch (any error) { assert findNoCase("fixture constructor rejected value", erro
 assert reference.info().value == 13;
 println("provider creation OK");
 "#).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "provider loaded\nreference only\ninitialized 13\ninitialized 7\nprovider creation OK\nprovider unloaded\n");
 }
@@ -952,10 +932,10 @@ assert Probe.answer() == 42;
 println("provider protocols OK");
 "#).unwrap();
     let expected = "provider loaded\ninitialized 12\ninitialized 14\ninitialized 15\ninitialized 16\ninitialized 17\nprovider protocols OK\nprovider unloaded\n";
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]); success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("application")).env("MATCHBOX_NATIVE_CACHE", dir.path().join("fresh-cache")).current_dir(dir.path()).output().unwrap()] {
@@ -988,11 +968,11 @@ catch (any error) { assert findNoCase("Java class not provided", error.message) 
 try { createObject("java", "org.matchbox.fixture.Counter", "not-a-jar"); throw "JAR accepted"; }
 catch (any error) { assert findNoCase("not supported", error.message) > 0; }
 "#).unwrap();
-    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--module", "module", "app.bxs"]));
     // The provider returned a frozen class value, not a second mutable-global lookup.
     let source = "replaceClass(); assert createObject('java', 'org.matchbox.fixture.Counter').init(8).info().value == 8;";
     fs::write(dir.path().join("app.bxs"), source).unwrap();
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "app.bxs"]));
     let app = matchbox_vm::bundle::Application::from_executable(&fs::read(dir.path().join("app.bxb")).unwrap()).unwrap();
     // Use a host VM to replace the mapped global without turning dotted assignment into a struct write.
     let mut vm = VM::new();
@@ -1103,7 +1083,7 @@ fn class_provider_records_and_results_are_validated_at_execution_only() {
     ] {
         fs::write(module.join("ModuleConfig.bx"), format!("class {{ function configure() {{ classProviders = {providers}; }} function factory() {{ {factory} }} }}")).unwrap();
         // Packaging must not run either the descriptor or provider, including invalid definitions.
-        success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+        success(&cli(dir.path(), &["--build", "--module", "module", "app.bxs"]));
         let output = cli(dir.path(), &["app.bxb"]);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains(expected), "{}", String::from_utf8_lossy(&output.stderr));
@@ -1111,7 +1091,7 @@ fn class_provider_records_and_results_are_validated_at_execution_only() {
     fs::write(module.join("NullFacade.bx"), "class { function init() { } }").unwrap();
     fs::write(module.join("ModuleConfig.bx"), "import bxModules.module.NullFacade; class { function configure() { classProviders = [{name:'java:org.matchbox.fixture.Invalid', provider:this.factory}]; } function factory() { return NullFacade; } }").unwrap();
     fs::write(dir.path().join("app.bxs"), "createObject('java','org.matchbox.fixture.Invalid').init();").unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("init() returned null"));
 }
@@ -1171,16 +1151,16 @@ fn module_classes_exclude_build_outputs_but_keep_nested_source_directories() {
     }
     source.push_str("println('module source boundaries OK');");
     fs::write(dir.path().join("app.bxs"), source).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(output.stdout, b"module source boundaries OK\n");
     fs::write(module.join("Broken.bxs"), "class { function broken( }").unwrap();
-    let invalid = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let invalid = cli(dir.path(), &["--module", "module", "app.bxs"]);
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("Broken.bxs"));
     fs::remove_file(module.join("Broken.bxs")).unwrap();
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("application"))
@@ -1243,15 +1223,7 @@ class {
     )
     .unwrap();
     fs::write(dir.path().join("app.bxs"), "import bxModules.consumerMapping.models.Value as Value; instance = new Value(); assert instance.get() == 7;").unwrap();
-    let args = [
-        "app.bxs",
-        "--module",
-        "consumer-dir",
-        "--module",
-        "provider-dir",
-        "--module",
-        "disabled",
-    ];
+    let args = ["--module", "consumer-dir", "--module", "provider-dir", "--module", "disabled", "app.bxs"];
     let output = cli(dir.path(), &args);
     success(&output);
     assert_eq!(
@@ -1267,7 +1239,7 @@ class {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Circular module dependency"));
     fs::remove_dir_all(dir.path().join("provider-dir")).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "consumer-dir"]);
+    let output = cli(dir.path(), &["--module", "consumer-dir", "app.bxs"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires missing module provider"));
 }
@@ -1350,7 +1322,7 @@ println("annotations OK");
     );
     success(&cli(
         dir.path(),
-        &["--build", "app.bxs", "--output", "app.bxb"],
+        &["--build", "--output", "app.bxb", "app.bxs"],
     ));
     fs::remove_dir_all(dir.path().join("boxlang_modules")).unwrap();
     let output = cli(dir.path(), &["app.bxb"]);
@@ -1412,7 +1384,7 @@ println("BIF invocation parity OK");
 "#,
     )
     .unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
@@ -1420,21 +1392,11 @@ println("BIF invocation parity OK");
     );
     success(&cli(
         dir.path(),
-        &[
-            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
-        ],
+        &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"],
     ));
     success(&cli(
         dir.path(),
-        &[
-            "--target",
-            "native",
-            "app.bxs",
-            "--module",
-            "module",
-            "--output",
-            "application",
-        ],
+        &["--target", "native", "--module", "module", "--output", "application", "app.bxs"],
     ));
     fs::remove_dir_all(&module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
@@ -1531,25 +1493,15 @@ println("interceptors OK");
 "#,
     )
     .unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     success(&cli(
         dir.path(),
-        &[
-            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
-        ],
+        &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"],
     ));
     success(&cli(
         dir.path(),
-        &[
-            "--target",
-            "native",
-            "app.bxs",
-            "--module",
-            "module",
-            "--output",
-            "application",
-        ],
+        &["--target", "native", "--module", "module", "--output", "application", "app.bxs"],
     ));
     fs::remove_dir_all(&module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
@@ -1607,9 +1559,9 @@ bus.announce("onInheritedProbe",data);
 assert data.count == 10;
 println("annotated interceptors OK");
 "#).unwrap();
-    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--module", "module", "app.bxs"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     success(&cli(dir.path(), &["app.bxb"]));
@@ -1663,9 +1615,9 @@ class {
 }
 "#).unwrap();
     fs::write(dir.path().join("app.bxs"), "data = {count:0}; boxAnnounce(\"onDeclaredProbe\",data); assert data.count == 9; println(\"declared interceptors OK\");").unwrap();
-    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--module", "module", "app.bxs"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     success(&cli(dir.path(), &["app.bxb"]));
@@ -1699,7 +1651,7 @@ boxAnnounce("outerProbe",data);
 assert data.count == 3;
 println("reentrant interceptor service OK");
 "#).unwrap();
-    success(&cli(dir.path(), &["app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--module", "module", "app.bxs"]));
 }
 
 #[test]
@@ -1758,11 +1710,11 @@ class {
 }
 "#).unwrap();
     fs::write(dir.path().join("app.bxm"), "<bx:speak message=\"Hello\" /><bx:Say message=\"World\" /><bx:Echo message=\"Again\" />").unwrap();
-    let output = cli(dir.path(), &["app.bxm", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxm"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout),"Hello!World!Again!");
-    success(&cli(dir.path(), &["--build", "app.bxm", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxm", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxm"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxm"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxm")).unwrap();
     let output = cli(dir.path(), &["app.bxb"]); success(&output);
@@ -1819,10 +1771,10 @@ render("outer");
 "#, include_str!("scripts/vm_lexical_closures.bxs"));
     fs::write(dir.path().join("app.bxs"), source).unwrap();
     let expected = "lexical closures OK\n[pre:outer[pre:inner]!]";
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]); success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     fs::remove_dir_all(dir.path().join("cache")).unwrap();
@@ -1867,10 +1819,10 @@ class {
 "#).unwrap();
     fs::write(dir.path().join("app.bxm"), "<bx:script>word = \"outer\";</bx:script><bx:wrap><bx:output>#word#</bx:output><bx:Wrap>inner</bx:Wrap>tail</bx:wrap><bx:twice>!</bx:twice>").unwrap();
     let expected = "[pre:outer[pre:inner]tail]!!";
-    let output = cli(dir.path(), &["app.bxm", "--module", "module"]); success(&output);
+    let output = cli(dir.path(), &["--module", "module", "app.bxm"]); success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout),expected);
-    success(&cli(dir.path(), &["--build", "app.bxm", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxm", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxm"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxm"]));
     fs::remove_dir_all(module).unwrap();
     fs::remove_file(dir.path().join("app.bxm")).unwrap();
     let output = cli(dir.path(), &["app.bxb"]); success(&output);
@@ -1899,18 +1851,18 @@ class {
 "#).unwrap();
     fs::write(module.join("components/Leaf.bx"), "@BoxComponent(\"leafAlias\") class { function invoke(attributes) { writeOutput(attributes.value); } }").unwrap();
     fs::write(dir.path().join("app.bxs"), "bx:frame { writeOutput(\"body\"); } bx:leafAlias value=\"!\";").unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]); success(&output);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]); success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "bodysuffix!");
     fs::write(dir.path().join("missing.bxm"), "<bx:frame />").unwrap();
-    let output = cli(dir.path(), &["missing.bxm", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "missing.bxm"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires a body"));
     fs::write(dir.path().join("unexpected.bxm"), "<bx:leafAlias>not allowed</bx:leafAlias>").unwrap();
-    let output = cli(dir.path(), &["unexpected.bxm", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "unexpected.bxm"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("does not allow a body"));
     fs::write(dir.path().join("unknown.bxm"), "<bx:unknown />").unwrap();
-    let output = cli(dir.path(), &["unknown.bxm", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "unknown.bxm"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Component not registered"));
 }
@@ -1936,7 +1888,7 @@ fn component_body_returns_reach_the_declaring_function() {
     }
     if (probe() != 42) { throw "Component body return value was lost"; }
     println("return OK");"#).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "before:return OK\n");
 }
@@ -1952,11 +1904,11 @@ fn component_completion_preserves_declaring_context_and_finally_without_sources(
     }"#).unwrap();
     let source = format!("{}\nif (!result.state.innerFinally || !result.state.outerFinally) {{ throw \"Finally did not unwind\"; }}", include_str!("scripts/module_component_flow.bxs"));
     fs::write(dir.path().join("app.bxs"), source).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "nested OK\ndeclarations OK\n");
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "standalone"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "standalone", "app.bxs"]));
     fs::remove_dir_all(&module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("standalone")).current_dir(dir.path()).output().unwrap()] {
@@ -1989,7 +1941,7 @@ bx:control kind=2 consume=true { break; }
 bx:control kind=3 consume=true { continue; }
 println("control results OK");
 "#).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "control results OK\n");
 }
@@ -2007,7 +1959,7 @@ fn component_body_results_trace_return_values_across_collections() {
         bx:flowPass { return {text:"retained body result"}; }
     }
     probe();"#).unwrap();
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "app.bxs"]));
     let app = matchbox_vm::bundle::Application::from_executable(&fs::read(dir.path().join("app.bxb")).unwrap()).unwrap();
     let mut vm = VM::new();
     app.run(&mut vm, &dir.path().join("cache")).unwrap();
@@ -2059,7 +2011,7 @@ fn component_and_interceptor_contexts_expose_live_caller_scopes_and_active_state
     }
     probe();
     println("component contexts OK");"#).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "<><component contexts OK\n");
 }
@@ -2111,7 +2063,7 @@ fn function_event_listener_errors_unwind_into_callers_without_poisoning_dispatch
         }
         if (stillWorks() != 42) { throw "Function event state remained poisoned"; }
         println("event failures OK");"#).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "event failures OK\n");
 }
@@ -2125,7 +2077,7 @@ fn component_output_policy_flags_fail_explicitly_without_running_descriptors() {
         fs::write(module.join("ModuleConfig.bx"), "class { println(\"Descriptor must not run\"); }").unwrap();
         fs::write(module.join("components/Policy.bx"), format!("@BoxComponent class {flag}=true {{ function invoke(context, attributes, body, executionState) {{ return processBody(context, body, newBuffer()); }} }}")).unwrap();
         fs::write(dir.path().join("app.bxs"), "bx:policy;").unwrap();
-        let output = cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]);
+        let output = cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]);
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("Module component {flag} is not yet supported")), "{}", String::from_utf8_lossy(&output.stderr));
@@ -2160,7 +2112,7 @@ fn module_inventory_bifs_expose_loaded_records_and_live_settings() {
         record.settings.value = 42;
         if (getModuleInfo("module").settings.value != 42 || !structIsEmpty(getModuleInfo("absent"))) { throw "Module inventory did not preserve live settings or absent records"; }
         println("module inventory OK");"#).unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "module inventory OK\n");
 }
@@ -2180,7 +2132,7 @@ fn module_lifecycle_interception_points_emit_live_records_in_dependency_order() 
     }"#).unwrap();
     fs::write(dir.path().join("worker/ModuleConfig.bx"), r#"class { this.dependencies = ["watcher"]; }"#).unwrap();
     fs::write(dir.path().join("app.bxs"), "println(\"application\");").unwrap();
-    let output = cli(dir.path(), &["app.bxs", "--module", "worker", "--module", "watcher"]);
+    let output = cli(dir.path(), &["--module", "worker", "--module", "watcher", "app.bxs"]);
     success(&output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "application\npost:watcher:true,pre:worker:false,post:worker:true,unload:worker:true,unloaded:worker:false,unload:watcher:true\n");
 }
@@ -2217,7 +2169,7 @@ fn function_interception_mutates_arguments_results_and_observes_errors() {
         println("function events OK");"#, include_str!("scripts/vm_execution_contexts.bxs"));
     fs::write(dir.path().join("app.bxs"), source).unwrap();
     let expected = format!("function events OK\ncontext scopes OK\n{}error:observed failure\n", "pre,post,".repeat(402));
-    let output = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&output);
     #[cfg(feature = "jit")]
     {
@@ -2226,8 +2178,8 @@ fn function_interception_mutates_arguments_results_and_observes_errors() {
         assert!(trace.contains("[JIT] compiled hot loop fn name=probeLoop "), "{trace}");
     }
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
-    success(&cli(dir.path(), &["--build", "app.bxs", "--module", "module", "--output", "app.bxb"]));
-    success(&cli(dir.path(), &["--target", "native", "app.bxs", "--module", "module", "--output", "application"]));
+    success(&cli(dir.path(), &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"]));
+    success(&cli(dir.path(), &["--target", "native", "--module", "module", "--output", "application", "app.bxs"]));
     fs::remove_dir_all(&module).unwrap();
     fs::remove_file(dir.path().join("app.bxs")).unwrap();
     for output in [cli(dir.path(), &["app.bxb"]), Command::new(dir.path().join("application")).current_dir(dir.path()).output().unwrap()] {
@@ -2244,12 +2196,12 @@ fn component_body_errors_restore_output_and_root_return_stops_execution() {
     fs::write(module.join("ModuleConfig.bx"), "class {}").unwrap();
     fs::write(module.join("components/Capture.bx"), "@RequiresBody(true) class { function invoke(context,attributes,body) { var buffer = newBuffer(); return processBody(context,body,buffer); } }").unwrap();
     fs::write(dir.path().join("app.bxm"), "<bx:capture><bx:script>writeOutput(\"partial\"); throw \"body failure\";</bx:script></bx:capture>").unwrap();
-    let output = cli(dir.path(), &["app.bxm", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "app.bxm"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("body failure"));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "partial");
     fs::write(dir.path().join("early.bxs"), "bx:capture { return; }").unwrap();
-    let output = cli(dir.path(), &["early.bxs", "--module", "module"]);
+    let output = cli(dir.path(), &["--module", "module", "early.bxs"]);
     success(&output);
     assert!(output.stdout.is_empty());
 }
@@ -2302,7 +2254,7 @@ println("parameterless members OK");
 "#,
     )
     .unwrap();
-    let direct = cli(dir.path(), &["app.bxs", "--module", "module"]);
+    let direct = cli(dir.path(), &["--module", "module", "app.bxs"]);
     success(&direct);
     assert_eq!(
         String::from_utf8_lossy(&direct.stdout).trim(),
@@ -2310,21 +2262,11 @@ println("parameterless members OK");
     );
     success(&cli(
         dir.path(),
-        &[
-            "--build", "app.bxs", "--module", "module", "--output", "app.bxb",
-        ],
+        &["--build", "--module", "module", "--output", "app.bxb", "app.bxs"],
     ));
     success(&cli(
         dir.path(),
-        &[
-            "--target",
-            "native",
-            "app.bxs",
-            "--module",
-            "module",
-            "--output",
-            "application",
-        ],
+        &["--target", "native", "--module", "module", "--output", "application", "app.bxs"],
     ));
     fs::remove_dir_all(module).unwrap();
     success(&cli(dir.path(), &["app.bxb"]));
@@ -2451,13 +2393,13 @@ fn source_native_modules_still_build_through_fusion() {
         &[
             "--target",
             "native",
-            root.join("tests/scripts/vm_module_native_fusion.bxs")
-                .to_str()
-                .unwrap(),
             "--module",
             root.join("tests/modules/native-math").to_str().unwrap(),
             "--output",
             "fusion-app",
+            root.join("tests/scripts/vm_module_native_fusion.bxs")
+                .to_str()
+                .unwrap(),
         ],
     );
     success(&output);

@@ -740,6 +740,10 @@ impl BxVM for VM {
         }
     }
 
+    fn is_truthy(&self, val: BxValue) -> bool {
+        VM::is_truthy(self, val)
+    }
+
     fn is_array_value(&self, val: BxValue) -> bool {
         val.as_gc_id()
             .map(|id| matches!(self.heap.get(id), GcObject::Array(_)))
@@ -2847,6 +2851,21 @@ impl VM {
                     "size" => Some("xmlsize".to_string()),
                     _ => None,
                 };
+            }
+            if matches!(self.heap.get(id), GcObject::Array(_)) && !crate::bifs::set::is_set(id) {
+                let bif = match name.as_str() {
+                    "each" => "arrayeach",
+                    "every" => "arrayevery",
+                    "map" => "arraymap",
+                    "reduce" => "arrayreduce",
+                    "filter" => "arrayfilter",
+                    "some" => "arraysome",
+                    "none" => "arraynone",
+                    _ => "",
+                };
+                if !bif.is_empty() {
+                    return Some(bif.to_string());
+                }
             }
             match self.heap.get(id) {
                 GcObject::String(_) => match name.as_str() {
@@ -5451,6 +5470,19 @@ impl VM {
                 op::DUP => {
                     let val = *self.fibers[fiber_idx].stack.last().unwrap();
                     self.fibers[fiber_idx].stack.push(val);
+                }
+                op::DUP_BELOW => {
+                    let stack = &mut self.fibers[fiber_idx].stack;
+                    let len = stack.len();
+                    let val = stack[len - 1 - op0 as usize];
+                    stack.insert(len - op0 as usize, val);
+                }
+                op::CTOR_FINISH => {
+                    let stack = &mut self.fibers[fiber_idx].stack;
+                    let result = stack.pop().unwrap();
+                    if !result.is_null() {
+                        *stack.last_mut().unwrap() = result;
+                    }
                 }
                 op::SWAP => {
                     let b = self.fibers[fiber_idx].stack.pop().unwrap();
@@ -8099,9 +8131,13 @@ impl VM {
         };
 
         let params: Vec<&str> = match function_name.to_ascii_lowercase().as_str() {
+            "arrayeach" | "arraymap" | "arrayfilter" | "arraysome" | "arrayevery" | "arraynone" => {
+                vec!["array", "callback", "parallel", "maxthreads", "virtual"]
+            }
+            "arrayreduce" => vec!["array", "callback", "initialvalue"],
             "boxannounce" => vec!["state", "data", "poolname"],
-            "dateformat" | "datetimeformat" => vec!["date", "format", "timezone", "locale"],
-            "timeformat" => vec!["date", "format", "timezone"],
+            "dateformat" | "datetimeformat" | "timeformat" => vec!["date", "format", "timezone", "locale"],
+            "createdatetime" | "createdate" => vec!["year", "month", "day", "hour", "minute", "second", "millisecond", "timezone"],
             "parsedatetime" => vec!["date", "format", "timezone", "locale"],
             "gettoken" => vec!["list", "position", "delimiter"],
             "listavg" => vec!["list", "delimiter"],

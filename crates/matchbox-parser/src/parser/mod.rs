@@ -423,6 +423,15 @@ impl<'a> Parser<'a> {
         if bare_abort || (self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon)) {
             return self.parse_component_statement(line);
         }
+        if self.kind(1) == Some(TokenKind::Colon)
+            && matches!(self.kind(2), Some(TokenKind::For) | Some(TokenKind::While) | Some(TokenKind::Do))
+            && self.peek_kind() == Some(TokenKind::Identifier)
+        {
+            let label = self.advance_lexeme().unwrap_or_default();
+            self.pos += 1; // :
+            let body = self.parse_statement()?;
+            return Ok(Statement::new(StatementKind::Labeled { label, body: vec![body] }, line));
+        }
         match self.peek_kind() {
             Some(TokenKind::Import) => self.parse_import(line),
             Some(TokenKind::Class) | Some(TokenKind::Abstract) | Some(TokenKind::Final) | Some(TokenKind::At)
@@ -1109,23 +1118,25 @@ impl<'a> Parser<'a> {
         Ok(Statement::new(StatementKind::Throw(expr), line))
     }
 
+    fn parse_jump_label(&mut self) -> Option<String> {
+        if self.peek_is(TokenKind::Semicolon) || self.at_statement_boundary() {
+            return None;
+        }
+        self.advance_lexeme()
+    }
+
     fn parse_continue(&mut self, line: u32) -> Result<Statement> {
         self.pos += 1; // continue
-        // Optional label (Phase 2 feature)
-        if !self.peek_is(TokenKind::Semicolon) && !self.at_statement_boundary() {
-            let _label = self.advance_lexeme();
-        }
+        let label = self.parse_jump_label();
         if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
-        Ok(Statement::new(StatementKind::Continue, line))
+        Ok(Statement::new(StatementKind::Continue(label), line))
     }
 
     fn parse_break(&mut self, line: u32) -> Result<Statement> {
         self.pos += 1; // break
-        if !self.peek_is(TokenKind::Semicolon) && !self.at_statement_boundary() {
-            let _label = self.advance_lexeme();
-        }
+        let label = self.parse_jump_label();
         if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
-        Ok(Statement::new(StatementKind::Break, line))
+        Ok(Statement::new(StatementKind::Break(label), line))
     }
 
     fn parse_rethrow(&mut self, line: u32) -> Result<Statement> {

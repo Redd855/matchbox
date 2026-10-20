@@ -438,7 +438,7 @@ impl<'a> TemplateParser<'a> {
         let line = self.peek_line();
         self.skip_to_close();
         Ok(Some(Statement::new(
-            if is_break { StatementKind::Break } else { StatementKind::Continue }, line,
+            if is_break { StatementKind::Break(None) } else { StatementKind::Continue(None) }, line,
         )))
     }
 

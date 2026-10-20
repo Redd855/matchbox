@@ -249,8 +249,9 @@ impl<'a> Export<'a> {
             StatementKind::Return(expr) => ("BoxReturn", json!({"expression":self.optional(expr)})),
             StatementKind::Throw(expr) => ("BoxThrow", json!({"expression":self.optional(expr)})),
             StatementKind::Rethrow => ("BoxRethrow", json!({})),
-            StatementKind::Continue => ("BoxContinue", json!({})),
-            StatementKind::Break => ("BoxBreak", json!({})),
+            StatementKind::Continue(label) => ("BoxContinue", json!({"label":label})),
+            StatementKind::Break(label) => ("BoxBreak", json!({"label":label})),
+            StatementKind::Labeled { label, body } => ("BoxLabel", json!({"label":label,"body":self.statements(body)})),
             StatementKind::If {
                 condition,
                 then_branch,

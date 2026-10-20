@@ -139,7 +139,7 @@ fn plugin_values_errors_and_object_lifetime() {
     let id = result.as_gc_id().unwrap();
     assert_eq!(vm.struct_get(id, "value").as_number(), 42.0);
     // Keep the callback globals and returned struct alive while collecting the temporary plugin object.
-    let mut roots = vm.global_values.clone();
+    let mut roots = vm.global_values().to_vec();
     roots.push(result);
     vm.heap.collect(&roots);
     assert_eq!(vm.struct_get(id, "value").as_number(), 42.0);
@@ -718,7 +718,7 @@ class {
         assert snapshot.mapping.path == moduleRecord.path;
         assert !snapshot.mapping.external;
         assert snapshot.publicMapping.name == (snapshot.mapping.name & "www/");
-        assert snapshot.publicMapping.path == (moduleRecord.path & "/www");
+        assert replace(snapshot.publicMapping.path, chr(92), "/", "all") == (replace(moduleRecord.path, chr(92), "/", "all") & "/www");
         assert snapshot.publicMapping.external;
         this.mapping = "tooLate";
         println("configured " & moduleRecord.invocationPath);
@@ -768,11 +768,11 @@ class {{
     function configure() {{
         var snapshot = moduleRecord.asStruct();
         assert snapshot.mapping.name == '{mapping}';
-        assert snapshot.mapping.path == (moduleRecord.path & '{mapping_path}');
+        assert replace(snapshot.mapping.path, chr(92), '/', 'all') == (replace(moduleRecord.path, chr(92), '/', 'all') & '{mapping_path}');
         assert snapshot.mapping.external == {external};
         assert snapshot.invocationPath == '{invocation}';
         assert snapshot.publicMapping.name == '{public}';
-        assert snapshot.publicMapping.path == (moduleRecord.path & '{public_path}');
+        assert replace(snapshot.publicMapping.path, chr(92), '/', 'all') == (replace(moduleRecord.path, chr(92), '/', 'all') & '{public_path}');
         assert snapshot.publicMapping.external == {public_external};
         assert this.mapping.name == listLast('{invocation}', '.');
         println('struct mappings OK');
@@ -1011,6 +1011,7 @@ fn native_class_provider_callbacks_and_references_survive_gc_and_owner_cleanup()
     let mut vm = VM::new();
     unsafe { matchbox_vm::plugins::load(&mut vm, library()) }.unwrap();
     let module = matchbox_vm::bundle::Module {
+        parent_module:None,nested_modules:vec![],
         name:"module".into(), path:"/module".into(), dependencies:vec![], instance:"config".into(),
         descriptor:compile(r#"
 class Config {
@@ -1062,6 +1063,7 @@ fn class_provider_registration_unwinds_partial_startup_and_preserves_original_er
             let on_load = if failing && phase == "startup" { "throw 'original startup error';" } else { "" };
             let on_unload = if failing { "throw 'secondary unload error';" } else { "" };
             matchbox_vm::bundle::Module {
+                parent_module:None,nested_modules:vec![],
                 name:"module".into(), path:"/module".into(), dependencies:vec![], instance:"config".into(),
                 descriptor:compile(&format!(r#"
 class Config {{
@@ -1719,6 +1721,7 @@ class Config {{
 config = new Config();
 "#));
         let module = matchbox_vm::bundle::Module {
+            parent_module:None,nested_modules:vec![],
             name:"module".into(), path:"/module".into(), dependencies:vec![],
             instance:"config".into(), descriptor, bifs:compile(""), bif_registrations:vec![], classes:vec![], components:vec![],
             settings:serde_json::json!({}), artifact:None,

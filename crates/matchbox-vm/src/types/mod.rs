@@ -120,6 +120,10 @@ pub trait BxVM {
         String::new()
     }
     fn interpret_chunk(&mut self, chunk: crate::vm::chunk::Chunk) -> Result<BxValue, String>;
+    fn interpret_chunk_with_receiver(&mut self, chunk: crate::vm::chunk::Chunk, receiver: Option<BxValue>) -> Result<BxValue, String> {
+        if receiver.is_some() { return Err("Class-context templates are unavailable in this host".into()); }
+        self.interpret_chunk(chunk)
+    }
     fn spawn(&mut self, func: Rc<BxCompiledFunction>, args: Vec<BxValue>, priority: u8, chunk: Rc<RefCell<crate::vm::chunk::Chunk>>) -> BxValue;
     fn spawn_by_value(&mut self, func: &BxValue, args: Vec<BxValue>, priority: u8, chunk: Rc<RefCell<crate::vm::chunk::Chunk>>) -> Result<BxValue, String>;
     fn call_function_by_value(&mut self, func: &BxValue, args: Vec<BxValue>, chunk: Rc<RefCell<crate::vm::chunk::Chunk>>) -> Result<BxValue, String>;
@@ -174,6 +178,7 @@ pub trait BxVM {
         self.struct_new()
     }
     fn struct_set(&mut self, id: usize, key: &str, val: BxValue);
+    fn struct_assign(&mut self, id: usize, key: &str, val: BxValue) -> Result<(), String> { self.struct_set(id, key, val); Ok(()) }
     fn struct_get(&self, id: usize, key: &str) -> BxValue;
     fn struct_delete(&mut self, id: usize, key: &str) -> bool;
     fn struct_key_exists(&self, id: usize, key: &str) -> bool;
@@ -215,6 +220,8 @@ pub trait BxVM {
     }
     fn native_object_new(&mut self, obj: Rc<RefCell<dyn BxNativeObject>>) -> usize;
     fn native_object_data(&self, _value: BxValue, _kind: &str) -> Option<*mut std::ffi::c_void> { None }
+    fn is_native_abort(&self, _message: &str) -> bool { false }
+    fn raise_abort(&mut self, _kind: &str, _cause: Option<String>) -> String { "Abort control flow is unsupported by this host".into() }
     fn register_callback(&mut self, _name: &str, _callback: NativeCallback) -> Result<(), String> {
         Err("Native callbacks are not supported by this host".into())
     }
@@ -417,6 +424,8 @@ pub(crate) fn take_wasm_future_thunk(id: u64) -> Option<WasmFutureThunk> {
 }
 
 pub trait BxNativeObject: fmt::Debug {
+    /// Internal language unwind payload; unlike ordinary exceptions it bypasses catch clauses.
+    fn abort_signal(&self) -> Option<crate::vm::AbortSignal> { None }
     /// Internal VM class-reference adapter; not part of the plugin C ABI.
     fn class_reference_target(&self) -> Option<BxValue> { None }
     fn class_reference_instance(&self) -> Option<BxValue> { None }

@@ -343,9 +343,10 @@ impl<'a> Export<'a> {
                 kind,
                 source,
                 bindings,
+                rest,
             } => (
                 "MatchBoxDestructure",
-                json!({"kind":match kind{DestructureKind::Array=>"array",DestructureKind::Object=>"object"},"source":self.expression(source),"bindings":bindings}),
+                json!({"kind":match kind{DestructureKind::Array=>"array",DestructureKind::Object=>"object"},"source":self.expression(source),"bindings":bindings,"rest":rest}),
             ),
             StatementKind::Component {
                 name,

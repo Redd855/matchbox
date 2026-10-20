@@ -1388,11 +1388,21 @@ impl Compiler {
                     stmt.line as u32,
                 );
 
-                self.add_local(item.clone());
-                self.publish_script_loop_variable(item, stmt.line as u32);
-                if let Some(index_name) = index {
-                    self.add_local(index_name.clone());
-                    self.publish_script_loop_variable(index_name, stmt.line as u32);
+                // Script-level loop variables live in the `variables` scope (shared with closures,
+                // readable and writable by the body); the stack slot only carries the iteration value.
+                let script_scope = !self.is_function && !self.is_class;
+                if script_scope {
+                    self.add_local("$item".to_string());
+                    self.publish_script_loop_variable(item, stmt.line as u32);
+                    if let Some(index_name) = index {
+                        self.add_local("$index".to_string());
+                        self.publish_script_loop_variable(index_name, stmt.line as u32);
+                    }
+                } else {
+                    self.add_local(item.clone());
+                    if let Some(index_name) = index {
+                        self.add_local(index_name.clone());
+                    }
                 }
 
                 self.continue_patches.push(Vec::new());
@@ -2932,10 +2942,9 @@ impl Compiler {
         }
     }
 
-    /// Script-level loop variables live in stack slots, which closures cannot reach.
-    /// Mirror the newest local into the script `variables` scope like BoxLang does.
+    /// Store the newest local (the iteration value) into the script `variables` scope.
     fn publish_script_loop_variable(&mut self, name: &str, line: u32) {
-        if self.is_function || name.is_empty() {
+        if name.is_empty() {
             return;
         }
         let slot = (self.locals.len() - 1) as u32;

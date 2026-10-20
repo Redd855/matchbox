@@ -25,3 +25,21 @@ function inFunction() {
     return out.toList();
 }
 expect( inFunction(), "2,4", "function loop variable" );
+
+// the body can assign the loop variable and closures see the assignment
+for ( n in [ 1 ] ) { n = 9; g = () => n; }
+expect( g(), 9, "assignment in body reaches closures" );
+expect( n, 9, "assignment in body is visible after the loop" );
+for ( n in [ 1, 2 ] ) { n++; }
+expect( n, 3, "increment of the loop variable" );
+
+// class bodies must not write into the caller's script variables
+outer = 99;
+class LoopHolder { function init() { for ( outer in [ 1, 2 ] ) { } return this; } }
+new LoopHolder();
+expect( outer, 99, "class loops do not touch script variables" );
+outer2 = 5;
+class PseudoLoop { for ( outer2 in [ 1, 2 ] ) { } }
+
+new PseudoLoop();
+expect( outer2, 5, "class body loops do not touch script variables" );

@@ -14,6 +14,8 @@ mod cookies;
 mod sessions;
 #[path = "../../matchbox-server/src/application_runtime.rs"]
 mod application_runtime;
+#[path = "../../matchbox-server/src/template_cache.rs"]
+mod template_cache;
 #[path = "../../matchbox-server/src/application.rs"]
 mod application;
 #[path = "../../matchbox-server/src/webroot_core.rs"]

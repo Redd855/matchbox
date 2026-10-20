@@ -230,6 +230,7 @@ script_test!(vm_instanceof_castas, "vm_instanceof_castas.bxs");
 script_test!(vm_assert_param_rethrow, "vm_assert_param_rethrow.bxs");
 script_test!(vm_contains, "vm_contains.bxs");
 script_test!(vm_array_bifs, "vm_array_bifs.bxs");
+script_test!(vm_closure_loop_variable, "vm_closure_loop_variable.bxs");
 script_test!(vm_future_get_in_callback, "vm_future_get_in_callback.bxs");
 script_test!(vm_array_callbacks, "vm_array_callbacks.bxs");
 script_test!(vm_member_shaking, "vm_member_shaking.bxs");

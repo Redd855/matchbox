@@ -92,17 +92,20 @@ mod cache;
 mod cli;
 mod conversion;
 mod crypto;
+mod array_callbacks;
 mod async_runtime;
 #[cfg(feature = "bif-datasource")]
 mod datasource;
 mod fs;
 mod http;
 mod i18n;
+mod java_time_format;
+mod java_time_locale;
 mod json;
 mod list_query_extra;
 mod math_datetime;
 mod net;
-mod set;
+pub(crate) mod set;
 mod system_execute;
 mod system_output;
 mod system;
@@ -470,7 +473,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     bifs.insert("stringlen".to_string(), len as BxNativeFunction);
     bifs.insert("cast".to_string(), cast_bif as BxNativeFunction);
     bifs.insert("now".to_string(), now as BxNativeFunction);
-    bifs.insert("createdate".to_string(), create_date as BxNativeFunction);
+    bifs.insert("createdate".to_string(), create_date_time as BxNativeFunction);
     bifs.insert(
         "createdatetime".to_string(),
         create_date_time as BxNativeFunction,
@@ -974,6 +977,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     type_format::register_type_format_bifs(&mut bifs);
     binary::register_binary_bifs(&mut bifs);
     set::register_set_bifs(&mut bifs);
+    array_callbacks::register_array_callback_bifs(&mut bifs);
     i18n::register_i18n_bifs(&mut bifs);
     watcher::register_watcher_bifs(&mut bifs);
     xml::register_xml_bifs(&mut bifs);
@@ -3166,7 +3170,7 @@ fn array_map(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
         let value = vm.array_get(array_id, index);
         let mapped = vm.call_function_by_value(
             &args[1],
-            vec![value, BxValue::new_number((index + 1) as f64)],
+            vec![value, BxValue::new_number((index + 1) as f64), args[0]],
             chunk.clone(),
         )?;
         vm.array_push(result_id, mapped);
@@ -4032,78 +4036,53 @@ fn translate_datetime_format(fmt: &str) -> String {
     out
 }
 
+/// Canonical `ZoneOffset` id for an offset in seconds (`Z`, `+05:30`, `-08:00`).
+fn zone_offset_id(total: i32) -> String {
+    if total == 0 {
+        return "Z".to_string();
+    }
+    let abs = total.abs();
+    let mut id = format!("{}{:02}:{:02}", if total < 0 { '-' } else { '+' }, abs / 3600, (abs / 60) % 60);
+    if abs % 60 != 0 {
+        id.push_str(&format!(":{:02}", abs % 60));
+    }
+    id
+}
+
+/// Resolve a BoxLang timezone argument to the zone used for formatting.
+/// Offsets and `Z` become offset zones; names keep their id (UTC/GMT are exact, other
+/// regions use MatchBox's fixed-offset table because no tz database is bundled).
+pub(super) fn java_zone(tz: Option<&str>) -> java_time_format::JavaZone {
+    let Some(tz) = tz.map(str::trim).filter(|tz| !tz.is_empty()) else {
+        return java_time_format::JavaZone::utc();
+    };
+    let offset = parse_timezone_offset(Some(tz)).map(|o| o.local_minus_utc()).unwrap_or(0);
+    if tz.eq_ignore_ascii_case("z") || tz.starts_with('+') || tz.starts_with('-') {
+        return java_time_format::JavaZone { id: zone_offset_id(offset), region: false, offset_secs: offset };
+    }
+    let id = if tz.eq_ignore_ascii_case("utc") {
+        "UTC".to_string()
+    } else if tz.eq_ignore_ascii_case("gmt") {
+        "GMT".to_string()
+    } else {
+        tz.to_string()
+    };
+    java_time_format::JavaZone { id, region: true, offset_secs: offset }
+}
+
+/// Format a value like BoxLang's `DateTimeFormat` BIF: Java `DateTimeFormatter` masks,
+/// named masks, `epoch`/`epochms`, localized text.
 pub(super) fn format_datetime(
     dt: DateTime<Utc>,
-    format: Option<&str>,
-    default_format: &str,
+    mode: java_time_format::Mode,
+    mask: Option<&str>,
     tz: Option<&str>,
+    locale: Option<&str>,
 ) -> Result<String, String> {
-    let format = format.unwrap_or(default_format).trim();
-    if format.eq_ignore_ascii_case("n") {
-        return Ok(dt.nanosecond().to_string());
-    }
-    if format.eq_ignore_ascii_case("epoch") {
-        return Ok(dt.timestamp().to_string());
-    }
-    if format.eq_ignore_ascii_case("epochms") {
-        return Ok(dt.timestamp_millis().to_string());
-    }
-    if format.eq_ignore_ascii_case("z") {
-        return Ok(match tz.unwrap_or("UTC") {
-            "America/Los_Angeles" => "PDT".to_string(),
-            "US/Hawaii" | "Pacific/Honolulu" => "HST".to_string(),
-            "America/New_York" => "EDT".to_string(),
-            _ => "UTC".to_string(),
-        });
-    }
-    if format.eq_ignore_ascii_case("yyyy-MM-dd'T'HH:mm:ss.SSSX") {
-        let formatted = if let Some(offset) = parse_timezone_offset(tz) {
-            dt.with_timezone(&offset)
-                .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-                .to_string()
-        } else {
-            dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
-        };
-        return Ok(if formatted.ends_with("+00:00") {
-            formatted.trim_end_matches("+00:00").to_string() + "Z"
-        } else if formatted.ends_with("+0000") {
-            formatted.trim_end_matches("+0000").to_string() + "Z"
-        } else {
-            formatted
-        });
-    }
-    let (format, alias) = match format.to_ascii_lowercase().as_str() {
-        "short" if default_format.contains("HH") => (Some("MM/dd/yy, hh:mm a"), None),
-        "short" => (Some("dd-MMM-yy"), None),
-        "long" => (Some("MMMM d, yyyy"), None),
-        "iso" | "iso8601" => (Some("yyyy-MM-dd"), None),
-        "full" => (Some("EEEE, MMMM d, yyyy"), None),
-        _ => (None, Some(format)),
-    };
-
-    let chrono_format = if let Some(alias_fmt) = format {
-        translate_datetime_format(alias_fmt)
-    } else {
-        translate_datetime_format(alias.unwrap())
-    };
-
-        let formatted = if let Some(offset) = parse_timezone_offset(tz) {
-        dt.with_timezone(&offset).format(&chrono_format).to_string()
-    } else {
-        dt.format(&chrono_format).to_string()
-    };
-
-    if format.is_none() && alias.unwrap_or("").contains('X') {
-        if formatted.ends_with("+00:00") {
-            Ok(formatted.trim_end_matches("+00:00").to_string() + "Z")
-        } else if formatted.ends_with("+0000") {
-            Ok(formatted.trim_end_matches("+0000").to_string() + "Z")
-        } else {
-            Ok(formatted)
-        }
-    } else {
-        Ok(formatted)
-    }
+    let zone = java_zone(tz);
+    let local = (dt + Duration::seconds(zone.offset_secs as i64)).naive_utc();
+    let fields = java_time_format::ZonedFields { local, zone };
+    java_time_format::format_mask(&fields, mode, mask, java_time_format::find_locale(locale))
 }
 
 fn parse_datetime_with_format(
@@ -4263,6 +4242,14 @@ pub(super) fn parse_datetime_input(
     };
     if let Ok(parsed) = DateTime::parse_from_rfc3339(&normalized) {
         return Ok(parsed.with_timezone(&Utc));
+    }
+
+    // Signed years outside 0000-9999, as written for datetime values (e.g. "+10000-01-01T00:00:00Z").
+    // Only the UTC form is handled here; unzoned input falls through to the timezone-aware parsing.
+    if input.starts_with(['+', '-']) && input.ends_with('Z') {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(input.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S%.f") {
+            return Ok(Utc.from_utc_datetime(&parsed));
+        }
     }
 
     let naive_patterns = [
@@ -4475,37 +4462,39 @@ fn now(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     Ok(BxValue::new_ptr(vm.datetime_new(now)))
 }
 
-fn create_date(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    if args.len() < 3 {
-        return Err("createDate() expects at least 3 arguments: (year, month, day)".to_string());
-    }
-    let tz = args.get(3).map(|v| vm.to_string(*v));
-    let dt = datetime_from_parts(
-        args[0].as_number() as i32,
-        args[1].as_number() as u32,
-        args[2].as_number() as u32,
-        0,
-        0,
-        0,
-        0,
-        tz.as_deref(),
-    )?;
-    Ok(BxValue::new_ptr(vm.datetime_new(dt)))
-}
-
+/// `CreateDateTime.java`: every argument is optional (year 0, month 1, day 1, time 0, then timezone);
+/// no arguments means now. `createDate` is the same BIF in BoxLang.
 fn create_date_time(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    if args.len() < 7 {
-        return Err("createDateTime() expects at least 7 arguments".to_string());
+    if args.is_empty() {
+        return now(vm, &[]);
     }
-    let tz = args.get(7).map(|v| vm.to_string(*v));
+    let int_arg = |index: usize, default: i64| -> i64 {
+        args.get(index)
+            .filter(|v| !v.is_null())
+            .map(|v| v.as_number().trunc() as i64)
+            .unwrap_or(default)
+    };
+    let year = int_arg(0, 0);
+    let month = int_arg(1, 1);
+    let day = int_arg(2, 1);
+    if year == 0 {
+        return Err("The year argument passed to this method must be greater than zero".to_string());
+    }
+    if month == 0 {
+        return Err("The month argument passed to this method must be greater than zero".to_string());
+    }
+    if day == 0 {
+        return Err("The day argument passed to this method must be greater than zero".to_string());
+    }
+    let tz = args.get(7).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
     let dt = datetime_from_parts(
-        args[0].as_number() as i32,
-        args[1].as_number() as u32,
-        args[2].as_number() as u32,
-        args[3].as_number() as u32,
-        args[4].as_number() as u32,
-        args[5].as_number() as u32,
-        args[6].as_number() as u32,
+        year as i32,
+        month as u32,
+        day as u32,
+        int_arg(3, 0) as u32,
+        int_arg(4, 0) as u32,
+        int_arg(5, 0) as u32,
+        int_arg(6, 0) as u32,
         tz.as_deref(),
     )?;
     Ok(BxValue::new_ptr(vm.datetime_new(dt)))
@@ -4573,20 +4562,7 @@ fn to_epoch_millis(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Strin
 }
 
 fn time_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    if args.is_empty() {
-        return Err("timeFormat() expects at least 1 argument".to_string());
-    }
-    let value = args[0];
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
-    let tz = args
-        .get(2)
-        .filter(|v| !v.is_null())
-        .map(|v| vm.to_string(*v))
-        .or_else(|| vm.datetime_timezone(value))
-        .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
-    let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
-    let formatted = format_datetime(dt, format.as_deref(), "hh:mm a", tz.as_deref())?;
-    Ok(BxValue::new_ptr(vm.string_new(formatted)))
+    java_format_bif(vm, args, java_time_format::Mode::Time, "timeFormat")
 }
 
 fn offset_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
@@ -4621,57 +4597,33 @@ fn get_time_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> 
 }
 
 fn date_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    if args.is_empty() {
-        return Err("dateFormat() expects at least 1 argument".to_string());
-    }
-    let value = args[0];
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
-    let tz = args
-        .get(2)
-        .filter(|v| !v.is_null())
-        .map(|v| vm.to_string(*v))
-        .or_else(|| vm.datetime_timezone(value))
-        .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
-    let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
-    let mut formatted = format_datetime(dt, format.as_deref(), "dd-MMM-yy", tz.as_deref())?;
-    if format.as_deref().is_some_and(|mask| mask.eq_ignore_ascii_case("mmmm")) {
-        if let Some(locale) = args.get(3).filter(|v| !v.is_null()).map(|v| vm.to_string(*v)) {
-            if locale.to_ascii_lowercase().starts_with("de") {
-                formatted = match formatted.as_str() {
-                    "January" => "Januar",
-                    "February" => "Februar",
-                    "March" => "März",
-                    "April" => "April",
-                    "May" => "Mai",
-                    "June" => "Juni",
-                    "July" => "Juli",
-                    "August" => "August",
-                    "September" => "September",
-                    "October" => "Oktober",
-                    "November" => "November",
-                    "December" => "Dezember",
-                    _ => formatted.as_str(),
-                }.to_string();
-            }
-        }
-    }
-    Ok(BxValue::new_ptr(vm.string_new(formatted)))
+    java_format_bif(vm, args, java_time_format::Mode::Date, "dateFormat")
 }
 
 fn date_time_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    java_format_bif(vm, args, java_time_format::Mode::DateTime, "dateTimeFormat")
+}
+
+fn java_format_bif(vm: &mut dyn BxVM, args: &[BxValue], mode: java_time_format::Mode, name: &str) -> Result<BxValue, String> {
     if args.is_empty() {
-        return Err("dateTimeFormat() expects at least 1 argument".to_string());
+        return Err(format!("{}() expects at least 1 argument", name));
     }
     let value = args[0];
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
+    let mask = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
     let tz = args
         .get(2)
         .filter(|v| !v.is_null())
         .map(|v| vm.to_string(*v))
         .or_else(|| vm.datetime_timezone(value))
         .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
-    let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
-    let formatted = format_datetime(dt, format.as_deref(), "dd-MMM-yyyy HH:mm:ss", tz.as_deref())?;
+    let locale = args
+        .get(3)
+        .filter(|v| !v.is_null())
+        .map(|v| vm.to_string(*v))
+        .or_else(|| vm.resolve_variable_path("__default_locale").map(|v| vm.to_string(v)));
+    let text = vm.to_string(value);
+    let dt = parse_datetime_input(&text, None, None).map_err(|_| format!("Can't cast [{}] to a DateTime.", text))?;
+    let formatted = format_datetime(dt, mode, mask.as_deref(), tz.as_deref(), locale.as_deref())?;
     Ok(BxValue::new_ptr(vm.string_new(formatted)))
 }
 

@@ -38,6 +38,9 @@ pub struct Compiler {
     continue_patches: Vec<Vec<usize>>,
     break_patches: Vec<Vec<usize>>,
     loop_locals: Vec<usize>,
+    // Parallel to break_patches: the label of each loop or switch, and whether it is a loop.
+    jump_targets: Vec<(Option<String>, bool)>,
+    pending_label: Option<String>,
     catch_exception_slots: Vec<usize>,
     class_methods: HashSet<String>, // Method names of the current class being compiled
     /// Directory to resolve unqualified source paths against (e.g. sibling interfaces).
@@ -67,6 +70,8 @@ impl Compiler {
             continue_patches: Vec::new(),
             break_patches: Vec::new(),
             loop_locals: Vec::new(),
+            jump_targets: Vec::new(),
+            pending_label: None,
             catch_exception_slots: Vec::new(),
             class_methods: HashSet::new(),
             source_dir,
@@ -92,6 +97,8 @@ impl Compiler {
             continue_patches: Vec::new(),
             break_patches: Vec::new(),
             loop_locals: Vec::new(),
+            jump_targets: Vec::new(),
+            pending_label: None,
             catch_exception_slots: Vec::new(),
             class_methods: HashSet::new(),
             source_dir,
@@ -128,6 +135,30 @@ impl Compiler {
         }
         self.chunk.emit0(op::RETURN, self.current_line as u32);
         Ok(self.chunk.clone())
+    }
+
+    /// Index into `jump_targets` of the loop (or switch, for `break`) a jump leaves.
+    fn jump_target_index(&self, label: Option<&str>, loops_only: bool) -> Result<usize> {
+        let found = match label {
+            Some(name) => self
+                .jump_targets
+                .iter()
+                .rposition(|(l, is_loop)| l.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(name)) && *is_loop),
+            None => self.jump_targets.iter().rposition(|(_, is_loop)| *is_loop || !loops_only),
+        };
+        found.ok_or_else(|| match (label, loops_only) {
+            (Some(name), _) => anyhow::anyhow!("label '{name}' not found for enclosing loop"),
+            (None, true) => anyhow::anyhow!("'continue' used outside of a loop"),
+            (None, false) => anyhow::anyhow!("'break' used outside of a loop or switch"),
+        })
+    }
+
+    /// Pops the locals declared since the target loop or switch began.
+    fn emit_jump_out(&mut self, target: usize, line: u32) {
+        let target_local_count = self.loop_locals[target];
+        for _ in target_local_count..self.locals.len() {
+            self.chunk.emit0(op::POP, line);
+        }
     }
 
     fn compile_statement(&mut self, stmt: &Statement, is_last: bool) -> Result<()> {
@@ -528,54 +559,40 @@ impl Compiler {
                 self.chunk.emit0(op::THROW, stmt.line as u32);
                 Ok(())
             }
-            StatementKind::Continue => {
+            StatementKind::Continue(label) => {
                 if self.is_component_body && self.continue_patches.is_empty() {
                     self.compile_body_result(3, None, stmt.line)?;
                     self.chunk.emit0(op::RETURN, stmt.line);
                     return Ok(());
                 }
-                // Pop any locals added within the loop body
-                if let Some(target_local_count) = self.loop_locals.last() {
-                    let current_local_count = self.locals.len();
-                    if current_local_count > *target_local_count {
-                        for _ in 0..(current_local_count - *target_local_count) {
-                            self.chunk.emit0(op::POP, stmt.line as u32);
-                        }
-                    }
-                }
-
+                let target = self.jump_target_index(label.as_deref(), true)?;
+                self.emit_jump_out(target, stmt.line as u32);
                 let jump_idx = self.chunk.code.len();
                 self.chunk.emit1(op::JUMP, 0, stmt.line as u32);
-                if let Some(patches) = self.continue_patches.last_mut() {
-                    patches.push(jump_idx);
-                } else {
-                    bail!("'continue' used outside of a loop");
-                }
+                // continue_patches only has entries for loops, so skip switch targets.
+                let loop_pos = self.jump_targets[..=target].iter().filter(|(_, is_loop)| *is_loop).count() - 1;
+                self.continue_patches[loop_pos].push(jump_idx);
                 Ok(())
             }
-            StatementKind::Break => {
+            StatementKind::Break(label) => {
                 if self.is_component_body && self.break_patches.is_empty() {
                     self.compile_body_result(2, None, stmt.line)?;
                     self.chunk.emit0(op::RETURN, stmt.line);
                     return Ok(());
                 }
-                // Pop any locals added within the loop/switch body
-                if let Some(target_local_count) = self.loop_locals.last() {
-                    let current_local_count = self.locals.len();
-                    if current_local_count > *target_local_count {
-                        for _ in 0..(current_local_count - *target_local_count) {
-                            self.chunk.emit0(op::POP, stmt.line as u32);
-                        }
-                    }
-                }
-
+                let target = self.jump_target_index(label.as_deref(), false)?;
+                self.emit_jump_out(target, stmt.line as u32);
                 let jump_idx = self.chunk.code.len();
                 self.chunk.emit1(op::JUMP, 0, stmt.line as u32);
-                if let Some(patches) = self.break_patches.last_mut() {
-                    patches.push(jump_idx);
-                } else {
-                    bail!("'break' used outside of a loop or switch");
+                self.break_patches[target].push(jump_idx);
+                Ok(())
+            }
+            StatementKind::Labeled { label, body } => {
+                self.pending_label = Some(label.clone());
+                for inner in body {
+                    self.compile_statement(inner, false)?;
                 }
+                self.pending_label = None;
                 Ok(())
             }
             StatementKind::Rethrow => {
@@ -1038,6 +1055,7 @@ impl Compiler {
 
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1175,6 +1193,7 @@ impl Compiler {
 
                 // Patch any break jumps to land at the end of the loop
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1200,6 +1219,7 @@ impl Compiler {
                 self.begin_scope();
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1230,6 +1250,7 @@ impl Compiler {
 
                 // Patch any break jumps to land at the end of the loop
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1246,6 +1267,7 @@ impl Compiler {
                 self.begin_scope();
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1282,6 +1304,7 @@ impl Compiler {
 
                 // 7. Patch break jumps
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1302,6 +1325,7 @@ impl Compiler {
                 self.begin_scope();
                 // Not pushing continue_patches since 'continue' isn't for switch, only 'break'.
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((None, false));
                 self.loop_locals.push(self.locals.len());
 
                 let mut jump_to_bodies = Vec::new();
@@ -1372,6 +1396,7 @@ impl Compiler {
 
                 // 6. Patch breaks
                 let end_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = end_target - idx - 1;
@@ -1465,6 +1490,7 @@ impl Compiler {
 
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1504,6 +1530,7 @@ impl Compiler {
 
                 // Patch any break jumps to land at the end of the loop
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -3371,7 +3398,8 @@ impl DependencyTracker {
                     self.track_expression(e);
                 }
             }
-            StatementKind::Break | StatementKind::Continue | StatementKind::Rethrow => {}
+            StatementKind::Labeled { body, .. } => self.track_statements(body),
+            StatementKind::Break(_) | StatementKind::Continue(_) | StatementKind::Rethrow => {}
             StatementKind::Assert { condition, message } => {
                 self.track_expression(condition);
                 if let Some(m) = message {

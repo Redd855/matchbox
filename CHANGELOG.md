@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Calling a function without a `required` argument now throws `Required argument [a] is missing for function [f]` (type `Application`) like BoxLang, instead of silently passing null.
+
+### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

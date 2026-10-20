@@ -115,7 +115,13 @@ fn array_contains(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String
         return Err("arrayContains() expects 2 arguments".to_string());
     }
     let array_id = get_set_id(args, 0, "arrayContains")?;
-    Ok(BxValue::new_bool(set_contains(vm, array_id, args[1])))
+    if is_set(array_id) {
+        return Ok(BxValue::new_bool(set_contains(vm, array_id, args[1])));
+    }
+    // Plain arrays compare case-sensitively, like BoxLang's arrayContains.
+    Ok(BxValue::new_bool(
+        (0..vm.array_len(array_id)).any(|index| values_equal(vm, vm.array_get(array_id, index), args[1])),
+    ))
 }
 
 fn array_contains_nocase(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {

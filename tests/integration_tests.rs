@@ -230,6 +230,7 @@ script_test!(vm_instanceof_castas, "vm_instanceof_castas.bxs");
 script_test!(vm_assert_param_rethrow, "vm_assert_param_rethrow.bxs");
 script_test!(vm_contains, "vm_contains.bxs");
 script_test!(vm_array_bifs, "vm_array_bifs.bxs");
+script_test!(vm_query_for_in, "vm_query_for_in.bxs");
 script_test!(vm_member_gaps, "vm_member_gaps.bxs");
 script_test!(vm_lock_blocks, "vm_lock_blocks.bxs");
 script_test!(vm_labeled_loops, "vm_labeled_loops.bxs");

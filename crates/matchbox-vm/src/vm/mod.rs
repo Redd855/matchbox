@@ -2857,6 +2857,44 @@ impl VM {
         }
     }
 
+    /// One step of `for ( row in query )`: the row struct and the 1-based row number.
+    #[cfg(target_arch = "wasm32")]
+    fn query_iteration_step(
+        &mut self,
+        _collection: BxValue,
+        _cursor: usize,
+    ) -> Result<Option<(bool, Option<BxValue>, Option<BxValue>)>> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn query_iteration_step(
+        &mut self,
+        collection: BxValue,
+        cursor: usize,
+    ) -> Result<Option<(bool, Option<BxValue>, Option<BxValue>)>> {
+        let Some(id) = collection.as_gc_id() else { return Ok(None) };
+        if !matches!(self.heap.get_opt(id), Some(GcObject::NativeObject(_)))
+            || BxVM::native_object_query_columns(self, id).is_none()
+        {
+            return Ok(None);
+        }
+        let count = BxVM::native_object_call_method(self, id, "recordcount", &[])
+            .map_err(anyhow::Error::msg)?
+            .as_number() as usize;
+        if cursor >= count {
+            return Ok(Some((true, None, None)));
+        }
+        let row = BxVM::native_object_call_method(
+            self,
+            id,
+            "getrow",
+            &[BxValue::new_number((cursor + 1) as f64)],
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok(Some((false, Some(row), Some(BxValue::new_number(cursor as f64 + 1.0)))))
+    }
+
     fn resolve_member_method(&self, receiver: &BxValue, method_name: &str) -> Option<String> {
         let name = method_name.to_ascii_lowercase();
         if receiver.is_bool() {
@@ -7046,7 +7084,9 @@ impl VM {
                             )
                         };
 
-                        if let Some(id) = collection.as_gc_id() {
+                        if let Some(step) = self.query_iteration_step(collection, cursor_val)? {
+                            step
+                        } else if let Some(id) = collection.as_gc_id() {
                             match self.heap.get(id) {
                                 GcObject::Array(arr) => {
                                     if cursor_val < arr.len() {
@@ -7109,7 +7149,7 @@ impl VM {
                                 _ => {
                                     self.throw_error(
                                         fiber_idx,
-                                        "Iteration only supported for arrays and structs",
+                                        "Iteration only supported for arrays, structs, queries and ranges",
                                     )?;
                                     (true, None, None)
                                 }
@@ -7117,7 +7157,7 @@ impl VM {
                         } else {
                             self.throw_error(
                                 fiber_idx,
-                                "Iteration only supported for arrays and structs",
+                                "Iteration only supported for arrays, structs, queries and ranges",
                             )?;
                             (true, None, None)
                         }
@@ -9180,7 +9220,10 @@ impl VM {
                 }
             }
         }
-        self.throw_error(fiber_idx, &format!("BIF {} not found.", bif_name))
+        let hint = crate::bifs::required_feature(&bif_name.to_ascii_lowercase())
+            .map(|feature| format!(" It requires the `{feature}` build feature."))
+            .unwrap_or_default();
+        self.throw_error(fiber_idx, &format!("BIF {} not found.{}", bif_name, hint))
     }
 
     fn read_constant(&mut self, fiber_idx: usize, idx: usize) -> Result<BxValue> {

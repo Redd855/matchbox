@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- `for ( row in query )` iterates the rows of a query (it failed with "Iteration only supported for arrays and structs"). A BIF that is compiled out now says which build feature provides it, and the QoQ error names the `qoq` feature.
 - Member functions that map to existing BIFs now resolve: struct `keyArray`, `keyList`, `valueArray`, `filter`, `map`, `reduce`, `some`, `every`, `none`, `delete`, `insert`, `update`, `clear`, `copy`, `sort`, `findValue`, `hash`; string `listToArray`, `listPrepend`, `listInsertAt`, `listSetAt`, `listReduce`, `jsonDeserialize`, `toBase64`, `toBinary`, `yesNoFormat` and other list/string members; array `join`, `findNoCase`, `isDefined`; number `max`, `min`, `formatBaseN`; date `hash`; future `isDone`.
 - Script `lock name="x" timeout=n { ... }` blocks parse and run their body (a lock never contends in the single-threaded VM). Script `thread { ... }` now parses and reports "The thread component is not supported yet in MatchBox" instead of a struct-literal parse error.
 - Labeled loops: `outer: for ( ... )` with `continue outer` / `break outer` (also `while` and `do`) now work like BoxLang. Labels were parsed and silently ignored, so `continue outer` only continued the inner loop.

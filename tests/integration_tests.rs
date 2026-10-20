@@ -1214,3 +1214,48 @@ fn test_native_math_module() {
     ).unwrap_err();
     assert!(error.to_string().contains("Source-only native modules require --target native"));
 }
+
+#[test]
+fn test_wasm_and_wasi_targets_produce_the_same_patched_module() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("scripts")
+        .join("vm_array_bifs.bxs");
+    let dir = tempfile::tempdir().unwrap();
+    let mut outputs = Vec::new();
+    for target in ["wasi", "wasm"] {
+        let output = dir.path().join(format!("{target}.wasm"));
+        let result = process_file(
+            &source,
+            false,
+            Some(target),
+            Vec::new(),
+            false,
+            false,
+            false,
+            Some(&output),
+            &[],
+            false,
+            None,
+            false,
+            false,
+            false,
+        );
+        if let Err(error) = result {
+            // The WASI runner stub is only embedded when the wasm32-wasip1 target is installed.
+            assert!(error.to_string().contains("stub"), "{error}");
+            eprintln!("skipping: {error}");
+            return;
+        }
+        outputs.push(std::fs::read(&output).unwrap());
+    }
+    assert_eq!(outputs[0].len(), outputs[1].len(), "--target wasm must package like --target wasi");
+
+    let sentinel = [b'B', b'X', b'L', b'G', 0, 0, 0, 1];
+    for module in &outputs {
+        assert_eq!(&module[0..4], b"\0asm");
+        let at = module.windows(8).position(|w| w == sentinel).expect("sentinel in stub");
+        let length = u32::from_le_bytes(module[at + 8..at + 12].try_into().unwrap());
+        assert!(length > 0, "the bytecode must be patched into the stub");
+    }
+}

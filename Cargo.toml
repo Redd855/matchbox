@@ -39,7 +39,6 @@ matchbox-embedded = { path = "crates/matchbox-embedded" }
 matchbox_server = { path = "crates/matchbox-server", optional = true }
 matchbox_tui = { path = "crates/matchbox-tui", optional = true }
 tokio = { version = "1.0", features = ["rt-multi-thread"], optional = true }
-wasm-encoder = "0.245.1"
 wasmparser = "0.245.1"
 base64-simd = "0.8.0"
 base64 = "0.22"

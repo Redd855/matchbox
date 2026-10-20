@@ -269,8 +269,15 @@ impl<'a> Parser<'a> {
             TokenKind::CastAs => "castas".to_string(),
             TokenKind::Xor => "xor".to_string(),
             TokenKind::Eqv => "eqv".to_string(),
+            TokenKind::Identifier if raw.eq_ignore_ascii_case("mod") => "%".to_string(),
             _ => raw.to_string(),
         }
+    }
+
+    // `mod` is only an operator between operands, so it stays usable as an identifier.
+    fn is_mod_operator(&self) -> bool {
+        self.token_text_lower(0).as_deref() == Some("mod")
+            && !matches!(self.kind(1), Some(TokenKind::Equal) | Some(TokenKind::Dot) | Some(TokenKind::LeftParen))
     }
 
     fn token_text_lower(&self, offset: usize) -> Option<String> {
@@ -1491,6 +1498,7 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Plus) | Some(TokenKind::Minus) => 10,
                 Some(TokenKind::Star) | Some(TokenKind::Slash) | Some(TokenKind::Percent)
                 | Some(TokenKind::Backslash) => 11,
+                Some(TokenKind::Identifier) if self.is_mod_operator() => 11,
                 Some(TokenKind::Caret) => 12, // power ^
                 _ => 0,
             };
@@ -1577,7 +1585,7 @@ impl<'a> Parser<'a> {
     fn parse_unary_inner(&mut self) -> Result<Expression> {
         let line = self.peek_line();
         match self.peek_kind() {
-            Some(TokenKind::Bang) => {
+            Some(TokenKind::Bang) | Some(TokenKind::Not) => {
                 self.pos += 1;
                 let expr = self.parse_unary()?;
                 Ok(Expression::new(ExpressionKind::UnaryNot(Box::new(expr)), line))

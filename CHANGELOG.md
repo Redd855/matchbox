@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- Labeled loops: `outer: for ( ... )` with `continue outer` / `break outer` (also `while` and `do`) now work like BoxLang. Labels were parsed and silently ignored, so `continue outer` only continued the inner loop.
 - The `mod` operator (`7 mod 3`) and unary `not` (`not x`) now parse, like BoxLang. `mod` stays usable as an identifier.
 - `private` class methods are enforced: calling one from outside the class (or an unrelated class) throws, while calls from the class, its subclasses and its closures keep working.
 - Class properties generate `getX()`/`setX()` by default (`accessors=false` opts out), generated setters return the instance so calls chain, and `obj.name` / `obj.name = v` use the accessors when there is no such field, as in BoxLang.

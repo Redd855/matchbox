@@ -13,6 +13,10 @@ use matchbox_vm::vm::opcode::op;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Debug, Clone)]
 struct Local {
@@ -22,6 +26,7 @@ struct Local {
 
 pub struct Compiler {
     pub chunk: Chunk,
+    source_dependencies: Arc<AtomicBool>,
     locals: Vec<Local>,
     scope_depth: i32,
     is_class: bool,
@@ -50,6 +55,7 @@ impl Compiler {
     pub fn new(filename: &str) -> Self {
         let source_dir = Path::new(filename).parent().map(|p| p.to_path_buf());
         Compiler {
+            source_dependencies: Arc::new(AtomicBool::new(false)),
             chunk: Chunk::new(filename),
             locals: Vec::new(),
             scope_depth: 0,
@@ -74,6 +80,7 @@ impl Compiler {
     pub fn with_chunk(chunk: Chunk) -> Self {
         let source_dir = Path::new(&chunk.filename).parent().map(|p| p.to_path_buf());
         Compiler {
+            source_dependencies: Arc::new(AtomicBool::new(false)),
             chunk,
             locals: Vec::new(),
             scope_depth: 0,
@@ -93,6 +100,23 @@ impl Compiler {
             is_function: false,
             is_component_body: false,
         }
+    }
+
+    /// Whether compilation consulted other source files, including unresolved lookups.
+    pub fn has_source_dependencies(&self) -> bool {
+        self.source_dependencies.load(Ordering::Relaxed)
+    }
+
+    fn child_compiler(&self, chunk: Chunk) -> Self {
+        let mut compiler = Self::with_chunk(chunk);
+        compiler.source_dependencies = Arc::clone(&self.source_dependencies);
+        compiler
+    }
+
+    /// Compile a web template included in an Application class's variables context.
+    pub fn compile_class_template(&mut self, ast: &[Statement], source: &str) -> Result<Chunk> {
+        self.is_class = true;
+        self.compile(ast, source)
     }
 
     pub fn compile(&mut self, ast: &[Statement], source: &str) -> Result<Chunk> {
@@ -158,7 +182,7 @@ impl Compiler {
                 members,
                 ..
             } => {
-                let mut constructor_compiler = Compiler::with_chunk(self.chunk.new_sub_chunk());
+                let mut constructor_compiler = self.child_compiler(self.chunk.new_sub_chunk());
                 constructor_compiler.is_class = true;
                 constructor_compiler.scope_depth = 1;
                 constructor_compiler.imports = self.imports.clone();
@@ -250,7 +274,7 @@ impl Compiler {
                                     }
                                 }
                                 let mut method_compiler =
-                                    Compiler::with_chunk(self.chunk.new_sub_chunk());
+                                    self.child_compiler(self.chunk.new_sub_chunk());
                                 method_compiler.is_class = true;
                                 method_compiler.imports = self.imports.clone();
                                 method_compiler.runtime_module_classes = self.runtime_module_classes;
@@ -432,7 +456,7 @@ impl Compiler {
                             None
                         } else {
                             let mut method_compiler =
-                                Compiler::with_chunk(self.chunk.new_sub_chunk());
+                                self.child_compiler(self.chunk.new_sub_chunk());
                             method_compiler.is_class = true;
                             method_compiler.imports = self.imports.clone();
                             method_compiler.runtime_module_classes = self.runtime_module_classes;
@@ -2444,7 +2468,7 @@ impl Compiler {
         modifiers: AstFunctionModifiers,
         kind: FunctionKind,
     ) -> Result<BxCompiledFunction> {
-        let mut sub_compiler = Compiler::with_chunk(self.chunk.new_sub_chunk());
+        let mut sub_compiler = self.child_compiler(self.chunk.new_sub_chunk());
         // Source text lives only in the root chunk to avoid N copies per file.
         // The VM falls back to disk when chunk.source is empty.
         sub_compiler.scope_depth = 1;
@@ -2668,6 +2692,7 @@ impl Compiler {
     }
 
     fn compile_include_file(&mut self, include_path: &str) -> Result<()> {
+        self.source_dependencies.store(true, Ordering::Relaxed);
         let base_dir = self
             .source_dir
             .clone()
@@ -2947,6 +2972,7 @@ impl Compiler {
     }
 
     fn resolve_source_file(&self, dotted_path: &str) -> Result<PathBuf> {
+        self.source_dependencies.store(true, Ordering::Relaxed);
         let base_path = Path::new(&dotted_path.replace('.', "/")).to_path_buf();
 
         // Try .bxs first, then fall back to .bx for BoxLang compatibility.

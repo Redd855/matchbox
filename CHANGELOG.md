@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Security: ESP32 firmware no longer ships default Wi-Fi credentials. Without `MATCHBOX_ESP32_WIFI_SSID` / `MATCHBOX_ESP32_WIFI_PASSWORD` at build time Wi-Fi stays off and the boot log says so (the credentials that were in the source should be considered public).
+
+### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Tree-shaking no longer drops prelude functions that are only reached through member calls (`[3,1,2].sort()`, `.first()`, `.reverse()`, `.sum()`, ... failed with "BIF arraysort not found" outside `--no-shaking`).
+
+### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

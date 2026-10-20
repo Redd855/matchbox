@@ -7847,6 +7847,41 @@ impl VM {
         instance.properties.get(index as usize).copied()
     }
 
+    /// `class` and its ancestors, nearest first.
+    fn class_chain(&self, class: &Rc<RefCell<BxClass>>) -> Vec<Rc<RefCell<BxClass>>> {
+        let mut chain = vec![Rc::clone(class)];
+        loop {
+            let parent = chain.last().and_then(|current| {
+                let extends = current.borrow().extends.clone()?;
+                let id = self.get_global(&extends)?.as_gc_id()?;
+                match self.heap.get(id) {
+                    GcObject::Class(parent) => Some(Rc::clone(parent)),
+                    _ => None,
+                }
+            });
+            match parent {
+                Some(parent) if !chain.iter().any(|seen| Rc::ptr_eq(seen, &parent)) => chain.push(parent),
+                _ => return chain,
+            }
+        }
+    }
+
+    /// Private methods are callable from code running inside the class or a related class
+    /// (the caller's receiver is an instance of `class`, a subclass, or an ancestor of it).
+    fn caller_inside_class(&self, fiber_idx: usize, class: &Rc<RefCell<BxClass>>) -> bool {
+        let Some(receiver) = self.fibers[fiber_idx].frames.last().and_then(|frame| frame.receiver) else {
+            return false;
+        };
+        let Some(caller_class) = self.receiver_instance_gc_id(receiver).and_then(|id| match self.heap.get(id) {
+            GcObject::Instance(instance) => Some(Rc::clone(&instance.class)),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.class_chain(&caller_class).iter().any(|c| Rc::ptr_eq(c, class))
+            || self.class_chain(class).iter().any(|c| Rc::ptr_eq(c, &caller_class))
+    }
+
     pub fn instance_has_method(&self, receiver: BxValue, name: &str) -> bool {
         match receiver.as_gc_id().and_then(|id| self.heap.get_opt(id)) {
             Some(GcObject::Instance(instance)) => self.resolve_method(instance.class.clone(), name).is_some(),
@@ -8613,6 +8648,18 @@ impl VM {
                     } else {
                         method
                     };
+
+                    if let Some(func) = &method {
+                        if func.modifiers.access.as_deref().is_some_and(|a| a.eq_ignore_ascii_case("private"))
+                            && !self.caller_inside_class(fiber_idx, &class)
+                        {
+                            let class_name = class.borrow().name.clone();
+                            return self.throw_error(
+                                fiber_idx,
+                                &format!("The function [{name}] in class [{class_name}] is private and can only be called from within its class"),
+                            );
+                        }
+                    }
 
                     if let Some(func) = method {
                         let mut args = Vec::with_capacity(arg_count);

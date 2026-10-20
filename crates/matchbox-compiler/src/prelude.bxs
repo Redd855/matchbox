@@ -1187,3 +1187,30 @@ function structSort(struct, sortType = "text", sortOrder = "asc", path = "", cal
     }
     return work;
 }
+
+// --- Destructuring ---
+
+/**
+ * Elements of an array from position `from` on (the `...rest` of `[ a, ...rest ] = source`).
+ */
+function _destructureArrayRest(source, from) {
+    var result = [];
+    var size = len(source);
+    for (var i = from; i <= size; i++) {
+        arrayAppend(result, source[i]);
+    }
+    return result;
+}
+
+/**
+ * Struct with every key of `source` that is not in `used` (the `...rest` of `{ a, ...rest } = source`).
+ */
+function _destructureObjectRest(source, used) {
+    var result = {};
+    for (key in structKeyArray(source)) {
+        if (!arrayContainsNoCase(used, key)) {
+            result[key] = source[key];
+        }
+    }
+    return result;
+}

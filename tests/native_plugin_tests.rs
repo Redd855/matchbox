@@ -718,7 +718,7 @@ class {
         assert snapshot.mapping.path == moduleRecord.path;
         assert !snapshot.mapping.external;
         assert snapshot.publicMapping.name == (snapshot.mapping.name & "www/");
-        assert snapshot.publicMapping.path == (moduleRecord.path & "/www");
+        assert replace(snapshot.publicMapping.path, chr(92), "/", "all") == (replace(moduleRecord.path, chr(92), "/", "all") & "/www");
         assert snapshot.publicMapping.external;
         this.mapping = "tooLate";
         println("configured " & moduleRecord.invocationPath);
@@ -768,11 +768,11 @@ class {{
     function configure() {{
         var snapshot = moduleRecord.asStruct();
         assert snapshot.mapping.name == '{mapping}';
-        assert snapshot.mapping.path == (moduleRecord.path & '{mapping_path}');
+        assert replace(snapshot.mapping.path, chr(92), '/', 'all') == (replace(moduleRecord.path, chr(92), '/', 'all') & '{mapping_path}');
         assert snapshot.mapping.external == {external};
         assert snapshot.invocationPath == '{invocation}';
         assert snapshot.publicMapping.name == '{public}';
-        assert snapshot.publicMapping.path == (moduleRecord.path & '{public_path}');
+        assert replace(snapshot.publicMapping.path, chr(92), '/', 'all') == (replace(moduleRecord.path, chr(92), '/', 'all') & '{public_path}');
         assert snapshot.publicMapping.external == {public_external};
         assert this.mapping.name == listLast('{invocation}', '.');
         println('struct mappings OK');

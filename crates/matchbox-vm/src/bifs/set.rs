@@ -514,6 +514,8 @@ fn box_set_union(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String>
     let set1_id = get_set_id(args, 0, "boxSetUnion")?;
     let set2_id = get_set_id(args, 1, "boxSetUnion")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set1_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len1 = vm.array_len(set1_id);
     for i in 0..len1 {
         let elem = vm.array_get(set1_id, i);
@@ -534,6 +536,8 @@ fn box_set_intersection(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, 
     let set1_id = get_set_id(args, 0, "boxSetIntersection")?;
     let set2_id = get_set_id(args, 1, "boxSetIntersection")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set1_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len = vm.array_len(set1_id);
     for i in 0..len {
         let elem = vm.array_get(set1_id, i);
@@ -551,6 +555,8 @@ fn box_set_difference(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, St
     let set1_id = get_set_id(args, 0, "boxSetDifference")?;
     let set2_id = get_set_id(args, 1, "boxSetDifference")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set1_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len = vm.array_len(set1_id);
     for i in 0..len {
         let elem = vm.array_get(set1_id, i);
@@ -568,6 +574,8 @@ fn box_set_symmetric_difference(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<B
     let set1_id = get_set_id(args, 0, "boxSetSymmetricDifference")?;
     let set2_id = get_set_id(args, 1, "boxSetSymmetricDifference")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set1_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len1 = vm.array_len(set1_id);
     for i in 0..len1 {
         let elem = vm.array_get(set1_id, i);
@@ -657,6 +665,8 @@ fn box_set_filter(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String
     let set_id = get_set_id(args, 0, "boxSetFilter")?;
     let chunk = vm.current_chunk().ok_or("No current chunk")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len = vm.array_len(set_id);
     for i in 0..len {
         let elem = vm.array_get(set_id, i);
@@ -675,6 +685,8 @@ fn box_set_map(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let set_id = get_set_id(args, 0, "boxSetMap")?;
     let chunk = vm.current_chunk().ok_or("No current chunk")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len = vm.array_len(set_id);
     for i in 0..len {
         let elem = vm.array_get(set_id, i);
@@ -691,6 +703,8 @@ fn box_set_reject(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String
     let set_id = get_set_id(args, 0, "boxSetReject")?;
     let chunk = vm.current_chunk().ok_or("No current chunk")?;
     let result_id = vm.array_new();
+    let source = get_set_metadata(set_id);
+    register_set_metadata(result_id, source.case_sensitive, source.synchronized);
     let len = vm.array_len(set_id);
     for i in 0..len {
         let elem = vm.array_get(set_id, i);
@@ -721,8 +735,13 @@ fn box_set_to_array(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Stri
     if args.is_empty() {
         return Err("boxSetToArray() expects 1 argument".to_string());
     }
-    let _set_id = get_set_id(args, 0, "boxSetToArray")?;
-    Ok(args[0])
+    let set_id = get_set_id(args, 0, "boxSetToArray")?;
+    let result_id = vm.array_new();
+    for index in 0..vm.array_len(set_id) {
+        let value = vm.array_get(set_id, index);
+        vm.array_push(result_id, value);
+    }
+    Ok(BxValue::new_ptr(result_id))
 }
 
 fn box_set_to_list(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {

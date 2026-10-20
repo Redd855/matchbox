@@ -1388,9 +1388,21 @@ impl Compiler {
                     stmt.line as u32,
                 );
 
-                self.add_local(item.clone());
-                if let Some(index_name) = index {
-                    self.add_local(index_name.clone());
+                // Script-level loop variables live in the `variables` scope (shared with closures,
+                // readable and writable by the body); the stack slot only carries the iteration value.
+                let script_scope = !self.is_function && !self.is_class;
+                if script_scope {
+                    self.add_local("$item".to_string());
+                    self.publish_script_loop_variable(item, stmt.line as u32);
+                    if let Some(index_name) = index {
+                        self.add_local("$index".to_string());
+                        self.publish_script_loop_variable(index_name, stmt.line as u32);
+                    }
+                } else {
+                    self.add_local(item.clone());
+                    if let Some(index_name) = index {
+                        self.add_local(index_name.clone());
+                    }
                 }
 
                 self.continue_patches.push(Vec::new());
@@ -1604,7 +1616,11 @@ impl Compiler {
                     == Some(true);
 
                 // Call init() if args were passed or if the class is known to define init().
+                // BoxLang yields the instance unless init() returns a non-null value, so
+                // keep a copy of the instance below the receiver and settle it afterwards.
                 if (!args.is_empty() || class_has_init) && !is_js_import {
+                    self.chunk
+                        .emit1(op::DUP_BELOW, args.len() as u32, expr.line);
                     let name_idx = self
                         .chunk
                         .add_constant(Constant::String(BoxString::new("init")));
@@ -1621,6 +1637,7 @@ impl Compiler {
                         self.chunk
                             .emit2(op::INVOKE, name_idx as u32, args.len() as u32, expr.line);
                     }
+                    self.chunk.emit0(op::CTOR_FINISH, expr.line);
                 }
 
                 Ok(())
@@ -2846,7 +2863,7 @@ impl Compiler {
                         base: member_base,
                         member,
                     } => {
-                        if *operator == "++" {
+                        if *operator == "++" && !is_variables_scope(member_base) {
                             self.compile_expression(member_base)?;
                             let name_idx = self
                                 .chunk
@@ -2903,7 +2920,7 @@ impl Compiler {
                         base: member_base,
                         member,
                     } => {
-                        if *operator == "++" {
+                        if *operator == "++" && !is_variables_scope(member_base) {
                             self.compile_expression(member_base)?;
                             let name_idx = self
                                 .chunk
@@ -2928,6 +2945,19 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+
+    /// Store the newest local (the iteration value) into the script `variables` scope.
+    fn publish_script_loop_variable(&mut self, name: &str, line: u32) {
+        if name.is_empty() {
+            return;
+        }
+        let slot = (self.locals.len() - 1) as u32;
+        let name_idx = self
+            .chunk
+            .add_constant(Constant::String(BoxString::new(name)));
+        self.chunk.emit1(op::GET_LOCAL, slot, line);
+        self.chunk.emit1(op::SET_GLOBAL_POP, name_idx as u32, line);
     }
 
     fn add_local(&mut self, name: String) {
@@ -3383,6 +3413,21 @@ impl DependencyTracker {
             ExpressionKind::Spread(expr) => {
                 self.track_expression(expr);
             }
+            ExpressionKind::Postfix { base, .. } => {
+                self.track_expression(base);
+            }
+            ExpressionKind::Prefix { target, .. } => match target {
+                crate::ast::AssignmentTarget::Identifier(name) => {
+                    self.used_symbols.insert(name.to_lowercase());
+                }
+                crate::ast::AssignmentTarget::Member { base, .. } => {
+                    self.track_expression(base);
+                }
+                crate::ast::AssignmentTarget::Index { base, index } => {
+                    self.track_expression(base);
+                    self.track_expression(index);
+                }
+            },
             _ => {}
         }
     }
@@ -3394,4 +3439,10 @@ impl DependencyTracker {
             _ => {}
         }
     }
+}
+
+/// The `variables` scope is not a struct or instance value, so it cannot use the
+/// fused member increment and goes through the generic member get/set path.
+fn is_variables_scope(expr: &Expression) -> bool {
+    matches!(&expr.kind, ExpressionKind::Identifier(name) if name.eq_ignore_ascii_case("variables"))
 }

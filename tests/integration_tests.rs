@@ -844,6 +844,33 @@ fn test_java_import() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "bif-jni"), ignore = "requires feature bif-jni")]
+fn test_java_overloads() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("scripts")
+        .join("java_overloads.bxs");
+
+    process_file(
+        &path,
+        false,
+        None,
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        &[],
+        false,
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
 fn test_native_fusion_compilation() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

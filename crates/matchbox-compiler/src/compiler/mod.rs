@@ -341,6 +341,11 @@ impl Compiler {
                             let name_idx = setter_chunk
                                 .add_constant(Constant::String(BoxString::new(prop.as_str())));
                             setter_chunk.emit1(op::SET_PRIVATE, name_idx as u32, stmt.line as u32);
+                            setter_chunk.emit0(op::POP, stmt.line as u32);
+                            // BoxLang's generated setter returns the instance so calls can chain.
+                            let this_idx = setter_chunk
+                                .add_constant(Constant::String(BoxString::new("this")));
+                            setter_chunk.emit1(op::GET_PRIVATE, this_idx as u32, stmt.line as u32);
                             setter_chunk.emit0(op::RETURN, stmt.line as u32);
 
                             let func = BxCompiledFunction {

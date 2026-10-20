@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Class properties generate `getX()`/`setX()` by default (`accessors=false` opts out), generated setters return the instance so calls chain, and `obj.name` / `obj.name = v` use the accessors when there is no such field, as in BoxLang.
+- Closures at script level can now see the `for ( n in ... )` loop variable (and index) instead of failing with "Variable 'n' not found"; assignments to the loop variable in the body are shared with closures.
 - `future.get()` inside a native callback (`map`, `filter`, ...) no longer hangs: the nested callback now lets other fibers run while it waits.
 - Array members `map`, `each`, `filter`, `reduce`, `some`, `every` and `none` no longer use the Set helpers: `map` kept only unique results, and callbacks now receive `(value, index, array)` (`(accumulator, value, index, array)` for `reduce`) like BoxLang.
 - `variables.n++` / `++variables.n` inside classes and scripts no longer fail with "Fused increment only supported on structs and instances", and prefix `++`/`--` now accept member targets such as `++s.n`.

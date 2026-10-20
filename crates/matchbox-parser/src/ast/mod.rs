@@ -124,6 +124,7 @@ pub enum StatementKind {
         kind: DestructureKind,
         source: Expression,
         bindings: Vec<(String, Option<String>)>, // (source_name, local_name?)
+        rest: Option<String>,                    // `...rest` target, always last
     },
     BufferOutput(Expression), // Write expression to output buffer (templates)
     TryCatch {

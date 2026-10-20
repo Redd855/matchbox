@@ -121,17 +121,23 @@ function arrayReverse(array) {
 /**
  * Returns a slice of an array.
  */
-function arraySlice(array, offset, length) {
+function arraySlice(array, start = 1, length = 0) {
     var result = [];
-    var arrayLen = len(array);
-    if (offset < 1) {
-        offset = 1;
+    var size = len(array);
+    var from = start - 1;
+    if (from < 0) {
+        from = size + start;
     }
-    if (length > arrayLen) {
-        length = arrayLen;
+    var count = length;
+    if (count < 0) {
+        count = (size + count) - from;
+    } else if (count == 0) {
+        count = size - from;
     }
-    for (var i = offset; i <= length; i++) {
-        arrayAppend(result, array[i]);
+    for (var i = from; i < from + count; i++) {
+        if (i < size) {
+            arrayAppend(result, array[i + 1]);
+        }
     }
     return result;
 }

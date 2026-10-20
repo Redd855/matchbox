@@ -13,8 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Calling a function without a `required` argument now throws `Required argument [a] is missing for function [f]` (type `Application`) like BoxLang, instead of silently passing null.
-
-### Fixed
 - `future.get()` inside a native callback (`map`, `filter`, ...) no longer hangs: the nested callback now lets other fibers run while it waits.
 - Array members `map`, `each`, `filter`, `reduce`, `some`, `every` and `none` no longer use the Set helpers: `map` kept only unique results, and callbacks now receive `(value, index, array)` (`(accumulator, value, index, array)` for `reduce`) like BoxLang.
 - `variables.n++` / `++variables.n` inside classes and scripts no longer fail with "Fused increment only supported on structs and instances", and prefix `++`/`--` now accept member targets such as `++s.n`.

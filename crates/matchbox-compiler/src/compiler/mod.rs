@@ -3367,6 +3367,21 @@ impl DependencyTracker {
             ExpressionKind::Spread(expr) => {
                 self.track_expression(expr);
             }
+            ExpressionKind::Postfix { base, .. } => {
+                self.track_expression(base);
+            }
+            ExpressionKind::Prefix { target, .. } => match target {
+                crate::ast::AssignmentTarget::Identifier(name) => {
+                    self.used_symbols.insert(name.to_lowercase());
+                }
+                crate::ast::AssignmentTarget::Member { base, .. } => {
+                    self.track_expression(base);
+                }
+                crate::ast::AssignmentTarget::Index { base, index } => {
+                    self.track_expression(base);
+                    self.track_expression(index);
+                }
+            },
             _ => {}
         }
     }

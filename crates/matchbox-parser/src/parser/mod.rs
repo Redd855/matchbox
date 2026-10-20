@@ -1590,7 +1590,8 @@ impl<'a> Parser<'a> {
             }
             Some(TokenKind::PlusPlus) | Some(TokenKind::MinusMinus) => {
                 let op = self.advance_lexeme().unwrap_or_default();
-                let operand = self.parse_postfix()?;
+                // no trailing ++/--: `++i` newline `++j` must stay two statements
+                let operand = self.parse_postfix_with(false)?;
                 let target = expr_to_assignment_target(&operand)?;
                 Ok(Expression::new(ExpressionKind::Prefix { operator: op, target }, line))
             }
@@ -1599,6 +1600,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix(&mut self) -> Result<Expression> {
+        self.parse_postfix_with(true)
+    }
+
+    fn parse_postfix_with(&mut self, allow_update: bool) -> Result<Expression> {
         let start = self.pos;
         let line = self.peek_line();
         let mut expr = self.parse_primary()?;
@@ -1635,7 +1640,7 @@ impl<'a> Parser<'a> {
                         else { ExpressionKind::MemberAccess { base: Box::new(expr), member } };
                     expr = Expression::new(kind, line);
                 }
-                Some(TokenKind::PlusPlus) | Some(TokenKind::MinusMinus) => {
+                Some(TokenKind::PlusPlus) | Some(TokenKind::MinusMinus) if allow_update => {
                     let operator = self.advance_lexeme().unwrap_or_default();
                     expr = Expression::new(
                         ExpressionKind::Postfix { base: Box::new(expr), operator },

@@ -64,4 +64,18 @@ variables.top++;
 assert variables.top == 2 : "script variables.top++";
 ++variables.top;
 assert variables.top == 3 : "script ++variables.top";
+// consecutive prefix statements without semicolons stay separate statements
+i = 0;
+j = 5;
+++i
+++j;
+assert i == 1 && j == 6 : "consecutive ++ statements";
+--i
+--j;
+assert i == 0 && j == 5 : "consecutive -- statements";
+
+// the call inside a prefix member target survives tree shaking
+items = [ { n = 1 } ];
+++arrayFirst( items ).n;
+assert items[ 1 ].n == 2 : "prefix on a call result member";
 println( "ok" );

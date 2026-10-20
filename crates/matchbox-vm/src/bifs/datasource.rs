@@ -199,7 +199,7 @@ pub fn query_execute(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
         }
         #[cfg(not(feature = "qoq"))]
         {
-            return Err("QoQ support is not enabled in this build".to_string());
+            return Err("Query of queries requires the `qoq` build feature".to_string());
         }
     }
 
@@ -481,7 +481,7 @@ fn query_execute_qoq(
     _sql: &str,
     _return_type: &str,
 ) -> Result<BxValue, String> {
-    Err("QoQ support is not enabled in this build".to_string())
+    Err("Query of queries requires the `qoq` build feature".to_string())
 }
 
 // ─── queryNew ────────────────────────────────────────────────────────────────

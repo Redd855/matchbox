@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `arraySlice` now follows BoxLang: `start` defaults to 1, `length` is a count (0 or omitted means to the end, negative trims from the end) and a negative `start` counts from the end.
+- Calling a function without a `required` argument now throws `Required argument [a] is missing for function [f]` (type `Application`) like BoxLang, instead of silently passing null.
 - Tree-shaking no longer drops prelude functions that are only reached through member calls (`[3,1,2].sort()`, `.first()`, `.reverse()`, `.sum()`, ... failed with "BIF arraysort not found" outside `--no-shaking`).
 - Removed prelude copies of `abs`, `min`, `max`, `arrayIsEmpty`, `arrayPrepend`, `arrayContains` and `arrayContainsNoCase` that shadowed the native BIFs depending on tree-shaking; `arrayPrepend` now returns the array and `arrayContains` is case-sensitive for arrays and case-aware for sets.
 - Closures at script level can now see the `for ( n in ... )` loop variable (and index) instead of failing with "Variable 'n' not found"; assignments to the loop variable in the body are shared with closures.

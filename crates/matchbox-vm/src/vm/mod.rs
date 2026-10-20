@@ -295,11 +295,14 @@ pub(crate) fn resolve_js_property(target: &JsValue, name: &str) -> JsValue {
 #[derive(Debug)]
 struct VariablesScopeProxy {
     variables: Rc<RefCell<HashMap<String, BxValue>>>,
+    /// Script-level `variables`: the VM globals are the real store (a bare `x` is `variables.x`).
+    script: bool,
 }
 
 impl BxNativeObject for VariablesScopeProxy {
     fn native_data(&self, kind: &str) -> Option<*mut std::ffi::c_void> {
-        (kind == "matchbox.variables_scope").then_some(self as *const Self as *mut std::ffi::c_void)
+        (kind == "matchbox.variables_scope" || (self.script && kind == "matchbox.script_variables"))
+            .then_some(self as *const Self as *mut std::ffi::c_void)
     }
 
     fn get_property(&self, name: &str) -> BxValue {
@@ -1894,6 +1897,25 @@ impl BxVM for VM {
 }
 
 impl VM {
+    /// Property read on a native object. The script-level `variables` scope is the VM globals.
+    fn native_object_get(&self, object: &Rc<RefCell<dyn BxNativeObject>>, name: &str) -> BxValue {
+        if object.borrow().native_data("matchbox.script_variables").is_some() {
+            if let Some(value) = self.get_global(&name.to_lowercase()) {
+                return value;
+            }
+        }
+        object.borrow().get_property(name)
+    }
+
+    /// Property write on a native object; see `native_object_get`.
+    fn native_object_set(&mut self, object: &Rc<RefCell<dyn BxNativeObject>>, name: &str, value: BxValue) {
+        if object.borrow().native_data("matchbox.script_variables").is_some() {
+            self.insert_global(name.to_lowercase(), value);
+            return;
+        }
+        object.borrow_mut().set_property(name, value);
+    }
+
     /// Shared GET_PRIVATE resolution; JIT intrinsic guards must respect the same scopes.
     fn private_value(&mut self, fiber: usize, name: &str) -> Option<BxValue> {
         let mut found = self.function_scope_value(fiber, name);
@@ -1906,7 +1928,7 @@ impl VM {
             } else if let Some(id) = self.receiver_instance_gc_id(receiver) {
                 if name == "variables" {
                     if let GcObject::Instance(inst) = self.heap.get(id) {
-                        let proxy = VariablesScopeProxy { variables: Rc::clone(&inst.variables) };
+                        let proxy = VariablesScopeProxy { variables: Rc::clone(&inst.variables), script: false };
                         found = Some(BxValue::new_ptr(self.heap.alloc(
                             GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
                         )));
@@ -1920,7 +1942,7 @@ impl VM {
             }
         }
         if found.is_none() && !lambda && name == "variables" {
-            let proxy = VariablesScopeProxy { variables: Rc::clone(&self.fibers[fiber].variables) };
+            let proxy = VariablesScopeProxy { variables: Rc::clone(&self.fibers[fiber].variables), script: true };
             found = Some(BxValue::new_ptr(self.heap.alloc(
                 GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
             )));
@@ -2778,6 +2800,8 @@ impl VM {
 
         let server_ptr = self.heap.alloc(GcObject::Struct(server_struct));
         self.insert_global("server".to_string(), BxValue::new_ptr(server_ptr));
+        // BoxLang's request context owns a `request` scope in CLI scripts too.
+        self.insert_empty_struct_global("request");
     }
 
     pub fn register_global_bif(&mut self, name: String, value: BxValue) {
@@ -5867,7 +5891,8 @@ impl VM {
                                     flush_ip!(); self.throw_error(fiber_idx, "Native object is read-only")?;
                                     frame_changed = true; continue 'quantum;
                                 }
-                                object.borrow_mut().set_property(&index_string, val);
+                                let object = object.clone();
+                                self.native_object_set(&object, &index_string, val);
                                 self.fibers[fiber_idx].stack.push(val);
                             }
                             _ => {
@@ -6015,6 +6040,16 @@ impl VM {
                                     let name = self.interner.resolve(name_id).to_string();
                                     if let Ok(value) = self.method_reference(base_val, &name) {
                                         self.fibers[fiber_idx].stack.push(value);
+                                    } else if let Some(getter) = Self::accessor_method_name("get", &name)
+                                        .filter(|getter| self.instance_has_method(base_val, getter))
+                                    {
+                                        // BoxLang invokeImplicitAccessor: `obj.name` calls `getName()`.
+                                        flush_ip!();
+                                        match self.call_method_value(base_val, &getter, Vec::new()) {
+                                            Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                                            Err(error) => self.throw_error(fiber_idx, &error.to_string())?,
+                                        }
+                                        frame_changed = true; continue 'quantum;
                                     } else {
                                         self.fibers[fiber_idx].stack.push(BxValue::new_null());
                                     }
@@ -6034,7 +6069,8 @@ impl VM {
                                 let is_query = obj.borrow().query_columns().is_some();
                                 #[cfg(target_arch = "wasm32")]
                                 let is_query = false;
-                                let property = obj.borrow().get_property(&name);
+                                let obj = obj.clone();
+                                let property = self.native_object_get(&obj, &name);
                                 let val = if !property.is_null() {
                                     property
                                 } else if is_query {
@@ -6208,6 +6244,23 @@ impl VM {
                             None
                         };
 
+                        // BoxLang invokeImplicitAccessor: `obj.name = v` calls `setName( v )` unless `name` is a field.
+                        if let Some(GcObject::Instance(inst)) = self.heap.get_opt(id) {
+                            if self.shapes.get_index(inst.shape_id, name_id).is_none() {
+                                let name = self.interner.resolve(name_id).to_string();
+                                if let Some(setter) = Self::accessor_method_name("set", &name)
+                                    .filter(|setter| self.instance_has_method(base_val, setter))
+                                {
+                                    flush_ip!();
+                                    match self.call_method_value(base_val, &setter, vec![val]) {
+                                        Ok(_) => self.fibers[fiber_idx].stack.push(val),
+                                        Err(error) => self.throw_error(fiber_idx, &error.to_string())?,
+                                    }
+                                    frame_changed = true; continue 'quantum;
+                                }
+                            }
+                        }
+
                         match self.heap.get_mut(id) {
                             GcObject::Struct(s) => {
                                 let name_id = struct_name_id.unwrap_or(name_id);
@@ -6319,7 +6372,8 @@ impl VM {
                                     flush_ip!(); self.throw_error(fiber_idx, "Native object is read-only")?;
                                     frame_changed = true; continue 'quantum;
                                 }
-                                obj.borrow_mut().set_property(&name, val);
+                                let obj = obj.clone();
+                                self.native_object_set(&obj, &name, val);
                                 self.fibers[fiber_idx].stack.push(val);
                             }
                             _ => {
@@ -6359,10 +6413,10 @@ impl VM {
                             let object = object.clone();
                             if object.borrow().native_data("matchbox.variables_scope").is_some() {
                                 let name = self.interner.resolve(name_id).to_string();
-                                let old = object.borrow().get_property(&name);
+                                let old = self.native_object_get(&object, &name);
                                 if old.is_number() {
                                     let new = BxValue::new_number(old.as_number() + 1.0);
-                                    object.borrow_mut().set_property(&name, new);
+                                    self.native_object_set(&object, &name, new);
                                     self.fibers[fiber_idx].stack.push(new);
                                 } else {
                                     flush_ip!();
@@ -8078,6 +8132,13 @@ impl VM {
         };
         self.class_chain(&caller_class).iter().any(|c| Rc::ptr_eq(c, class))
             || self.class_chain(class).iter().any(|c| Rc::ptr_eq(c, &caller_class))
+    }
+
+    /// `get`/`set` + capitalized property name, e.g. ("get", "title") -> "getTitle".
+    fn accessor_method_name(prefix: &str, name: &str) -> Option<String> {
+        let mut chars = name.chars();
+        let first = chars.next()?;
+        Some(format!("{prefix}{}{}", first.to_uppercase(), chars.as_str()))
     }
 
     pub fn instance_has_method(&self, receiver: BxValue, name: &str) -> bool {

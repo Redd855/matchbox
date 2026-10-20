@@ -52,6 +52,7 @@ public class GenLocale {
         out.println("    pub time_styles: [&'static str; 4],");
         out.println("    pub datetime_styles: [[&'static str; 4]; 4], // [date style][time style]");
         out.println("    pub utc_names: [&'static str; 4],      // z, zzzz, v, vvvv for the UTC zone");
+        out.println("    pub gmt_names: [&'static str; 4],      // z, zzzz, v, vvvv for the GMT zone");
         out.println("    pub gmt_zero: &'static str,            // O for a zero offset");
         out.println("    pub gmt_prefix: &'static str,          // text before the sign in O/OOOO");
         out.println("    pub gmt_minus: &'static str,           // minus sign used in O/OOOO");
@@ -91,6 +92,8 @@ public class GenLocale {
             out.println("],");
             ZonedDateTime utc = ZonedDateTime.of(2024, 3, 5, 14, 7, 9, 0, ZoneId.of("UTC"));
             out.println("        utc_names: " + arr(List.of(f(utc, "z", l), f(utc, "zzzz", l), f(utc, "v", l), f(utc, "vvvv", l))) + ",");
+            ZonedDateTime gmt = ZonedDateTime.of(2024, 3, 5, 14, 7, 9, 0, ZoneId.of("GMT"));
+            out.println("        gmt_names: " + arr(List.of(f(gmt, "z", l), f(gmt, "zzzz", l), f(gmt, "v", l), f(gmt, "vvvv", l))) + ",");
             ZonedDateTime plus = ZonedDateTime.of(2024, 3, 5, 14, 7, 9, 0, ZoneOffset.ofHoursMinutes(5, 30));
             String o = f(plus, "O", l);
             String prefix = o.substring(0, o.indexOf('5') - 1);

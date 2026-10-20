@@ -4242,8 +4242,9 @@ pub(super) fn parse_datetime_input(
         return Ok(parsed.with_timezone(&Utc));
     }
 
-    // Signed years outside 0000-9999, as written for datetime values (e.g. "+10000-01-01T00:00:00Z")
-    if input.starts_with(['+', '-']) {
+    // Signed years outside 0000-9999, as written for datetime values (e.g. "+10000-01-01T00:00:00Z").
+    // Only the UTC form is handled here; unzoned input falls through to the timezone-aware parsing.
+    if input.starts_with(['+', '-']) && input.ends_with('Z') {
         if let Ok(parsed) = NaiveDateTime::parse_from_str(input.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S%.f") {
             return Ok(Utc.from_utc_datetime(&parsed));
         }

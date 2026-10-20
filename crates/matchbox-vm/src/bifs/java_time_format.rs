@@ -1018,13 +1018,7 @@ fn zone_text(loc: &JavaLocale, zone: &JavaZone, full: bool, generic: bool) -> St
         "UTC" | "Etc/UTC" => {
             loc.utc_names[usize::from(generic) * 2 + usize::from(full)].to_string()
         }
-        "GMT" | "UT" | "Z" => {
-            if full {
-                "Greenwich Mean Time".to_string()
-            } else {
-                zone.id.clone()
-            }
-        }
+        "GMT" => loc.gmt_names[usize::from(generic) * 2 + usize::from(full)].to_string(),
         _ => region_text(zone, full, generic)
             .map(str::to_string)
             .unwrap_or_else(|| zone.id.clone()),
@@ -1401,6 +1395,11 @@ mod golden_tests {
     fn zone_for(id: &str) -> JavaZone {
         match id {
             "UTC" => JavaZone::utc(),
+            "GMT" => JavaZone {
+                id: "GMT".to_string(),
+                region: true,
+                offset_secs: 0,
+            },
             "Z" | "+00:00" => JavaZone {
                 id: "Z".to_string(),
                 region: false,

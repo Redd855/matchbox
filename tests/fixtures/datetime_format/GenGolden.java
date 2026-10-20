@@ -118,7 +118,7 @@ public class GenGolden {
         }
         // fixed offset zones
         for (int i = 0; i < 6; i++) {
-            for (String z : new String[]{"+05:30", "-08:00", "+00:00", "Z"}) {
+            for (String z : new String[]{"+05:30", "-08:00", "+00:00", "Z", "GMT"}) {
                 for (String m : (i < 2 ? fullMasks : extraMasks)) emit(out, dates[i], z, "en_US", "datetime", m);
                 for (String fn : fns) {
                     emit(out, dates[i], z, "en_US", fn, null);
@@ -130,6 +130,7 @@ public class GenGolden {
         String[] locales = {"en_GB", "de_DE", "es_ES", "fr_FR", "it_IT", "pt_BR", "nl_NL", "ru_RU", "ja_JP", "zh_CN"};
         String[] lmasks = {"MMM", "MMMM", "MMMMM", "LLL", "LLLL", "LLLLL", "EEE", "EEEE", "EEEEE", "ccc", "cccc", "a", "G", "GGGG", "GGGGG", "QQQ", "QQQQ", "QQQQQ", "qqq", "qqqq", "yyyy-MM-dd", "d. MMMM yyyy", "EEEE, d MMMM", "hh:mm a", "BBBB", "w", "e", "ee", "c"};
         for (String loc : locales) {
+            for (String m : new String[]{"z", "zzzz", "v", "vvvv", "O", "OOOO", "VV"}) emit(out, dates[0], "GMT", loc, "datetime", m);
             for (int i : new int[]{0, 2, 16, 12, 13}) {
                 for (String m : lmasks) emit(out, dates[i], "UTC", loc, "datetime", m);
                 for (String fn : fns) {

@@ -69,6 +69,14 @@ assert dateFormat( createDateTime( 1, 1, 1 ), "yyyy-MM-dd G" ) == "0001-01-01 AD
 assert dateFormat( createDateTime( 10000, 1, 1 ), "yyyy-MM-dd" ) == "+10000-01-01" : "year 10000 keeps the sign";
 assert dateFormat( createDateTime( 1970, 1, 1 ), "epoch" ) == "0" : "epoch zero";
 
+// GMT display names are localized like the JDK
+assert dateTimeFormat( d, "zzzz", "GMT", "de-DE" ) == "Mittlere Greenwich-Zeit" : "GMT full name in German";
+assert dateTimeFormat( d, "zzzz", "GMT" ) == "Greenwich Mean Time" : "GMT full name";
+
+// signed years: unzoned input uses the supplied timezone, Z input is UTC
+assert dateTimeFormat( parseDateTime( "+10000-01-01T00:00:00", timezone = "+05:30" ), "yyyy-MM-dd HH:mm:ssXXX", "UTC" ) == "9999-12-31 18:30:00Z" : "unzoned signed year";
+assert dateTimeFormat( parseDateTime( "+10000-01-01T00:00:00Z", timezone = "+05:30" ), "yyyy-MM-dd HH:mm:ssXXX", "UTC" ) == "+10000-01-01 00:00:00Z" : "zulu signed year";
+
 // invalid input
 assert fails( () => dateFormat( "notadate" ) ) == "Can't cast [notadate] to a DateTime." : "invalid date";
 

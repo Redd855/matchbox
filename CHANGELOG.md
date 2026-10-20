@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Script-level `variables` is now the same store as bare variables (`variables.k = 1; k` and `j = 2; variables.j` work), and CLI scripts and class methods have a `request` scope.
+- Closures at script level can now see the `for ( n in ... )` loop variable (and index) instead of failing with "Variable 'n' not found"; assignments to the loop variable in the body are shared with closures.
 - `future.get()` inside a native callback (`map`, `filter`, ...) no longer hangs: the nested callback now lets other fibers run while it waits.
 - Array members `map`, `each`, `filter`, `reduce`, `some`, `every` and `none` no longer use the Set helpers: `map` kept only unique results, and callbacks now receive `(value, index, array)` (`(accumulator, value, index, array)` for `reduce`) like BoxLang.
 - `variables.n++` / `++variables.n` inside classes and scripts no longer fail with "Fused increment only supported on structs and instances", and prefix `++`/`--` now accept member targets such as `++s.n`.

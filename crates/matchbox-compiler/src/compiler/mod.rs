@@ -2851,7 +2851,7 @@ impl Compiler {
                         base: member_base,
                         member,
                     } => {
-                        if *operator == "++" {
+                        if *operator == "++" && !is_variables_scope(member_base) {
                             self.compile_expression(member_base)?;
                             let name_idx = self
                                 .chunk
@@ -2908,7 +2908,7 @@ impl Compiler {
                         base: member_base,
                         member,
                     } => {
-                        if *operator == "++" {
+                        if *operator == "++" && !is_variables_scope(member_base) {
                             self.compile_expression(member_base)?;
                             let name_idx = self
                                 .chunk
@@ -3372,6 +3372,21 @@ impl DependencyTracker {
             ExpressionKind::Spread(expr) => {
                 self.track_expression(expr);
             }
+            ExpressionKind::Postfix { base, .. } => {
+                self.track_expression(base);
+            }
+            ExpressionKind::Prefix { target, .. } => match target {
+                crate::ast::AssignmentTarget::Identifier(name) => {
+                    self.used_symbols.insert(name.to_lowercase());
+                }
+                crate::ast::AssignmentTarget::Member { base, .. } => {
+                    self.track_expression(base);
+                }
+                crate::ast::AssignmentTarget::Index { base, index } => {
+                    self.track_expression(base);
+                    self.track_expression(index);
+                }
+            },
             _ => {}
         }
     }
@@ -3383,4 +3398,10 @@ impl DependencyTracker {
             _ => {}
         }
     }
+}
+
+/// The `variables` scope is not a struct or instance value, so it cannot use the
+/// fused member increment and goes through the generic member get/set path.
+fn is_variables_scope(expr: &Expression) -> bool {
+    matches!(&expr.kind, ExpressionKind::Identifier(name) if name.eq_ignore_ascii_case("variables"))
 }

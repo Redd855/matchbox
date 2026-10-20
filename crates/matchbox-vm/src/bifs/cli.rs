@@ -1,4 +1,3 @@
-#[cfg(feature = "bif-cli")]
 use crate::types::{BxVM, BxValue};
 #[cfg(feature = "bif-cli")]
 use std::io::{self, IsTerminal, Write};
@@ -86,12 +85,9 @@ pub fn parse_cli_arguments(args: &[String]) -> (Vec<(String, CliOptionValue)>, V
     (options, positionals)
 }
 
-#[cfg(feature = "bif-cli")]
-pub fn cli_get_args(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    // The first entry is the executable, as in BoxLang's raw `server.cli.args` context.
-    let all_args = vm.get_cli_args();
-    let user_args: Vec<String> = all_args.into_iter().skip(1).collect();
-    let (options, positionals) = parse_cli_arguments(&user_args);
+/// `{ options, positionals }` for the given user arguments (the executable is not included).
+pub fn parsed_arguments_value(vm: &mut dyn BxVM, user_args: &[String]) -> BxValue {
+    let (options, positionals) = parse_cli_arguments(user_args);
 
     let options_id = vm.struct_new();
     for (key, value) in options {
@@ -111,7 +107,14 @@ pub fn cli_get_args(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, Str
     vm.struct_set(result_id, "options", BxValue::new_ptr(options_id));
     vm.struct_set(result_id, "positionals", BxValue::new_ptr(positionals_id));
 
-    Ok(BxValue::new_ptr(result_id))
+    BxValue::new_ptr(result_id)
+}
+
+#[cfg(feature = "bif-cli")]
+pub fn cli_get_args(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+    // The first entry is the executable.
+    let user_args: Vec<String> = vm.get_cli_args().into_iter().skip(1).collect();
+    Ok(parsed_arguments_value(vm, &user_args))
 }
 
 #[cfg(feature = "bif-cli")]

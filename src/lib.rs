@@ -811,8 +811,35 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    if cli.verbose {
+    if cli.verbose || cli.bx_debug {
         enable_logging();
+    }
+    // MatchBox has no boxlang.json or runtime home: accept the BoxLang flags (they must never
+    // reach the script) but say so instead of silently pretending to apply them.
+    for (flag, value) in [("--bx-config", &cli.bx_config), ("--bx-home", &cli.bx_home)] {
+        if let Some(value) = value {
+            eprintln!("[matchbox] {flag} {value} is not supported by MatchBox and is ignored");
+        }
+    }
+    if cli.bx_transpile {
+        bail!("--bx-transpile is not supported by MatchBox (BoxLang uses it to transpile to Java)");
+    }
+    if cli.bx_print_ast {
+        return print_ast(&cli);
+    }
+    if let Some(code) = &cli.bx_code {
+        if cli.build || cli.target.is_some() || cli.serve {
+            bail!("--bx-code runs inline code and cannot be combined with --build, --target or --serve");
+        }
+        let script_args = vec![all_args[0].clone()];
+        #[cfg(not(target_arch = "wasm32"))]
+        let started = std::time::Instant::now();
+        let result = run_inline_code(code, cli.no_shaking, cli.no_std_lib, script_args);
+        #[cfg(not(target_arch = "wasm32"))]
+        if cli.bx_debug {
+            eprintln!("[matchbox] executed in {:?}", started.elapsed());
+        }
+        return result;
     }
 
     let is_build = cli.build;
@@ -975,14 +1002,63 @@ struct CliOptions {
     modules: Vec<String>,
     file: Option<String>,
     script_args: Vec<String>,
+    /// `--bx-*` options (BoxLang's runtime flags).
+    bx_debug: bool,
+    bx_config: Option<String>,
+    bx_home: Option<String>,
+    bx_code: Option<String>,
+    bx_print_ast: bool,
+    bx_transpile: bool,
 }
 
 fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
     let mut cli = CliOptions::default();
+    // Runtime startup flags are honored anywhere in the argument list and never reach the script
+    // (BoxLang's pre-parse pass); both `--bx-config path` and `--bx-config=path` are accepted.
+    let mut rest: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let arg = args[i].as_str();
+        let lower = arg.to_ascii_lowercase();
+        let name = lower.split_once('=').map_or(lower.as_str(), |(name, _)| name);
+        if lower == "--bx-debug" {
+            cli.bx_debug = true;
+        } else if name == "--bx-config" || name == "--bx-home" {
+            let value = match arg.split_once('=') {
+                Some((_, value)) => value.to_string(),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .ok_or_else(|| format!("Missing path for {name}, it must be the next argument. [{name} /path]"))?
+                        .clone()
+                }
+            };
+            if name == "--bx-config" {
+                cli.bx_config = Some(value);
+            } else {
+                cli.bx_home = Some(value);
+            }
+        } else {
+            rest.push(arg.to_string());
+        }
+        i += 1;
+    }
+
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = rest[i].as_str();
         match arg.to_ascii_lowercase().as_str() {
+            "--bx-printast" => cli.bx_print_ast = true,
+            "--bx-transpile" => cli.bx_transpile = true,
+            "--bx-code" => {
+                i += 1;
+                cli.bx_code = Some(
+                    rest.get(i)
+                        .ok_or_else(|| "Missing inline code to execute with --bx-code flag.".to_string())?
+                        .clone(),
+                );
+                break;
+            }
             "--verbose" => cli.verbose = true,
             "--build" => cli.build = true,
             "--flash" => cli.flash = true,
@@ -997,7 +1073,7 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
             option @ ("--target" | "--chip" | "--keep" | "--output" | "--webroot" | "--port"
             | "--host" | "--module") => {
                 i += 1;
-                let value = args
+                let value = rest
                     .get(i)
                     .ok_or_else(|| format!("Option '{arg}' requires a value"))?
                     .clone();
@@ -1014,14 +1090,14 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
             }
             _ => {
                 cli.file = Some(arg.to_string());
-                cli.script_args = args[i + 1..].to_vec();
+                cli.script_args = rest[i + 1..].to_vec();
                 break;
             }
         }
         i += 1;
     }
     // Help and version are global only when nothing else is left (BoxLang: `cliArgs.size() == 1`).
-    if cli.script_args.is_empty() {
+    if cli.bx_code.is_none() && cli.script_args.is_empty() {
         match cli.file.as_deref().map(|f| f.to_ascii_lowercase()).as_deref() {
             Some("-h" | "--help") => {
                 cli.help = true;
@@ -1046,6 +1122,11 @@ fn usage_text() -> String {
     let _ = writeln!(out, "  -h, --help          Show this help message (when it is the only argument)");
     let _ = writeln!(out, "  -v, --version       Show version information (when it is the only argument)");
     let _ = writeln!(out, "  --verbose           Emit verbose build logging");
+    let _ = writeln!(out, "  --bx-debug          Enable debug mode (verbose logging and timing); honored anywhere, never passed to the script");
+    let _ = writeln!(out, "  --bx-code <code>    Execute inline BoxLang code");
+    let _ = writeln!(out, "  --bx-printAST       Print the AST (JSON) of a file, --bx-code or stdin");
+    let _ = writeln!(out, "  --bx-config <path>, --bx-home <path>, --bx-transpile");
+    let _ = writeln!(out, "                      Accepted for BoxLang compatibility; not supported by MatchBox");
     let _ = writeln!(out, "  --build             Compile to bytecode (.bxb)");
     let _ = writeln!(out, "  --target <native>   Produce a standalone native binary");
     let _ = writeln!(out, "  --target <wasi>     Produce a standalone WASI container binary");
@@ -1214,6 +1295,43 @@ fn run_lambda_deploy(args: &[String]) -> Result<()> {
         println!("{}", url);
     }
     Ok(())
+}
+
+/// `--bx-printAST`: print the AST as JSON for a file, inline code (`--bx-code`) or stdin.
+fn print_ast(cli: &CliOptions) -> Result<()> {
+    let (source, name) = match (&cli.file, &cli.bx_code) {
+        (Some(file), _) => (fs::read_to_string(file).with_context(|| format!("Cannot read {file}"))?, Some(file.clone())),
+        (None, Some(code)) => (code.clone(), None),
+        (None, None) => {
+            use std::io::Read;
+            let mut source = String::new();
+            io::stdin().read_to_string(&mut source)?;
+            (source, None)
+        }
+    };
+    let ast = matchbox_compiler::inspect::inspect(&source, name.as_deref(), false, false)
+        .map_err(|e| anyhow::anyhow!("{} {}", "Parse Error:".red().bold(), e))?;
+    println!("{}", serde_json::to_string_pretty(&ast)?);
+    Ok(())
+}
+
+/// `--bx-code`: compile and run a source string like a script file.
+fn run_inline_code(code: &str, no_shaking: bool, no_std_lib: bool, cli_args: Vec<String>) -> Result<()> {
+    let ast = parser::parse(code, Some("inline"))
+        .map_err(|e| anyhow::anyhow!("{} {}", "Parse Error:".red().bold(), e))?;
+    let mut chunk = matchbox_compiler::compile_with_treeshaking(
+        "inline",
+        &ast,
+        code,
+        Vec::new(),
+        no_shaking,
+        no_std_lib,
+        false,
+        &[],
+    )
+    .map_err(|e| anyhow::anyhow!("Compiler Error: {}", e))?;
+    chunk.reconstruct_functions();
+    run_chunk_with_args(chunk, &[], cli_args)
 }
 
 fn print_version() {
@@ -1928,7 +2046,7 @@ fn run_chunk_with_args(
     }
 
     let mut vm = vm::VM::new_with_bifs(external_bifs, native_classes);
-    vm.cli_args = args;
+    vm.set_cli_args(args);
 
     #[cfg(feature = "jit")]
     vm.enable_jit();
@@ -1959,7 +2077,7 @@ fn run_repl() -> Result<()> {
         include_bif as types::BxNativeFunction,
     );
     let mut vm = vm::VM::new_with_bifs(external_bifs, HashMap::new());
-    vm.cli_args = args;
+    vm.set_cli_args(args);
 
     // Load full prelude for REPL
 
@@ -2411,7 +2529,7 @@ fn run_interpreted() -> anyhow::Result<()> {{
     let bytes = vec!{bytes:?};
     let application = matchbox_vm::bundle::Application::from_executable(&bytes)?;
     let mut vm = VM::new_with_bifs(bifs, classes);
-    vm.cli_args = std::env::args().collect();
+    vm.set_cli_args(std::env::args().collect());
     application.run(&mut vm, &matchbox_vm::bundle::cache_root())?;
     Ok(())
 }}
@@ -3624,6 +3742,30 @@ mod cli_tests {
         let cli = parse(&["--module", "a", "--module", "b", "--keep", "x,y", "app.bxs"]).unwrap();
         assert_eq!(cli.modules, ["a", "b"]);
         assert_eq!(cli.keep.as_deref(), Some("x,y"));
+    }
+
+    #[test]
+    fn bx_runtime_flags_are_honored_anywhere_and_never_reach_the_script() {
+        let cli = parse(&["app.bxs", "one", "--bx-debug", "--bx-config=/c.json", "--BX-HOME", "/h", "two"]).unwrap();
+        assert!(cli.bx_debug);
+        assert_eq!(cli.bx_config.as_deref(), Some("/c.json"));
+        assert_eq!(cli.bx_home.as_deref(), Some("/h"));
+        assert_eq!(cli.file.as_deref(), Some("app.bxs"));
+        assert_eq!(cli.script_args, ["one", "two"]);
+        assert!(parse(&["--bx-config"]).unwrap_err().contains("--bx-config"));
+    }
+
+    #[test]
+    fn bx_code_print_ast_and_transpile() {
+        let cli = parse(&["--bx-code", "println( 1 )", "ignored", "args"]).unwrap();
+        assert_eq!(cli.bx_code.as_deref(), Some("println( 1 )"));
+        assert!(cli.file.is_none() && cli.script_args.is_empty());
+        assert_eq!(parse(&["--bx-code"]).unwrap_err(), "Missing inline code to execute with --bx-code flag.");
+        let cli = parse(&["--bx-printAST", "--bx-transpile", "app.bxs"]).unwrap();
+        assert!(cli.bx_print_ast && cli.bx_transpile);
+        assert_eq!(cli.file.as_deref(), Some("app.bxs"));
+        // a recognized flag can precede help/version, which is still global
+        assert!(parse(&["--bx-printAST", "--help"]).unwrap().help);
     }
 
     #[test]

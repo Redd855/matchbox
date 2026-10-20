@@ -146,6 +146,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
         system::run_thread_in_context as BxNativeFunction,
     );
     bifs.insert("lock".to_string(), system::lock as BxNativeFunction);
+    bifs.insert("__supercall".to_string(), system::super_call as BxNativeFunction);
     bifs.insert("getbasetagdata".to_string(), system::get_base_tag_data as BxNativeFunction);
     bifs.insert("getbasetaglist".to_string(), system::get_base_tag_list as BxNativeFunction);
     bifs.insert("getbasetemplatepath".to_string(), system::get_base_template_path as BxNativeFunction);

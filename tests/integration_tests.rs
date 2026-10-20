@@ -235,6 +235,7 @@ script_test!(vm_future_get_in_callback, "vm_future_get_in_callback.bxs");
 script_test!(vm_array_callbacks, "vm_array_callbacks.bxs");
 script_test!(vm_member_shaking, "vm_member_shaking.bxs");
 script_test!(vm_member_gaps, "vm_member_gaps.bxs");
+script_test!(vm_required_arguments, "vm_required_arguments.bxs");
 script_test!(vm_member_shaking, "vm_member_shaking.bxs");
 script_test!(vm_closure_loop_variable, "vm_closure_loop_variable.bxs");
 script_test!(vm_future_get_in_callback, "vm_future_get_in_callback.bxs");

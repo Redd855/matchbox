@@ -10,6 +10,8 @@ pub struct ModuleInfo {
     /// The module name (e.g. `"bx-strings"`). Becomes the `bxModules.{name}` namespace.
     pub name: String,
     pub dependencies: Vec<String>,
+    pub parent_module: Option<String>,
+    pub nested_modules: Vec<String>,
     /// Absolute physical path to the module root directory.
     pub path: PathBuf,
     /// Contents of each `bifs/*.bxs` (or `.bx`) file in this module, injected as extra
@@ -96,6 +98,42 @@ pub fn discover_modules(
     project_dir: &Path,
     extra_module_paths: &[PathBuf],
 ) -> Result<Vec<ModuleInfo>> {
+    let home = std::env::var_os("BOXLANG_HOME").map(PathBuf::from);
+    discover_modules_with_home(project_dir, extra_module_paths, home.as_deref())
+}
+
+/// Explicit home selection avoids changing process-wide environment in embedded hosts.
+pub fn discover_modules_with_home(
+    project_dir: &Path,
+    extra_module_paths: &[PathBuf],
+    home: Option<&Path>,
+) -> Result<Vec<ModuleInfo>> {
+    discover_modules_with_config(project_dir, extra_module_paths, home, None)
+}
+
+/// Modules and all discovered installation/package paths that HTTP hosts must keep private.
+pub struct DiscoveredModules {
+    pub modules: Vec<ModuleInfo>,
+    pub private_paths: Vec<PathBuf>,
+}
+
+pub fn discover_modules_with_config(
+    project_dir: &Path,
+    extra_module_paths: &[PathBuf],
+    home: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<Vec<ModuleInfo>> {
+    Ok(discover_module_installations(project_dir, extra_module_paths, home, config_path)?.modules)
+}
+
+/// Resolve configuration once so package selection and HTTP privacy use the same snapshot.
+pub fn discover_module_installations(
+    project_dir: &Path,
+    extra_module_paths: &[PathBuf],
+    home: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<DiscoveredModules> {
+    let mut private_paths = Vec::new();
     // Collect (name, raw_path) pairs.  Later entries for the same name replace earlier ones.
     let mut entries: Vec<(String, PathBuf)> = Vec::new();
 
@@ -153,25 +191,11 @@ pub fn discover_modules(
     }
 
     // 3. Scan the project installation directory for packages not explicitly configured.
-    let dir_path = project_dir.join("boxlang_modules");
-    if dir_path.is_dir() {
-        let mut paths = std::fs::read_dir(dir_path)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        paths.sort();
-        for path in paths {
-            if path.is_dir() && path.join("ModuleConfig.bx").is_file() {
-                let name = path
-                    .file_name()
-                    .context("Module directory has no name")?
-                    .to_string_lossy()
-                    .into_owned();
-                if !entries.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
-                    entries.push((name, path));
-                }
-            }
-        }
-    }
+    scan_module_directory(
+        &project_dir.join("boxlang_modules"),
+        &mut entries,
+        &mut private_paths,
+    )?;
 
     // 4. --module CLI overrides: derive name from the directory name, replace manifest entry
     //    with the same name so CLI always wins.
@@ -191,39 +215,103 @@ pub fn discover_modules(
     }
 
     // The runtime home is lower priority than project packages and explicit selections.
-    if let Some(home) = std::env::var_os("BOXLANG_HOME") {
-        let directory = PathBuf::from(home).join("modules");
-        if directory.is_dir() {
-            let mut paths = std::fs::read_dir(directory)?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            paths.sort();
-            for path in paths {
-                if !path.is_dir() || !path.join("ModuleConfig.bx").is_file() {
-                    continue;
-                }
-                let name = path
-                    .file_name()
-                    .context("Module directory has no name")?
-                    .to_string_lossy()
-                    .into_owned();
-                if !entries
-                    .iter()
-                    .any(|(local, _)| local.eq_ignore_ascii_case(&name))
-                {
-                    entries.push((name, path));
-                }
+    if let Some(home) = home {
+        scan_module_directory(&home.join("modules"), &mut entries, &mut private_paths)?;
+    }
+
+    let file = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| project_dir.join("boxlang.json"));
+    let config: serde_json::Value = if config_path.is_some() || file.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&file)?)
+            .with_context(|| format!("Invalid {}", file.display()))?
+    } else {
+        serde_json::json!({})
+    };
+    if config_path.is_some()
+        && !config.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "modules" | "modulesDirectory"))
+        })
+    {
+        bail!(
+            "Native runtime configuration currently supports only modules enabled/settings and modulesDirectory; other runtime configuration remains unsupported"
+        );
+    }
+
+    if let Some(directories) = config.get("modulesDirectory") {
+        for directory in directories
+            .as_array()
+            .context("modulesDirectory must be an array of strings")?
+        {
+            let directory = directory
+                .as_str()
+                .context("modulesDirectory entries must be strings")?;
+            if directory.trim().is_empty() {
+                continue;
             }
+            let directory = project_dir.join(directory);
+            scan_module_directory(&directory, &mut entries, &mut private_paths)?;
         }
     }
 
+    if let Some(entries) = config.get("modules") {
+        let entries = entries
+            .as_object()
+            .context("modules configuration must be an object")?;
+        for (name, entry) in entries {
+            let entry = entry
+                .as_object()
+                .with_context(|| format!("Module {name} configuration must be an object"))?;
+            if entry
+                .keys()
+                .any(|key| !matches!(key.as_str(), "enabled" | "settings"))
+            {
+                bail!("Module {name} supports only enabled/settings configuration");
+            }
+            if let Some(enabled) = entry.get("enabled")
+                && !enabled.is_null()
+                && !enabled.is_boolean()
+            {
+                bail!("Module {name} enabled must be boolean");
+            }
+            if let Some(settings) = entry.get("settings")
+                && !settings.is_null()
+                && !settings.is_object()
+            {
+                bail!("Module {name} settings must be an object");
+            }
+        }
+    }
     // Validate and resolve each entry.
-    let mut modules = Vec::new();
-    for (mut name, path) in entries {
+    let mut modules: Vec<ModuleInfo> = Vec::new();
+    let mut pending: std::collections::VecDeque<_> = entries
+        .into_iter()
+        .map(|(name, path)| {
+            (
+                name,
+                path,
+                None::<String>,
+                Vec::<PathBuf>::new(),
+                serde_json::json!({}),
+            )
+        })
+        .collect();
+    while let Some((mut name, path, parent_module, mut ancestors, parent_overrides)) =
+        pending.pop_front()
+    {
         let path = path.canonicalize().with_context(|| {
             format!("Module '{}': path does not exist: {}", name, path.display())
         })?;
 
+        if ancestors.contains(&path) {
+            bail!("Circular nested module path: {}", path.display());
+        }
+        ancestors.push(path.clone());
+        if !private_paths.contains(&path) {
+            private_paths.push(path.clone());
+        }
         let descriptor = path.join("ModuleConfig.bx");
         if !descriptor.exists() {
             bail!(
@@ -242,10 +330,45 @@ pub fn discover_modules(
         if let Some(declared) = package["boxlang"]["moduleName"].as_str() {
             name = declared.to_owned();
         }
+        if parent_module.is_some()
+            && modules
+                .iter()
+                .any(|module| module.name.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        let mut overrides = parent_overrides
+            .as_object()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+            })
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut global = config["modules"][&name].clone();
+        if let Some(entries) = global.as_object_mut() {
+            entries.retain(|_, value| !value.is_null());
+        }
+        merge_configuration(&mut overrides, &global);
+        if overrides["enabled"] == false {
+            continue;
+        }
         let source = std::fs::read_to_string(&descriptor)?;
         let metadata = descriptor_metadata(&source)?;
-        if !metadata.enabled {
+        if !overrides["enabled"].as_bool().unwrap_or(metadata.enabled) {
             continue;
+        }
+        let mut children = Vec::new();
+        scan_module_directory(&path.join("modules"), &mut children, &mut private_paths)?;
+        for (child, child_path) in children {
+            pending.push_back((
+                child,
+                child_path,
+                Some(name.clone()),
+                ancestors.clone(),
+                metadata.modules.clone(),
+            ));
         }
         // Collect bifs/*.bxs sources (sorted for determinism).
         let bifs_dir = path.join("bifs");
@@ -293,16 +416,7 @@ pub fn discover_modules(
             .is_some_and(|a| !a.is_empty());
         let has_native = !has_artifacts && path.join("matchbox").join("Cargo.toml").exists();
 
-        let config_path = project_dir.join("boxlang.json");
-        let config: serde_json::Value = if config_path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(config_path)?)?
-        } else {
-            serde_json::json!({})
-        };
-        if config["modules"][&name]["enabled"] == false {
-            continue;
-        }
-        let settings = config["modules"][&name]["settings"]
+        let settings = overrides["settings"]
             .as_object()
             .map(|m| serde_json::Value::Object(m.clone()))
             .unwrap_or_else(|| serde_json::json!({}));
@@ -310,6 +424,8 @@ pub fn discover_modules(
         modules.push(ModuleInfo {
             name,
             dependencies: metadata.dependencies,
+            parent_module,
+            nested_modules: Vec::new(),
             path,
             bif_sources,
             bif_classes,
@@ -318,7 +434,68 @@ pub fn discover_modules(
         });
     }
 
-    order_modules(modules)
+    for index in 0..modules.len() {
+        modules[index].nested_modules = modules
+            .iter()
+            .filter(|child| child.parent_module.as_deref() == Some(modules[index].name.as_str()))
+            .map(|child| child.name.clone())
+            .collect();
+    }
+    Ok(DiscoveredModules {
+        modules: order_modules(modules)?,
+        private_paths,
+    })
+}
+
+fn scan_module_directory(
+    directory: &Path,
+    entries: &mut Vec<(String, PathBuf)>,
+    private_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let metadata = match std::fs::metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Reading module directory {}", directory.display()));
+        }
+    };
+    if !metadata.is_dir() {
+        eprintln!(
+            "Warning: module directory {} is not a directory; ignoring",
+            directory.display()
+        );
+        return Ok(());
+    }
+    let canonical = directory.canonicalize()?;
+    if !private_paths.contains(&canonical) {
+        private_paths.push(canonical);
+    }
+    let mut paths = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        if !path.is_dir() || !path.join("ModuleConfig.bx").is_file() {
+            continue;
+        }
+        let canonical = path.canonicalize()?;
+        if !private_paths.contains(&canonical) {
+            private_paths.push(canonical);
+        }
+        let name = path
+            .file_name()
+            .context("Module directory has no name")?
+            .to_string_lossy()
+            .into_owned();
+        if !entries
+            .iter()
+            .any(|(selected, _)| selected.eq_ignore_ascii_case(&name))
+        {
+            entries.push((name, path));
+        }
+    }
+    Ok(())
 }
 
 /// Read `[datasources.<name>]` sections from `matchbox.toml` in `project_dir`.
@@ -342,6 +519,71 @@ pub fn read_datasource_configs(project_dir: &Path) -> Result<HashMap<String, Dat
 struct DescriptorMetadata {
     enabled: bool,
     dependencies: Vec<String>,
+    modules: serde_json::Value,
+}
+fn merge_configuration(target: &mut serde_json::Value, source: &serde_json::Value) {
+    if let Some(source) = source.as_object() {
+        if !target.is_object() {
+            *target = serde_json::json!({});
+        }
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in source {
+            if value.is_object() {
+                merge_configuration(
+                    target
+                        .entry(key.clone())
+                        .or_insert_with(|| serde_json::json!({})),
+                    value,
+                );
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+fn literal_configuration(
+    expression: &matchbox_compiler::ast::Expression,
+    key: bool,
+) -> Result<serde_json::Value> {
+    use matchbox_compiler::ast::*;
+    Ok(match &expression.kind {
+        ExpressionKind::Identifier(name) if key => serde_json::Value::String(name.to_lowercase()),
+        ExpressionKind::Literal(Literal::String(parts)) => serde_json::Value::String(
+            parts
+                .iter()
+                .map(|part| match part {
+                    StringPart::Text(text) => Ok(text.as_str()),
+                    _ => bail!("Nested module overrides must be literals"),
+                })
+                .collect::<Result<String>>()?,
+        ),
+        ExpressionKind::Literal(Literal::Boolean(value)) => serde_json::Value::Bool(*value),
+        ExpressionKind::Literal(Literal::Number(value)) => serde_json::json!(value),
+        ExpressionKind::Literal(Literal::Null) => serde_json::Value::Null,
+        ExpressionKind::Literal(Literal::Array(items)) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| literal_configuration(item, false))
+                .collect::<Result<_>>()?,
+        ),
+        ExpressionKind::Literal(Literal::Struct(items)) => serde_json::Value::Object(
+            items
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        literal_configuration(key, true)?
+                            .as_str()
+                            .context("Nested override keys must be strings")?
+                            .to_lowercase(),
+                        literal_configuration(value, false)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        _ => bail!(
+            "Nested module overrides must be literals; dynamic descriptor configuration is unsupported"
+        ),
+    })
 }
 fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
     use matchbox_compiler::ast::*;
@@ -369,6 +611,7 @@ fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
     let mut result = DescriptorMetadata {
         enabled: true,
         dependencies: vec![],
+        modules: serde_json::json!({}),
     };
     for statement in matchbox_compiler::parser::parse(source, Some("ModuleConfig.bx"))? {
         let StatementKind::ClassDecl { members, .. } = statement.kind else {
@@ -399,6 +642,32 @@ fn descriptor_metadata(source: &str) -> Result<DescriptorMetadata> {
                         bail!("Module enabled metadata must be a boolean literal");
                     };
                     result.enabled = enabled;
+                }
+                "modules" => {
+                    result.modules = literal_configuration(&value, false)?;
+                    let entries = result
+                        .modules
+                        .as_object()
+                        .context("Nested module overrides must be a struct")?;
+                    for (name, entry) in entries {
+                        let entry = entry.as_object().with_context(|| {
+                            format!("Nested module {name} overrides must be a struct")
+                        })?;
+                        if entry
+                            .keys()
+                            .any(|key| !matches!(key.as_str(), "enabled" | "settings"))
+                            || entry
+                                .get("enabled")
+                                .is_some_and(|value| !value.is_boolean())
+                            || entry
+                                .get("settings")
+                                .is_some_and(|value| !value.is_object())
+                        {
+                            bail!(
+                                "Nested module {name} supports only boolean enabled and struct settings"
+                            );
+                        }
+                    }
                 }
                 "dependencies" => {
                     let ExpressionKind::Literal(Literal::Array(values)) = value.kind else {
@@ -439,7 +708,11 @@ fn order_modules(modules: Vec<ModuleInfo>) -> Result<Vec<ModuleInfo>> {
             );
         }
         states[index] = 1;
-        for dependency in &modules[index].dependencies {
+        for dependency in modules[index]
+            .nested_modules
+            .iter()
+            .chain(&modules[index].dependencies)
+        {
             let next = *names.get(&dependency.to_lowercase()).with_context(|| {
                 format!(
                     "Module {} requires missing module {dependency}",

@@ -49,11 +49,47 @@ This uses the ordinary process loader namespace, not JVM-style sibling isolation
 
 ## Runtime startup
 
-Modules are discovered in project-local `boxlang_modules/` and in `BOXLANG_HOME/modules/` when that environment variable is set; project packages and explicit selections take precedence for the same directory name. Arbitrary locations can be selected with `--module` or explicit manifest paths. Discovery reads metadata and compiles descriptors without executing lifecycle hooks. Module names honor `boxlang.moduleName`. Descriptor mappings are resolved at execution; dependency arrays and enabled discovery metadata currently require literals. Dependencies initialize first; missing dependencies and cycles fail. Disabled modules are omitted. Application overrides come from `boxlang.json` → `modules.<name>.settings`.
+Modules are discovered in project-local `boxlang_modules/` and in `BOXLANG_HOME/modules/` when that environment variable is set; project packages and explicit selections take precedence for the same directory name. Arbitrary packages can be selected with `--module` or explicit manifest paths.
+`modulesDirectory` in the project runtime configuration adds directories to scan:
+relative paths resolve against the startup project/CWD, and earlier entries win.
+Project/explicit selections and default home packages precede these additional
+folders. Missing/blank/non-directory entries are ignored; the native loader
+requires an array of strings and rejects invalid types. Discovery reads metadata and compiles descriptors without executing lifecycle hooks. Module names honor `boxlang.moduleName`. Descriptor mappings are resolved at execution; dependency arrays and enabled discovery metadata currently require literals. Dependencies initialize first; missing dependencies and cycles fail. Disabled modules are omitted. Application overrides come from `boxlang.json` → `modules.<name>.settings`.
 
 At execution, load native providers, instantiate descriptors, call `configure()`, read the descriptor's **variables-scope `settings`**, deep-merge application settings, and register BoxLang class BIFs using their `invoke()` method. After initialization, call `onLoad()` in dependency order. Call `onUnload()` in reverse order at normal shutdown, including application errors. This does not provide cleanup after process abort/crash.
 
 `configure()` populates `settings`; its return value is ignored. Old build-time lifecycle execution and baked settings are removed. Class BIFs honor `@BoxBIF` aliases and `@BoxMember` declarations (also supported as class-header attributes). A string alias replaces the filename name; an alias array includes the filename name. Members retain their callable independently of global aliases and bind the receiver to `objectArgument`, or the first declared argument by default, for positional and named calls. The currently supported member targets are the VM's core scalar, array, struct, date, class, and callable types; JVM-specific targets fail explicitly. Parameterless `invoke()` methods retain positional receivers and extras in `arguments` under numeric keys, as on the JVM. Named member calls require a declared first parameter or an explicit `objectArgument`, which need not be declared. Class BIFs retain undeclared positional/named values and expose `__functionName` / `__isMemberExecution`. Explicit `objectArgument` positional dispatch maps only declared parameters and drops surplus values, matching JVM member dispatch. Doc comments remain documentation, not BIF/member registration annotations, matching the JVM. Synchronous global interception supports descriptor/custom-point handlers, descriptor-declared interceptor classes, and explicitly registered class instances, shared mutable event data, Boolean-true short-circuiting, and reverse-order cleanup. Declared methods with an `@interceptionPoint` annotation discover their own point; annotation presence matters even when its value is false. Documentation tags and inherited-only methods are not discovered, matching JVM metadata registration. Module `.bx`/`.bxs` class declarations are embedded with the application, so declared interceptors do not require their source package at execution. Module components support template tags and `bx:name` script syntax. Native objects can declare member-to-BIF mappings. A module relying on unsupported JVM APIs must provide an alternative backend.
+
+### Native HTTP hosts
+
+Discovery/preparation lives in the shared `matchbox-modules` crate rather than
+private CLI files. `WebrootRuntime::from_project(project, home, config)` starts
+modules on its VM-owning thread before serving; application-end precedes module
+unload on orderly disposal. The module-aware web compiler defers packaged class
+references to the VM catalog. Request namespaces retain module objects/settings
+and clear inline caches without serializing them.
+
+The HTTP startup path is offline: artifact URLs and source-only Rust packages fail.
+Install native bytes in the package first; publisher trust and target/hash/ABI/cache
+checks still apply. Runtime configuration supports module enabled/settings and
+modulesDirectory. Nested packages under each module's modules/ directory are
+discovered recursively; disabled ancestors suppress their subtree. Parent descriptor
+constructors/class mappings are prepared before children; child configuration and
+activation precede the parent, and children unload before their parent. Literal
+this.modules per-child enabled/settings overrides are supported; global configuration
+wins. Dynamic overrides remain explicitly unsupported, as do dynamic enabled/dependency
+metadata. Top-level selections precede duplicate nested identities. Cyclic physical
+paths fail instead of recursively walking symlinks forever. Hot reload remains unsupported.
+LoadedModules::mappings and WebrootRuntime::module_mappings export resolved plain-data
+mapping snapshots for HTTP hosts; only external mappings may be published. The native
+frontend serves public mappings as confined mounts with its existing source/config
+protection; ordinary aliases to package paths remain private. discover_module_installations reports all installation
+roots and physical package paths (including disabled/shadowed packages) from the
+same configuration snapshot; HTTP hosts must keep these paths private, including
+through aliases. The existing discover_modules APIs use the same selection logic
+without requiring hosts to maintain a second directory scanner.
+The standalone server crate does not select JNI; the root CLI still controls its
+own optional JNI feature.
 
 ### Descriptor mappings
 
@@ -65,7 +101,7 @@ Package `.bx`/`.bxs` class declarations are embedded under private identities, t
 
 Module-root `build/`, `dist/`, and `target/` directories are authoring outputs, not class sources: their contents are neither parsed nor embedded. This lets development checkouts retain generated packages and malformed test fixtures without loading them as module classes. These names remain valid below source directories such as `models/build/`. Non-BIF `.bxs` scripts are conservatively screened for class declarations using the lexer; comments, string contents, member names and struct keys do not turn them into class sources. Candidate class scripts still undergo normal syntax validation; surrounding script statements remain unexecuted.
 
-This is BoxLang package-class resolution, distinct from the class-provider boundary below. Arbitrary runtime mappings, source/template loading, and complete BoxLang static scopes remain separate work.
+This is BoxLang package-class resolution, distinct from the class-provider boundary below. Public HTTP mapped mounts can serve native templates/static assets. Arbitrary application/runtime source mappings and complete BoxLang static scopes remain separate work.
 
 ### Module-owned Java class providers
 
@@ -143,7 +179,7 @@ Milestone 1 covers synchronous packaged modules, not an exhaustive JVM runtime A
 
 Three compatibility transfer tests formerly passed only because reflection/reload returned placeholders. They are now explicitly ignored with unsupported-feature reasons; the missing-custom-tag fixture now verifies the canonical JVM error instead of accepting null. These exclusions are not compatibility successes. Unrelated general-language BIFs and complete framework compatibility are not certified by this module audit.
 
-Direct execution, source-free `.bxb` and standalone execution, retained roots/contexts and repeated GC, nested callbacks, no-JNI execution, and the unchanged image-provider contract are the exit gates. Plugin ABI-1 remains unchanged; envelope v10 requires rebuilding older development applications.
+Direct execution, source-free `.bxb` and standalone execution, retained roots/contexts and repeated GC, nested callbacks, no-JNI execution, and the unchanged image-provider contract are the exit gates. Plugin ABI-1 remains unchanged; envelope v11 requires rebuilding older development applications.
 
 ## Native SDK / ABI
 
@@ -199,7 +235,7 @@ matchbox --target native app.bxs --module /path/to/package --output app
 
 Native libraries are extracted into a private content-addressed cache by target/library-group hash. Each file is published atomically across concurrent launches; every selected cached file is verified before loading. Tampered entries fail rather than being silently trusted. Set `MATCHBOX_NATIVE_CACHE` to choose the directory. Otherwise use the platform's user cache directory (or a process-specific temporary directory when no home/cache directory is available).
 
-Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 10; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
+Source-based Native Fusion remains available with `--target native`. A source-only Rust module cannot be executed directly by the CLI; publish a prebuilt artifact or use Native Fusion. Native module envelopes currently target desktop execution, not ESP32 or WebAssembly. The module envelope format is version 11; rebuild application bundles made with the earlier development format. This does not change the native plugin ABI or require rebuilding plugin libraries.
 
 ## Checks
 

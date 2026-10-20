@@ -94,6 +94,7 @@ script_test!(structs, "structs.bxs");
 script_test!(top_level_return, "top_level_return.bxs");
 script_test!(vm_basic, "vm_basic.bxs");
 script_test!(vm_classes, "vm_classes.bxs");
+script_test!(vm_datetime_format, "vm_datetime_format.bxs");
 script_test!(vm_member_increment, "vm_member_increment.bxs");
 script_test!(vm_new_init_result, "vm_new_init_result.bxs");
 script_test!(vm_complex_types, "vm_complex_types.bxs");

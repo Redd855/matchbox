@@ -630,13 +630,18 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_include_tag(&mut self) -> Result<Option<Statement>> {
+        // <bx:include template="part.bxm">
         let line = self.peek_line();
-        self.skip_to_close();
-        Ok(Some(Statement::new(
-            StatementKind::Include(Expression::new(
-                ExpressionKind::Literal(Literal::String(vec![StringPart::Text(String::new())])), line,
-            )), line,
-        )))
+        let (attributes, self_closing) = self.parse_tag_attributes(line)?;
+        let template = attributes
+            .into_iter()
+            .find(|(key, _)| key == "template")
+            .map(|(_, value)| value)
+            .ok_or_else(|| anyhow::anyhow!("<bx:include> requires a template attribute"))?;
+        if !self_closing {
+            self.skip_closing("include");
+        }
+        Ok(Some(Statement::new(StatementKind::Include(template), line)))
     }
 
     fn parse_import_tag(&mut self) -> Result<Option<Statement>> {

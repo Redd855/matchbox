@@ -18,6 +18,11 @@ fn register_set_metadata(id: usize, case_sensitive: bool, synchronized: bool) {
     set_metadata().lock().unwrap().insert(id, SetMetadata { case_sensitive, synchronized });
 }
 
+/// True when `id` was created as a Set (sets and arrays share one representation).
+pub fn is_set(id: usize) -> bool {
+    set_metadata().lock().unwrap().contains_key(&id)
+}
+
 fn get_set_metadata(id: usize) -> SetMetadata {
     set_metadata()
         .lock()

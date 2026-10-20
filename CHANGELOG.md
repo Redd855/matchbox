@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Array members `map`, `each`, `filter`, `reduce`, `some`, `every` and `none` no longer use the Set helpers: `map` kept only unique results, and callbacks now receive `(value, index, array)` (`(accumulator, value, index, array)` for `reduce`) like BoxLang.
+
+### Fixed
 - Corrected the native fusion documentation example that used the nonexistent `BxValue::new_string`; strings are returned with `BxValue::new_ptr( vm.string_new( text ) )`.
 
 ### Documentation

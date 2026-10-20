@@ -1,0 +1,41 @@
+// Array members use Array semantics (not Set): duplicates kept, (value, index, array) passed.
+function expect( actual, expected, label ) {
+    if ( actual != expected ) { throw "#label# failed: expected [#expected#], got [#actual#]"; }
+}
+
+// map keeps duplicate results (was deduplicated by the Set helper)
+expect( [1,2,3].map( f => 7 ).len(), 3, "map constant callback" );
+expect( [1,2,3].map( f => 7 ).toList(), "7,7,7", "map constant values" );
+
+// index and array arguments
+expect( [ "a", "b" ].map( ( v, i ) => i & v ).toList(), "1a,2b", "map index" );
+expect( [ "a", "b" ].map( ( v, i, arr ) => arr.len() ).toList(), "2,2", "map array" );
+var seen = [];
+[ "x", "y" ].each( ( v, i, arr ) => { seen.append( i & v & arr.len() ); } );
+expect( seen.toList(), "1x2,2y2", "each args" );
+expect( [ 1, 2, 3, 4 ].filter( ( v, i ) => i > 2 ).toList(), "3,4", "filter index" );
+expect( [ 5, 5, 5 ].filter( v => true ).len(), 3, "filter keeps duplicates" );
+expect( [ 1, 2, 3 ].reduce( ( acc, v, i ) => acc + v * i, 0 ), 14, "reduce index" );
+expect( [ 1, 2, 3 ].reduce( ( acc, v, i, arr ) => acc + arr.len(), 0 ), 9, "reduce array" );
+expect( [ 1, 2, 3 ].some( ( v, i ) => i == 3 ), true, "some index" );
+expect( [ 1, 2, 3 ].every( ( v, i ) => i < 4 ), true, "every index" );
+expect( [ 1, 2, 3 ].every( v => v < 3 ), false, "every false" );
+expect( [ 1, 2, 3 ].none( v => v > 3 ), true, "none" );
+expect( arrayMap( [ 1, 2 ], ( v, i ) => i ).toList(), "1,2", "arrayMap function form" );
+
+// closures created in a loop, then mapped (issue: results collapsed to one element)
+function loopClosures() {
+    var fs = [];
+    for ( i = 1; i <= 3; i++ ) { fs.append( () => i * 10 ); }
+    return fs.map( f => f() );
+}
+expect( loopClosures().toList(), "40,40,40", "closures in loop" );
+
+// closures capturing parameters and mutating enclosed locals
+function adder( n ) { return x => x + n; }
+expect( adder( 5 )( 10 ), 15, "closure captures parameter" );
+function counter() { var count = 0; var inc = () => { count = count + 1; }; inc(); inc(); return count; }
+expect( counter(), 2, "closure mutates local" );
+
+// sets still dedupe
+expect( setOf( 1, 2, 3 ).map( v => 7 ).len(), 1, "set map dedupes" );

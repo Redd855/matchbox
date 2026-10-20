@@ -92,6 +92,7 @@ mod cache;
 mod cli;
 mod conversion;
 mod crypto;
+mod array_callbacks;
 mod async_runtime;
 #[cfg(feature = "bif-datasource")]
 mod datasource;
@@ -102,7 +103,7 @@ mod json;
 mod list_query_extra;
 mod math_datetime;
 mod net;
-mod set;
+pub(crate) mod set;
 mod system_execute;
 mod system_output;
 mod system;
@@ -974,6 +975,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     type_format::register_type_format_bifs(&mut bifs);
     binary::register_binary_bifs(&mut bifs);
     set::register_set_bifs(&mut bifs);
+    array_callbacks::register_array_callback_bifs(&mut bifs);
     i18n::register_i18n_bifs(&mut bifs);
     watcher::register_watcher_bifs(&mut bifs);
     xml::register_xml_bifs(&mut bifs);
@@ -3166,7 +3168,7 @@ fn array_map(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
         let value = vm.array_get(array_id, index);
         let mapped = vm.call_function_by_value(
             &args[1],
-            vec![value, BxValue::new_number((index + 1) as f64)],
+            vec![value, BxValue::new_number((index + 1) as f64), args[0]],
             chunk.clone(),
         )?;
         vm.array_push(result_id, mapped);

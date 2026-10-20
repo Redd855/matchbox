@@ -2839,6 +2839,21 @@ impl VM {
                     _ => None,
                 };
             }
+            if matches!(self.heap.get(id), GcObject::Array(_)) && !crate::bifs::set::is_set(id) {
+                let bif = match name.as_str() {
+                    "each" => "arrayeach",
+                    "every" => "arrayevery",
+                    "map" => "arraymap",
+                    "reduce" => "arrayreduce",
+                    "filter" => "arrayfilter",
+                    "some" => "arraysome",
+                    "none" => "arraynone",
+                    _ => "",
+                };
+                if !bif.is_empty() {
+                    return Some(bif.to_string());
+                }
+            }
             match self.heap.get(id) {
                 GcObject::String(_) => match name.as_str() {
                     "len" | "length" => Some("len".to_string()),

@@ -1,6 +1,6 @@
 use crate::types::{BxNativeFunction, BxVM, BxValue};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 
 #[derive(Clone, Copy)]
 struct SetMetadata {
@@ -8,28 +8,27 @@ struct SetMetadata {
     synchronized: bool,
 }
 
-static SET_METADATA: OnceLock<Mutex<HashMap<usize, SetMetadata>>> = OnceLock::new();
-
-fn set_metadata() -> &'static Mutex<HashMap<usize, SetMetadata>> {
-    SET_METADATA.get_or_init(|| Mutex::new(HashMap::new()))
+// Heap ids are only unique per VM, and a VM never leaves its thread, so the table is per thread.
+thread_local! {
+    static SET_METADATA: RefCell<HashMap<usize, SetMetadata>> = RefCell::new(HashMap::new());
 }
 
 fn register_set_metadata(id: usize, case_sensitive: bool, synchronized: bool) {
-    set_metadata().lock().unwrap().insert(id, SetMetadata { case_sensitive, synchronized });
+    SET_METADATA.with(|m| m.borrow_mut().insert(id, SetMetadata { case_sensitive, synchronized }));
 }
 
 /// True when `id` was created as a Set (sets and arrays share one representation).
 pub fn is_set(id: usize) -> bool {
-    set_metadata().lock().unwrap().contains_key(&id)
+    SET_METADATA.with(|m| m.borrow().contains_key(&id))
 }
 
 fn get_set_metadata(id: usize) -> SetMetadata {
-    set_metadata()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .copied()
-        .unwrap_or(SetMetadata { case_sensitive: false, synchronized: true })
+    SET_METADATA.with(|m| {
+        m.borrow()
+            .get(&id)
+            .copied()
+            .unwrap_or(SetMetadata { case_sensitive: false, synchronized: true })
+    })
 }
 
 pub fn register_set_bifs(bifs: &mut HashMap<String, BxNativeFunction>) {

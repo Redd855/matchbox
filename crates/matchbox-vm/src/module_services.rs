@@ -84,6 +84,7 @@ pub(crate) fn record(
         "invocationPath": format!("bxModules.{name}"),
         "mapping": mapping, "publicMapping": public_mapping,
         "dependencies": module.dependencies, "enabled": true, "activated": false,
+        "parentModule":module.parent_module,"nestedModules":module.nested_modules,
         "bifs": [], "memberMethods": []
     });
     let mut fields = HashMap::new();
@@ -429,18 +430,7 @@ impl Services {
                 vm.construct_box_class(&class, args, named.then_some(names))
             }),
         }).expect("VM callback registration");
-        vm.register_callback("__mb_body_result", NativeCallback {
-            parameters: vec!["type".into(), "value".into()],
-            callback: Rc::new(crate::vm::components::body_result),
-        }).expect("VM callback registration");
-        vm.register_callback("__mb_component", NativeCallback {
-            parameters: vec!["name".into(), "attributes".into(), "body".into()],
-            callback: Rc::new(|vm, args| {
-                if args.len() != 3 { return Err("Component invocation requires name, attributes and body".into()); }
-                let name = vm.to_string(args[0]);
-                vm.invoke_component(&name, args[1], args[2])
-            }),
-        }).expect("VM callback registration");
+        vm.register_component_runtime().expect("VM callback registration");
         Self { fields }
     }
     pub fn register(&self, vm: &mut VM, name: &str, record: BxValue) {
@@ -473,6 +463,7 @@ mod tests {
         let mut vm = VM::new();
         let services = Services::new(&mut vm);
         let module = Module {
+            parent_module:None,nested_modules:vec![],
             name: "gc-test".into(),
             path: "/module".into(),
             dependencies: vec![],

@@ -230,6 +230,15 @@ script_test!(vm_instanceof_castas, "vm_instanceof_castas.bxs");
 script_test!(vm_assert_param_rethrow, "vm_assert_param_rethrow.bxs");
 script_test!(vm_contains, "vm_contains.bxs");
 script_test!(vm_array_bifs, "vm_array_bifs.bxs");
+script_test!(vm_query_for_in, "vm_query_for_in.bxs");
+script_test!(vm_member_gaps, "vm_member_gaps.bxs");
+script_test!(vm_lock_blocks, "vm_lock_blocks.bxs");
+script_test!(vm_labeled_loops, "vm_labeled_loops.bxs");
+script_test!(vm_word_operators, "vm_word_operators.bxs");
+script_test!(vm_private_methods, "vm_private_methods.bxs");
+script_test!(vm_class_accessors, "vm_class_accessors.bxs");
+script_test!(vm_class_annotation_names, "vm_class_annotation_names.bxs");
+script_test!(vm_variables_request_scope, "vm_variables_request_scope.bxs");
 script_test!(vm_destructure_rest, "vm_destructure_rest.bxs");
 script_test!(vm_array_slice, "vm_array_slice.bxs");
 script_test!(vm_required_arguments, "vm_required_arguments.bxs");
@@ -846,6 +855,33 @@ fn test_java_import() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "bif-jni"), ignore = "requires feature bif-jni")]
+fn test_java_overloads() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("scripts")
+        .join("java_overloads.bxs");
+
+    process_file(
+        &path,
+        false,
+        None,
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        &[],
+        false,
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
 fn test_native_fusion_compilation() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1258,4 +1294,36 @@ fn test_wasm_and_wasi_targets_produce_the_same_patched_module() {
         let length = u32::from_le_bytes(module[at + 8..at + 12].try_into().unwrap());
         assert!(length > 0, "the bytecode must be patched into the stub");
     }
+}
+
+#[test]
+fn test_native_fusion_uses_native_cargo_toml_dependencies() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("native_fusion_deps")
+        .join("script.bxs");
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join(if cfg!(windows) { "fusion_deps.exe" } else { "fusion_deps" });
+
+    process_file(
+        &source_path,
+        false,
+        Some("native"),
+        Vec::new(),
+        false,
+        false,
+        false,
+        Some(&output_path),
+        &[],
+        false,
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(&output_path).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "YWJj");
 }

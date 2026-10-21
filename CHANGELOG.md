@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- `new Child()` calls `init()` inherited from a parent class when `Child` defines none (the compiler only looked at the class itself).
 - `--target wasi` works again: the WASI runner stub lost its embed region in an earlier refactor, so packaging always failed with "WASI stub is missing the BOXLANG_EMBED sentinel". `--target wasm` produced an invalid module (a custom section written without its header) that no runtime could load; it is now the same as `--target wasi`. The docs said `--target wasm` was browser oriented; use `--target js` for the browser.
 - Native Fusion reads `native/Cargo.toml`: its `[dependencies]` are added to the generated build (relative `path` dependencies are resolved against `native/`), as the Native Fusion guide already described. Redeclaring a crate the build provides (`matchbox_vm`, `postcard`, `bincode`, `anyhow`) is an error.
 - Java interop (`bif-jni`): methods and constructors are chosen by their parameter types, not just argument count (`sb.append( 2 )`, `String.valueOf( 5 )`), static methods work on `createObject( "java", ... )` references (`Math.max( 1, 2 )`, `Integer.parseInt( "42" )`), and Java exceptions report their class and message.

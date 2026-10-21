@@ -451,7 +451,10 @@ impl Compiler {
                     chunk: constructor_compiler.chunk,
                 };
 
-                let has_init = methods.keys().any(|n| n.eq_ignore_ascii_case("init"));
+                let has_init = methods.keys().any(|n| n.eq_ignore_ascii_case("init"))
+                    || extends
+                        .as_deref()
+                        .is_some_and(|parent| self.class_chain_has_init(parent, 0));
                 self.class_has_init_map
                     .insert(name.to_lowercase(), has_init);
 
@@ -1652,7 +1655,11 @@ impl Compiler {
                         class_has_init = cls
                             .methods
                             .iter()
-                            .any(|(n, _)| n.eq_ignore_ascii_case("init"));
+                            .any(|(n, _)| n.eq_ignore_ascii_case("init"))
+                            || cls
+                                .extends
+                                .as_deref()
+                                .is_some_and(|parent| self.class_chain_has_init(parent, 0));
                     }
                     let class_idx = self.chunk.add_constant(class_val);
                     self.chunk.emit1(op::CONSTANT, class_idx, expr.line);
@@ -1687,6 +1694,9 @@ impl Compiler {
                                 false
                             }
                         });
+                    }
+                    if !class_has_init {
+                        class_has_init = self.class_chain_has_init(&resolved_path, 0);
                     }
                     let class_idx = self
                         .chunk
@@ -2793,6 +2803,29 @@ impl Compiler {
             }
         }
         None
+    }
+
+    /// Whether `class_name` or one of its ancestors defines `init()`, as far as the compiler can see.
+    fn class_chain_has_init(&mut self, class_name: &str, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if self
+            .class_has_init_map
+            .get(&class_name.to_lowercase())
+            .copied()
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let Ok(Some(class)) = self.find_class_constant(class_name) else {
+            return false;
+        };
+        class.methods.iter().any(|(n, _)| n.eq_ignore_ascii_case("init"))
+            || class
+                .extends
+                .as_deref()
+                .is_some_and(|parent| self.class_chain_has_init(parent, depth + 1))
     }
 
     fn find_class_constant(&mut self, class_name: &str) -> Result<Option<BxClass>> {

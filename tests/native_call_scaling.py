@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix='matchbox-native-calls-') as directory:
     script = work / 'modes.bxs'; script.write_bytes((ROOT / 'tests/scripts/vm_native_calls.bxs').read_bytes())
     bytecode = work / 'modes.bxb'; native = work / 'modes'
     for flags, output in [(['--build'], bytecode), (['--target', 'native'], native)]:
-        subprocess.run([MATCHBOX, '--no-shaking', *flags, str(script), '--output', str(output)], cwd=work, check=True)
+        subprocess.run([MATCHBOX, '--no-shaking', *flags, '--output', str(output), str(script)], cwd=work, check=True)
     script.unlink()
     for index, command in enumerate([[MATCHBOX, str(bytecode)], [str(native)]]):
         env = dict(os.environ, BOXLANG_HOME=str(work / f'mode-run-{index}' / 'home'), MATCHBOX_NATIVE_CACHE=str(work / f'mode-run-{index}' / 'cache'))
@@ -29,7 +29,7 @@ println(jsonSerialize({{ms: elapsed}}));
 '''
         script = work / f'calls-{count}.bxs'; binary = work / f'calls-{count}'
         script.write_text(source)
-        subprocess.run([MATCHBOX, '--no-shaking', '--target', 'native', str(script), '--output', str(binary)], cwd=work, check=True)
+        subprocess.run([MATCHBOX, '--no-shaking', '--target', 'native', '--output', str(binary), str(script)], cwd=work, check=True)
         script.unlink(); binaries[count] = binary
     for trial in range(3):
         for count in (list(timings) if trial != 1 else list(reversed(timings))):

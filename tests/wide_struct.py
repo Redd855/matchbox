@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory(prefix='matchbox-wide-struct-') as directory:
     work = Path(directory); script = work / 'wide.bxs'; bytecode = work / 'wide.bxb'; native = work / 'wide'
     shutil.copyfile(ROOT / 'tests/scripts/vm_wide_struct.bxs', script)
     for flags, output in [(['--build'], bytecode), (['--target', 'native'], native)]:
-        subprocess.run([MATCHBOX, '--no-shaking', *flags, str(script), '--output', str(output)], cwd=work, check=True)
+        subprocess.run([MATCHBOX, '--no-shaking', *flags, '--output', str(output), str(script)], cwd=work, check=True)
     script.unlink()
     for label, command in [('bytecode', [MATCHBOX, str(bytecode)]), ('native', [str(native)])]:
         env = dict(os.environ, BOXLANG_HOME=str(work / 'home'), MATCHBOX_NATIVE_CACHE=str(work / f'cache-{label}'))

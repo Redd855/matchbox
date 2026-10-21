@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix="matchbox-jit-runner-") as directory:
         modules = ["--module", str(module)] if bundled else []
         for target, flags in [("bxb", ["--build"]), ("native", ["--target", "native"])]:
             output = work / f"{'module' if bundled else 'plain'}.{target}"
-            result = subprocess.run([str(cli), "--no-shaking", *modules, *flags, str(source), "--output", str(output)], cwd=work, env=env, capture_output=True, timeout=60)
+            result = subprocess.run([str(cli), "--no-shaking", *modules, *flags, "--output", str(output), str(source)], cwd=work, env=env, capture_output=True, timeout=60)
             assert result.returncode == 0, result.stderr
             outputs.append((target, output))
     source.unlink()

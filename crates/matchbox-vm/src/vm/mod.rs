@@ -44,10 +44,26 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 use std::vec;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn wait_until_instant(until: Instant) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let now = Instant::now();
+        if until > now {
+            std::thread::sleep(until - now);
+        }
+    }
+    // Browser WASM cannot park a thread; synchronous waits must poll the clock.
+    #[cfg(target_arch = "wasm32")]
+    while Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 fn browser_js_root() -> Option<JsValue> {
@@ -3823,7 +3839,7 @@ impl VM {
     }
 
     #[cfg(feature = "debugger")]
-    pub fn debug_get_value_json(&self, path: &str) -> Result<serde_json::Value> {
+    pub fn debug_get_value_json(&mut self, path: &str) -> Result<serde_json::Value> {
         let mut parts = path.split('.');
         let root = parts
             .next()
@@ -3833,27 +3849,23 @@ impl VM {
         }
 
         let fiber_idx = self.current_fiber_idx.unwrap_or(0);
-        let fiber = self
-            .fibers
-            .get(fiber_idx)
-            .ok_or_else(|| anyhow::anyhow!("No active debug fiber"))?;
+        anyhow::ensure!(
+            self.fibers.get(fiber_idx).is_some_and(|fiber| !fiber.frames.is_empty()),
+            "No active debug frame"
+        );
         let first = parts
             .next()
             .ok_or_else(|| anyhow::anyhow!("Value path must include a variables member"))?;
-        let mut value = fiber
-            .variables
-            .borrow()
-            .get(&first.to_lowercase())
-            .copied()
-            .unwrap_or(BxValue::new_null());
+        let mut value = self.private_value(fiber_idx, "variables")
+            .unwrap_or_else(BxValue::new_null);
 
-        for part in parts {
+        for part in std::iter::once(first).chain(parts) {
             let Some(id) = value.as_gc_id() else {
                 return Ok(serde_json::Value::Null);
             };
             value = match self.heap.get(id) {
                 GcObject::Struct(_) => self.struct_get(id, part),
-                GcObject::NativeObject(obj) => obj.borrow().get_property(part),
+                GcObject::NativeObject(obj) => self.native_object_get(obj, part),
                 _ => BxValue::new_null(),
             };
         }
@@ -4064,13 +4076,10 @@ impl VM {
 
             if all_waiting && !self.fibers.is_empty() {
                 if let Some(until) = earliest_wait {
-                    let now = Instant::now();
-                    if until > now {
-                        std::thread::sleep(until - now);
-                    }
+                    wait_until_instant(until);
                 } else {
                     // Fallback if somehow all_waiting but no earliest_wait
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    wait_until_instant(Instant::now() + Duration::from_millis(1));
                 }
             }
 
@@ -4193,10 +4202,7 @@ impl VM {
             }
 
             if let Some(until) = self.fibers[fiber_idx].wait_until {
-                let now = Instant::now();
-                if until > now {
-                    std::thread::sleep(until - now);
-                }
+                wait_until_instant(until);
                 if fiber_idx < self.fibers.len() {
                     self.fibers[fiber_idx].wait_until = None;
                 }
@@ -9836,12 +9842,12 @@ pub fn _matchbox_invoke_callback(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-fn wasm_instance_prop_get(vm: &mut VM, base_val: BxValue, name: &str) -> BxValue {
+fn wasm_instance_prop_get(vm: &mut VM, base_val: BxValue, name: &str) -> Result<BxValue> {
     let Some(id) = base_val.as_gc_id() else {
-        return BxValue::new_null();
+        return Ok(BxValue::new_null());
     };
 
-    match vm.heap.get(id) {
+    Ok(match vm.heap.get(id) {
         GcObject::Struct(_) => vm.struct_get(id, name),
         GcObject::Instance(inst) => {
             let name_id = vm.interner.intern(name);
@@ -9852,13 +9858,17 @@ fn wasm_instance_prop_get(vm: &mut VM, base_val: BxValue, name: &str) -> BxValue
                     .unwrap_or_else(BxValue::new_null)
             } else if let Some(method) = vm.resolve_method(Rc::clone(&inst.class), name) {
                 BxValue::new_ptr(vm.heap.alloc(GcObject::CompiledFunction(method)))
+            } else if let Some(getter) = VM::accessor_method_name("get", name)
+                .filter(|getter| vm.instance_has_method(base_val, getter))
+            {
+                return vm.call_method_value(base_val, &getter, Vec::new());
             } else {
                 BxValue::new_null()
             }
         }
-        GcObject::NativeObject(obj) => obj.borrow().get_property(&name.to_lowercase()),
+        GcObject::NativeObject(obj) => vm.native_object_get(obj, &name.to_lowercase()),
         _ => BxValue::new_null(),
-    }
+    })
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -9881,8 +9891,15 @@ fn wasm_instance_keys(vm: &mut VM, base_val: BxValue) -> Vec<String> {
             loop {
                 let class_ref = current_class.borrow();
 
-                for (name, _) in &class_ref.methods {
+                for (name, method) in &class_ref.methods {
                     let lowered = name.to_lowercase();
+                    if let Some(property) = lowered.strip_prefix("get")
+                        .filter(|property| !property.is_empty() && method.params.is_empty())
+                    {
+                        if seen.insert(property.to_string()) {
+                            keys.push(property.to_string());
+                        }
+                    }
                     if seen.insert(lowered) {
                         keys.push(name.clone());
                     }
@@ -9922,10 +9939,20 @@ fn wasm_instance_keys(vm: &mut VM, base_val: BxValue) -> Vec<String> {
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-fn wasm_instance_prop_set(vm: &mut VM, base_val: BxValue, name: &str, val: BxValue) {
+fn wasm_instance_prop_set(vm: &mut VM, base_val: BxValue, name: &str, val: BxValue) -> Result<()> {
     let Some(id) = base_val.as_gc_id() else {
-        return;
+        return Ok(());
     };
+    if let GcObject::Instance(inst) = vm.heap.get(id) {
+        let field = vm.interner.get_id(name).and_then(|key| vm.shapes.get_index(inst.shape_id, key));
+        if field.is_none()
+            && let Some(setter) = VM::accessor_method_name("set", name)
+                .filter(|setter| vm.instance_has_method(base_val, setter))
+        {
+            vm.call_method_value(base_val, &setter, vec![val])?;
+            return Ok(());
+        }
+    }
 
     match vm.heap.get_mut(id) {
         GcObject::Struct(_) => vm.struct_set(id, name, val),
@@ -9943,6 +9970,7 @@ fn wasm_instance_prop_set(vm: &mut VM, base_val: BxValue, name: &str, val: BxVal
         GcObject::NativeObject(obj) => obj.borrow_mut().set_property(&name.to_lowercase(), val),
         _ => {}
     }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -9955,11 +9983,12 @@ pub fn _matchbox_pump_vm(vm_ptr: usize) -> Result<(), JsValue> {
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 #[wasm_bindgen]
-pub fn _matchbox_get_instance_prop(vm_ptr: usize, gc_id: u32, name: &str) -> JsValue {
+pub fn _matchbox_get_instance_prop(vm_ptr: usize, gc_id: u32, name: &str) -> Result<JsValue, JsValue> {
     let vm = unsafe { &mut *(vm_ptr as *mut VM) };
     let base_val = BxValue::new_ptr(gc_id as usize);
-    let val = wasm_instance_prop_get(vm, base_val, name);
-    vm.bx_to_js(&val)
+    let val = wasm_instance_prop_get(vm, base_val, name)
+        .map_err(|error| js_error_value(&error.to_string()))?;
+    Ok(vm.bx_to_js(&val))
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -9977,11 +10006,12 @@ pub fn _matchbox_get_instance_keys(vm_ptr: usize, gc_id: u32) -> js_sys::Array {
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 #[wasm_bindgen]
-pub fn _matchbox_set_instance_prop(vm_ptr: usize, gc_id: u32, name: &str, val: JsValue) {
+pub fn _matchbox_set_instance_prop(vm_ptr: usize, gc_id: u32, name: &str, val: JsValue) -> Result<(), JsValue> {
     let vm = unsafe { &mut *(vm_ptr as *mut VM) };
     let base_val = BxValue::new_ptr(gc_id as usize);
     let bx_val = vm.js_to_bx(val);
-    wasm_instance_prop_set(vm, base_val, name, bx_val);
+    wasm_instance_prop_set(vm, base_val, name, bx_val)
+        .map_err(|error| js_error_value(&error.to_string()))
 }
 
 #[cfg(test)]

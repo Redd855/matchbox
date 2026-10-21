@@ -1,3 +1,5 @@
+#![cfg(target_os = "wasi")]
+
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::sync::OnceLock;

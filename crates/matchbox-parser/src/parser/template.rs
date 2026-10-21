@@ -458,40 +458,42 @@ impl<'a> TemplateParser<'a> {
 
         if let (Some(from), Some(to)) = (attribute("from"), attribute("to")) {
             let index = variable("index").ok_or_else(|| anyhow::anyhow!("<bx:loop from/to> requires an index attribute"))?;
-            let from = number_literal(from);
-            let to = number_literal(to);
-            let step = attribute("step").map(number_literal);
-            let descending = matches!(&step, Some(Expression { kind: ExpressionKind::Literal(Literal::Number(n)), .. }) if *n < 0.0);
-            let step = step.unwrap_or_else(|| Expression::new(ExpressionKind::Literal(Literal::Number(1.0)), line));
-            let init = Statement::new(
-                StatementKind::Expression(Expression::new(
-                    ExpressionKind::Assignment { target: AssignmentTarget::Identifier(index.clone()), value: Box::new(from) },
-                    line,
-                )),
-                line,
+            // Unspellable local names keep nested loop state out of the template's variables.
+            let cursor = format!("@loop:{}:cursor", self.pos);
+            let limit = format!("@loop:{}:limit", self.pos);
+            let increment = format!("@loop:{}:step", self.pos);
+            let number = |value| Expression::new(ExpressionKind::Literal(Literal::Number(value)), line);
+            let binary = |left, operator: &str, right| Expression::new(
+                ExpressionKind::Binary { left: Box::new(left), operator: operator.into(), right: Box::new(right) }, line,
             );
-            let condition = Expression::new(
-                ExpressionKind::Binary {
-                    left: Box::new(ident(&index)),
-                    operator: if descending { ">=" } else { "<=" }.to_string(),
-                    right: Box::new(to),
-                },
-                line,
+            let condition = binary(
+                binary(binary(ident(&increment), ">", number(0.0)), "&&", binary(ident(&cursor), "<=", ident(&limit))),
+                "||",
+                binary(binary(ident(&increment), "<", number(0.0)), "&&", binary(ident(&cursor), ">=", ident(&limit))),
             );
-            let update = Expression::new(
-                ExpressionKind::Assignment {
-                    target: AssignmentTarget::Identifier(index.clone()),
-                    value: Box::new(Expression::new(
-                        ExpressionKind::Binary { left: Box::new(ident(&index)), operator: "+".to_string(), right: Box::new(step) },
-                        line,
-                    )),
-                },
-                line,
-            );
-            return Ok(Some(Statement::new(
-                StatementKind::ForClassic { init: Some(Box::new(init)), condition: Some(condition), update: Some(update), body },
-                line,
-            )));
+            let update = Expression::new(ExpressionKind::Assignment {
+                target: AssignmentTarget::Identifier(cursor.clone()),
+                value: Box::new(binary(ident(&cursor), "+", ident(&increment))),
+            }, line);
+            let mut loop_body = vec![Statement::new(StatementKind::Expression(Expression::new(
+                ExpressionKind::Assignment { target: AssignmentTarget::Identifier(index), value: Box::new(ident(&cursor)) }, line,
+            )), line)];
+            loop_body.extend(body);
+            let mut statements = vec![
+                Statement::new(StatementKind::VariableDecl { name: cursor, value: number_literal(from) }, line),
+                Statement::new(StatementKind::VariableDecl { name: limit, value: number_literal(to) }, line),
+                Statement::new(StatementKind::VariableDecl {
+                    name: increment,
+                    value: attribute("step").map(number_literal).unwrap_or_else(|| number(1.0)),
+                }, line),
+            ];
+            statements.push(Statement::new(StatementKind::ForClassic {
+                init: None, condition: Some(condition), update: Some(update), body: loop_body,
+            }, line));
+            return Ok(Some(Statement::new(StatementKind::If {
+                condition: Expression::new(ExpressionKind::Literal(Literal::Boolean(true)), line),
+                then_branch: statements, else_branch: None,
+            }, line)));
         }
 
         let collection = if let Some(array) = attribute("array").or_else(|| attribute("collection")) {

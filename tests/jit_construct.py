@@ -80,10 +80,10 @@ assert reboundOutput[13000].first == 13005;
         assert b'[JIT] executed constructing loop fn name=bxTextMap' in result.stderr, result.stderr
     check([str(cli),str(source)])
     binary=work/'mapping'
-    result=subprocess.run([str(cli),'--no-shaking','--target','native',str(source),'--output',str(binary)],cwd=work,env=env,capture_output=True,timeout=90)
+    result=subprocess.run([str(cli),'--no-shaking','--target','native','--output',str(binary),str(source)],cwd=work,env=env,capture_output=True,timeout=90)
     assert result.returncode==0,result.stderr
     bytecode=work/'mapping.bxb'
-    result=subprocess.run([str(cli),'--no-shaking','--build',str(source),'--output',str(bytecode)],cwd=work,env=env,capture_output=True,timeout=90)
+    result=subprocess.run([str(cli),'--no-shaking','--build','--output',str(bytecode),str(source)],cwd=work,env=env,capture_output=True,timeout=90)
     assert result.returncode==0,result.stderr
     source.unlink();env['MATCHBOX_NATIVE_CACHE']=str(work/'cache')
     check([str(cli),str(bytecode)])

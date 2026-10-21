@@ -107,8 +107,13 @@ pub enum StatementKind {
     },
     Return(Option<Expression>),
     Throw(Option<Expression>),
-    Continue,
-    Break,
+    Continue(Option<String>),
+    Break(Option<String>),
+    /// `label: for ( ... )`; `body` holds the single labeled loop.
+    Labeled {
+        label: String,
+        body: Vec<Statement>,
+    },
     Rethrow,
     Assert {
         condition: Expression,

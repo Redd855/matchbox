@@ -190,8 +190,8 @@ fn collect_esp32_unsupported_features_in_stmt(
 
     match &stmt.kind {
         StatementKind::Import { .. }
-        | StatementKind::Continue
-        | StatementKind::Break
+        | StatementKind::Continue(_)
+        | StatementKind::Break(_)
         | StatementKind::Rethrow
         | StatementKind::Not(_)
         | StatementKind::Include(_)
@@ -250,6 +250,15 @@ fn collect_esp32_unsupported_features_in_stmt(
             if let Some(update) = update {
                 collect_esp32_unsupported_features_in_expr(update, findings, embedded_web_enabled);
             }
+            for statement in body {
+                collect_esp32_unsupported_features_in_stmt(
+                    statement,
+                    findings,
+                    embedded_web_enabled,
+                );
+            }
+        }
+        StatementKind::Labeled { body, .. } => {
             for statement in body {
                 collect_esp32_unsupported_features_in_stmt(
                     statement,

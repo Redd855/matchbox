@@ -215,6 +215,7 @@ script_test!(vm_cache_bifs, "vm_cache_bifs.bxs");
 script_test!(vm_qoq_query_execute, "vm_qoq_query_execute.bxs");
 #[cfg(feature = "qoq")]
 script_test!(vm_qoq_join, "vm_qoq_join.bxs");
+script_test!(vm_encode_for_html, "vm_encode_for_html.bxs");
 
 #[test]
 #[cfg(feature = "bif-tui")]
@@ -913,6 +914,209 @@ fn test_module_loading() {
     }
 }
 
+const NESTED_SETTINGS_MODULE_CONFIG: &str = r##"class ModuleConfig {
+    function configure() {
+        hash = chr(35)
+        return {
+            "name": "nested",
+            "count": 42,
+            "ratio": 2.5,
+            "negative": -7,
+            "enabled": true,
+            "disabled": false,
+            "numericText": "42",
+            "nothing": null,
+            "database": {
+                "host": "localhost",
+                "port": 5432,
+                "options": { "ssl": true, "retries": [1, 2, 3] }
+            },
+            "tags": ["fast", "small"],
+            "servers": [
+                { "name": "a", "port": 1 },
+                { "name": "b", "port": 2 }
+            ],
+            "emptyStruct": {},
+            "emptyArray": [],
+            "nestedNulls": { "inner": null, "list": [null, "x"] },
+            "my key": "spaced",
+            "api-key": "hyphenated",
+            "nested keys": { "inner key": 1, "inner-key": 2 },
+            "quotes": "say ""hi""",
+            "backslashes": "C:\path\to\file \n",
+            "newline": "line1" & chr(10) & "line2",
+            "interpolation": hash & "now()" & hash,
+            ("key" & hash & "with" & hash & "hashes"): "hashed key"
+        }
+    }
+
+    function onLoad() {}
+
+    function onUnload() {}
+}
+"##;
+
+const NESTED_SETTINGS_CONSUMER: &str = r##"function check(condition, label) {
+    if (!condition) {
+        throw "nested settings check failed: " & label
+    }
+}
+
+hash = chr(35)
+s = getModuleSettings("nested-settings")
+
+// Flat values keep their types
+check(isString(s.name) && s.name == "nested", "name")
+check(!isString(s.count) && s.count == 42, "count")
+check(!isString(s.ratio) && s.ratio == 2.5, "ratio")
+check(!isString(s.negative) && s.negative == -7, "negative")
+check(!isString(s.enabled) && isBoolean(s.enabled) && s.enabled, "enabled")
+check(!isString(s.disabled) && isBoolean(s.disabled) && !s.disabled, "disabled")
+check(isString(s.numericText) && s.numericText == "42", "numericText")
+check(structKeyExists(s, "nothing") && isNull(s.nothing), "nothing")
+
+// Nested structs
+check(isStruct(s.database), "database is struct")
+check(s.database.host == "localhost", "database.host")
+check(!isString(s.database.port) && s.database.port == 5432, "database.port")
+check(isStruct(s.database.options) && s.database.options.ssl == true, "database.options.ssl")
+check(isArray(s.database.options.retries) && arrayLen(s.database.options.retries) == 3, "retries")
+check(s.database.options.retries[3] == 3, "retries[3]")
+
+// Arrays and arrays of structs
+check(isArray(s.tags) && arrayLen(s.tags) == 2, "tags is array")
+check(s.tags[1] == "fast" && s.tags[2] == "small", "tags values")
+check(isArray(s.servers) && arrayLen(s.servers) == 2, "servers is array")
+check(isStruct(s.servers[2]) && s.servers[2].name == "b" && s.servers[2].port == 2, "servers[2]")
+
+// Empty collections
+check(isStruct(s.emptyStruct) && structCount(s.emptyStruct) == 0, "emptyStruct")
+check(isArray(s.emptyArray) && arrayLen(s.emptyArray) == 0, "emptyArray")
+
+// Nulls inside nested collections
+check(structKeyExists(s.nestedNulls, "inner") && isNull(s.nestedNulls.inner), "nestedNulls.inner")
+check(arrayLen(s.nestedNulls.list) == 2 && isNull(s.nestedNulls.list[1]), "nestedNulls.list[1]")
+check(s.nestedNulls.list[2] == "x", "nestedNulls.list[2]")
+
+// Unusual keys
+check(s["my key"] == "spaced", "my key")
+check(s["api-key"] == "hyphenated", "api-key")
+check(s["nested keys"]["inner key"] == 1, "nested inner key")
+check(s["nested keys"]["inner-key"] == 2, "nested inner-key")
+check(s["key" & hash & "with" & hash & "hashes"] == "hashed key", "key with hashes")
+
+// Strings that need escaping survive unchanged
+check(s.quotes == "say ""hi""", "quotes")
+check(s.backslashes == "C:\path\to\file \n", "backslashes")
+check(s.newline == "line1" & chr(10) & "line2", "newline")
+check(s.interpolation == hash & "now()" & hash, "interpolation")
+
+// Unknown modules still return an empty struct
+check(isStruct(getModuleSettings("missing")) && structCount(getModuleSettings("missing")) == 0, "missing module")
+
+println("Nested module settings test passed!")
+"##;
+
+/// Create a temporary `nested-settings` module plus a consumer script that
+/// asserts on its settings. Returns (root, module_path, script_path).
+fn write_nested_settings_fixture(
+    label: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "matchbox-nested-settings-{}-{}-{}",
+        label,
+        std::process::id(),
+        nonce
+    ));
+    let module_path = root.join("nested-settings");
+    fs::create_dir_all(&module_path).unwrap();
+    fs::write(
+        module_path.join("ModuleConfig.bx"),
+        NESTED_SETTINGS_MODULE_CONFIG,
+    )
+    .unwrap();
+    let script_path = root.join("consumer.bxs");
+    fs::write(&script_path, NESTED_SETTINGS_CONSUMER).unwrap();
+    (root, module_path, script_path)
+}
+
+#[test]
+fn test_module_settings_nested_interpreted() {
+    let (root, module_path, script_path) = write_nested_settings_fixture("interpreted");
+
+    let result = process_file(
+        &script_path,
+        false,
+        None,
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        &[module_path],
+        false,
+        None,
+        false,
+        false,
+        false,
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    result.unwrap();
+}
+
+#[test]
+fn test_module_settings_nested_bytecode() {
+    let (root, module_path, script_path) = write_nested_settings_fixture("bytecode");
+    let out_path = root.join("consumer.bxb");
+
+    let build = process_file(
+        &script_path,
+        true,
+        None,
+        Vec::new(),
+        false,
+        false,
+        false,
+        Some(&out_path),
+        &[module_path.clone()],
+        false,
+        None,
+        false,
+        false,
+        false,
+    );
+
+    // Remove the module before running so the settings must come from the .bxb.
+    let _ = fs::remove_dir_all(&module_path);
+
+    let run = build.and_then(|_| {
+        process_file(
+            &out_path,
+            false,
+            None,
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            &[],
+            false,
+            None,
+            false,
+            false,
+            false,
+        )
+    });
+
+    let _ = fs::remove_dir_all(&root);
+    run.unwrap();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Datasource tests
 //
@@ -1107,6 +1311,12 @@ fn datasource_select() {
     run_ds_script("datasource_select.bxs");
 }
 
+#[test]
+#[cfg(feature = "bif-datasource")]
+fn sqlite_select() {
+    run_ds_script("sqlite_select.bxs");
+}
+
 /// Full table scan: users and products tables with type assertions.
 #[test]
 #[cfg(feature = "bif-datasource")]
@@ -1169,5 +1379,139 @@ fn test_native_math_module() {
         false,
     ) {
         panic!("Native math module test failed: {}", e);
+    }
+}
+
+
+// --eval: inline script execution (issue #47)
+
+mod eval_flag {
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn matchbox() -> Command {
+        Command::new(env!("CARGO_BIN_EXE_matchbox"))
+    }
+
+    fn eval(src: &str) -> std::process::Output {
+        matchbox().arg("--eval").arg(src).output().unwrap()
+    }
+
+    #[test]
+    fn arithmetic_prints_and_exits_zero() {
+        let out = eval("println(1 + 2);");
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
+    }
+
+    #[test]
+    fn short_flag_works() {
+        let out = matchbox().arg("-e").arg("println(\"hi\");").output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    }
+
+    #[test]
+    fn multiple_statements_and_udfs() {
+        let out = eval("function double(n) { return n * 2; } var x = 5; println(double(x));");
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "10");
+    }
+
+    #[test]
+    fn no_repl_prompt_and_no_artifacts() {
+        let dir = tempdir().unwrap();
+        let out = matchbox()
+            .current_dir(dir.path())
+            .arg("--eval")
+            .arg("println(1);")
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("bx>"));
+        assert!(!stdout.contains("REPL"));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "artifacts left behind");
+    }
+
+    #[test]
+    fn parse_error_reports_eval_source_on_stderr() {
+        let out = eval("function broken( {");
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("<eval>"), "missing <eval> marker in: {stderr}");
+    }
+
+    #[test]
+    fn runtime_error_exits_nonzero() {
+        let out = eval("thisFunctionDoesNotExistAnywhere();");
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+    }
+
+    #[test]
+    fn rejects_missing_empty_and_conflicting_input() {
+        assert!(!matchbox().arg("--eval").status().unwrap().success());
+        assert!(!eval("   ").status.success());
+
+        // File argument alongside --eval
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("x.bxs");
+        fs::write(&file, "println(1);\n").unwrap();
+        assert!(!matchbox()
+            .arg("--eval").arg("println(1);")
+            .arg(&file)
+            .status().unwrap().success());
+
+        for conflict in ["--build", "--serve", "--watch"] {
+            assert!(!matchbox()
+                .arg("--eval").arg("println(1);")
+                .arg(conflict)
+                .status().unwrap().success(),
+                "{conflict} was accepted");
+        }
+    }
+
+    #[test]
+    fn prelude_function_works() {
+        // arrayUnique is implemented in the BoxLang prelude, not as a native BIF.
+        let out = eval("println(arrayUnique([1, 1, 2]).len());");
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+    }
+
+    #[test]
+    fn compilation_error_exits_nonzero_and_names_eval() {
+        // Parses fine, but the compiler rejects `break` outside a loop.
+        let out = eval("break;");
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Compiler Error"), "unexpected stderr: {stderr}");
+        assert!(stderr.contains("<eval>"), "missing <eval> marker in: {stderr}");
+    }
+
+    #[test]
+    fn uncaught_runtime_error_reports_eval_location() {
+        let out = eval("throw(\"boom\");");
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("boom"), "unexpected stderr: {stderr}");
+        assert!(stderr.contains("<eval>"), "missing <eval> marker in: {stderr}");
+    }
+
+    #[test]
+    fn failures_leave_no_artifacts() {
+        let dir = tempdir().unwrap();
+        for src in ["function broken( {", "break;", "throw(\"boom\");"] {
+            let out = matchbox()
+                .current_dir(dir.path())
+                .arg("--eval")
+                .arg(src)
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "{src:?} unexpectedly succeeded");
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "artifacts left behind");
     }
 }

@@ -783,6 +783,10 @@ pub fn run() -> Result<()> {
         enable_logging();
     }
 
+    if let Some(idx) = args.iter().position(|a| a == "--eval" || a == "-e") {
+        return run_eval(&args, idx);
+    }
+
     let is_build = args.contains(&"--build".to_string());
     let mut is_flash = args.contains(&"--flash".to_string());
     let is_full_flash = args.contains(&"--full-flash".to_string());
@@ -980,6 +984,98 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// CLI flags that consume the argument immediately following them.
+const VALUE_FLAGS: &[&str] = &[
+    "--target", "--keep", "--output", "--module", "--chip", "--port", "--host", "--webroot",
+    "--check", "--eval", "-e",
+];
+
+/// Collect positional (non-flag) arguments, skipping values owned by a flag.
+fn positional_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') {
+            if VALUE_FLAGS.contains(&a.as_str()) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Execute inline BoxLang source supplied via `--eval <source>` / `-e <source>`.
+/// Compiles through the normal pipeline (prelude + tree-shaking) and runs
+/// in-process. Writes no temporary source or build artifacts and shows no REPL
+/// prompt. Diagnostics report the source location as `<eval>`.
+fn run_eval(args: &[String], flag_index: usize) -> Result<()> {
+    const EVAL_NAME: &str = "<eval>";
+
+    if args
+        .iter()
+        .enumerate()
+        .any(|(i, a)| i != flag_index && (a == "--eval" || a == "-e"))
+    {
+        bail!("--eval may only be specified once");
+    }
+
+    for flag in [
+        "--build", "--target", "--serve", "--watch", "--flash", "--full-flash", "--output",
+        "--check",
+    ] {
+        if args.iter().any(|a| a.as_str() == flag) {
+            bail!("{flag} cannot be combined with --eval");
+        }
+    }
+
+    let source = args.get(flag_index + 1).ok_or_else(|| {
+        anyhow::anyhow!("--eval requires inline source, e.g. matchbox --eval 'println(1 + 2);'")
+    })?;
+
+    if source.trim().is_empty() {
+        bail!("--eval was given empty source code");
+    }
+
+    let extras = positional_args(args);
+    if !extras.is_empty() {
+        bail!(
+            "--eval executes inline source; unexpected file argument '{}'",
+            extras[0]
+        );
+    }
+
+    let ast = parser::parse(source, Some(EVAL_NAME))
+        .map_err(|e| anyhow::anyhow!("{} {}", "Parse Error:".red().bold(), e))?;
+
+    let mut chunk = matchbox_compiler::compile_with_treeshaking(
+        EVAL_NAME,
+        &ast,
+        source,
+        Vec::new(),
+        args.contains(&"--no-shaking".to_string()),
+        args.contains(&"--no-std-lib".to_string()),
+        &[],
+        &[],
+    )
+    .map_err(|e| anyhow::anyhow!("Compiler Error in {}: {}", EVAL_NAME, e))?;
+
+    chunk.reconstruct_functions();
+
+    // Anything after the source string is passed through as script arguments.
+    let script_args = args
+        .get(flag_index + 2..)
+        .map(|rest| rest.to_vec())
+        .unwrap_or_default();
+
+    run_chunk_with_args(chunk, &[], script_args)
+}
+
 fn print_usage() {
     println!("Usage: matchbox [options] [file.bxs|file.bxb|directory]");
     println!("       matchbox esp32-doctor");
@@ -987,6 +1083,10 @@ fn print_usage() {
     println!("  -h, --help          Show this help message");
     println!("  -v, --version       Show version information");
     println!("  --verbose           Emit verbose build logging");
+    println!("  -e, --eval <source> Execute inline BoxLang source and exit");
+    println!("                      Example: matchbox --eval 'println(1 + 2);'");
+    println!("                      Supports multiple statements, UDFs, BIFs and prelude functions");
+    println!("                      Incompatible with file arguments, --build, --target, --serve, --check");
     println!("  --build             Compile to bytecode (.bxb)");
     println!("  --target <native>   Produce a standalone native binary");
     println!("  --target <wasi>     Produce a standalone WASI container binary");
@@ -1820,6 +1920,11 @@ fn register_datasources_from_config(project_dir: &Path) -> Result<()> {
                         })?;
                 matchbox_vm::datasource::registry::register(&name, Arc::new(driver));
             }
+            "sqlite" => {
+                let driver = matchbox_vm::datasource::drivers::sqlite::SqliteDriver::new(&config)
+                    .map_err(|e| anyhow::anyhow!("Failed to create datasource '{}': {}", name, e))?;
+                matchbox_vm::datasource::registry::register(&name, Arc::new(driver));
+            }
             other => {
                 eprintln!(
                     "Warning: datasource '{}' has unknown driver '{}', skipping.",
@@ -1841,7 +1946,6 @@ fn run_chunk_with_args(
     modules: &[modules::ModuleInfo],
     args: Vec<String>,
 ) -> Result<()> {
-
     let mut external_bifs = HashMap::new();
     #[allow(unused_mut)]
     let mut native_classes = HashMap::new();
@@ -3340,6 +3444,42 @@ fn watch_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_datasource_toml_registration_accepts_minimal_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("app.db");
+        let manifest = format!(
+            "[datasources.db]\ndriver = \"sqlite\"\ndatabase = \"{}\"\n",
+            db_path.display()
+        );
+        std::fs::write(tmp.path().join("matchbox.toml"), manifest).unwrap();
+
+        let configs = modules::read_datasource_configs(tmp.path()).unwrap();
+        let entry = configs.get("db").unwrap();
+        assert_eq!(entry.driver, "sqlite");
+        assert_eq!(entry.host, "localhost");
+        assert_eq!(entry.username, "");
+        assert_eq!(entry.password, "");
+
+        let config = matchbox_vm::datasource::traits::DatasourceConfig {
+            driver: entry.driver.clone(),
+            host: entry.host.clone(),
+            port: entry.port,
+            database: entry.database.clone(),
+            username: entry.username.clone(),
+            password: entry.password.clone(),
+            max_connections: entry.max_connections,
+        };
+        let driver = matchbox_vm::datasource::drivers::sqlite::SqliteDriver::new(&config).unwrap();
+        matchbox_vm::datasource::registry::register("db", std::sync::Arc::new(driver));
+
+        let result = matchbox_vm::datasource::registry::get("db").unwrap()
+            .execute("SELECT 1 AS val", &[])
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], matchbox_vm::datasource::traits::SqlValue::Int(1));
+    }
 
     #[test]
     fn esp32_validator_allows_route_and_middleware_registration() {

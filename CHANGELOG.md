@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **WASM time traps**: The VM scheduler and `getTickCount()` used `std::time` clocks, which panic on `wasm32-unknown-unknown` (`time not implemented on this platform`). Calls such as `sleep()`, `getTickCount()` and member functions like `[1,2,3].map(...)` trapped in browser builds. They now use `web_time`, which is `std::time` on native targets.
 - **WASM blocking waits**: the scheduler's idle wait (`run_all`, `run_fiber_to_completion`) called `std::thread::sleep`, which also panics on `wasm32-unknown-unknown`, so `run_boxlang( "sleep( 1000 ); 1" )` from a `--target js` build trapped. On `wasm32` the wait now polls the clock, as the cooperative `pump_until_blocked` path already did. Native builds still sleep the thread.
+### Added
+- **HTML Encoding**: Added `encodeForHTML()` and its `htmlEditFormat()` alias, matching BoxLang JVM output.
 
 ## [0.11.0] - 2026-10-02
 

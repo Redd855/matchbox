@@ -1,11 +1,12 @@
 use crate::types::{BxNativeFunction, BxNativeObject, BxVM, BxValue, Tracer};
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
+    DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone,
+    Timelike, Utc,
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,12 +91,12 @@ mod jni {
         Err("Java interoperability is not enabled in this build.".to_string())
     }
 }
+mod async_runtime;
 mod binary;
 mod cache;
 mod cli;
 mod conversion;
 mod crypto;
-mod async_runtime;
 #[cfg(feature = "bif-datasource")]
 mod datasource;
 mod fs;
@@ -106,15 +107,15 @@ mod list_query_extra;
 mod math_datetime;
 mod net;
 mod set;
+mod system;
 mod system_execute;
 mod system_output;
-mod system;
 mod toml;
 mod type_format;
 mod watcher;
+pub(crate) mod xml;
 mod yaml;
 mod zip;
-pub(crate) mod xml;
 
 pub fn register_all() -> HashMap<String, BxNativeFunction> {
     let mut bifs = HashMap::new();
@@ -127,33 +128,69 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
         "systemoutput".to_string(),
         system_output::system_output as BxNativeFunction,
     );
-    bifs.insert("boxannounce".to_string(), system::box_announce as BxNativeFunction);
+    bifs.insert(
+        "boxannounce".to_string(),
+        system::box_announce as BxNativeFunction,
+    );
     bifs.insert("boxast".to_string(), system::box_ast as BxNativeFunction);
     bifs.insert(
         "boxmodulereload".to_string(),
         system::box_module_reload as BxNativeFunction,
     );
     bifs.insert("trace".to_string(), system::trace as BxNativeFunction);
-    bifs.insert("writelog".to_string(), system::write_log as BxNativeFunction);
+    bifs.insert(
+        "writelog".to_string(),
+        system::write_log as BxNativeFunction,
+    );
     bifs.insert(
         "getfunctioncalledname".to_string(),
         system::get_function_called_name as BxNativeFunction,
     );
-    bifs.insert("getboxcontext".to_string(), system::get_box_context as BxNativeFunction);
+    bifs.insert(
+        "getboxcontext".to_string(),
+        system::get_box_context as BxNativeFunction,
+    );
     bifs.insert(
         "runthreadincontext".to_string(),
         system::run_thread_in_context as BxNativeFunction,
     );
     bifs.insert("lock".to_string(), system::lock as BxNativeFunction);
-    bifs.insert("getbasetagdata".to_string(), system::get_base_tag_data as BxNativeFunction);
-    bifs.insert("getbasetaglist".to_string(), system::get_base_tag_list as BxNativeFunction);
-    bifs.insert("getbasetemplatepath".to_string(), system::get_base_template_path as BxNativeFunction);
-    bifs.insert("getcurrenttemplatepath".to_string(), system::get_current_template_path as BxNativeFunction);
-    bifs.insert("getboxversioninfo".to_string(), system::get_box_version_info as BxNativeFunction);
-    bifs.insert("getcomponentlist".to_string(), system::get_component_list as BxNativeFunction);
-    bifs.insert("getfunctionlist".to_string(), system::get_function_list as BxNativeFunction);
-    bifs.insert("getmoduleinfo".to_string(), system::get_module_info as BxNativeFunction);
-    bifs.insert("getmodulelist".to_string(), system::get_module_list as BxNativeFunction);
+    bifs.insert(
+        "getbasetagdata".to_string(),
+        system::get_base_tag_data as BxNativeFunction,
+    );
+    bifs.insert(
+        "getbasetaglist".to_string(),
+        system::get_base_tag_list as BxNativeFunction,
+    );
+    bifs.insert(
+        "getbasetemplatepath".to_string(),
+        system::get_base_template_path as BxNativeFunction,
+    );
+    bifs.insert(
+        "getcurrenttemplatepath".to_string(),
+        system::get_current_template_path as BxNativeFunction,
+    );
+    bifs.insert(
+        "getboxversioninfo".to_string(),
+        system::get_box_version_info as BxNativeFunction,
+    );
+    bifs.insert(
+        "getcomponentlist".to_string(),
+        system::get_component_list as BxNativeFunction,
+    );
+    bifs.insert(
+        "getfunctionlist".to_string(),
+        system::get_function_list as BxNativeFunction,
+    );
+    bifs.insert(
+        "getmoduleinfo".to_string(),
+        system::get_module_info as BxNativeFunction,
+    );
+    bifs.insert(
+        "getmodulelist".to_string(),
+        system::get_module_list as BxNativeFunction,
+    );
     bifs.insert("invoke".to_string(), system::invoke as BxNativeFunction);
     bifs.insert(
         "urlencodedformat".to_string(),
@@ -198,7 +235,10 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     );
     bifs.insert("arraymap".to_string(), array_map as BxNativeFunction);
     bifs.insert("arraylen".to_string(), len as BxNativeFunction);
-    bifs.insert("arrayprepend".to_string(), array_prepend as BxNativeFunction);
+    bifs.insert(
+        "arrayprepend".to_string(),
+        array_prepend as BxNativeFunction,
+    );
     bifs.insert("arraynew".to_string(), array_new as BxNativeFunction);
     bifs.insert(
         "arrayissynchronized".to_string(),
@@ -299,27 +339,81 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     );
 
     // StringBuilder BIFs
-    bifs.insert("stringbuildernew".to_string(), string_builder_new_bif as BxNativeFunction);
-    bifs.insert("isstringbuilder".to_string(), is_string_builder_bif as BxNativeFunction);
-    bifs.insert("stringbuilderappend".to_string(), string_builder_append_bif as BxNativeFunction);
-    bifs.insert("stringbuilderclear".to_string(), string_builder_clear_bif as BxNativeFunction);
-    bifs.insert("stringbuildercontains".to_string(), string_builder_contains_bif as BxNativeFunction);
-    bifs.insert("stringbuilderdelete".to_string(), string_builder_delete_bif as BxNativeFunction);
-    bifs.insert("stringbuilderendswith".to_string(), string_builder_ends_with_bif as BxNativeFunction);
-    bifs.insert("stringbuilderfind".to_string(), string_builder_find_bif as BxNativeFunction);
-    bifs.insert("stringbuilderinsert".to_string(), string_builder_insert_bif as BxNativeFunction);
-    bifs.insert("stringbuilderleft".to_string(), string_builder_left_bif as BxNativeFunction);
-    bifs.insert("stringbuildermid".to_string(), string_builder_mid_bif as BxNativeFunction);
-    bifs.insert("stringbuilderprepend".to_string(), string_builder_prepend_bif as BxNativeFunction);
-    bifs.insert("stringbuilderreplace".to_string(), string_builder_replace_bif as BxNativeFunction);
-    bifs.insert("stringbuilderreverse".to_string(), string_builder_reverse_bif as BxNativeFunction);
-    bifs.insert("stringbuilderright".to_string(), string_builder_right_bif as BxNativeFunction);
-    bifs.insert("stringbuilderstartswith".to_string(), string_builder_starts_with_bif as BxNativeFunction);
-    bifs.insert("stringbuildertrim".to_string(), string_builder_trim_bif as BxNativeFunction);
+    bifs.insert(
+        "stringbuildernew".to_string(),
+        string_builder_new_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "isstringbuilder".to_string(),
+        is_string_builder_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderappend".to_string(),
+        string_builder_append_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderclear".to_string(),
+        string_builder_clear_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuildercontains".to_string(),
+        string_builder_contains_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderdelete".to_string(),
+        string_builder_delete_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderendswith".to_string(),
+        string_builder_ends_with_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderfind".to_string(),
+        string_builder_find_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderinsert".to_string(),
+        string_builder_insert_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderleft".to_string(),
+        string_builder_left_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuildermid".to_string(),
+        string_builder_mid_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderprepend".to_string(),
+        string_builder_prepend_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderreplace".to_string(),
+        string_builder_replace_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderreverse".to_string(),
+        string_builder_reverse_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderright".to_string(),
+        string_builder_right_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuilderstartswith".to_string(),
+        string_builder_starts_with_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "stringbuildertrim".to_string(),
+        string_builder_trim_bif as BxNativeFunction,
+    );
 
     // Core BIFs
     bifs.insert("len".to_string(), len as BxNativeFunction);
-    bifs.insert("getmetadata".to_string(), get_metadata_bif as BxNativeFunction);
+    bifs.insert(
+        "getmetadata".to_string(),
+        get_metadata_bif as BxNativeFunction,
+    );
     bifs.insert(
         "writeoutput".to_string(),
         write_output_bif as BxNativeFunction,
@@ -337,7 +431,10 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     bifs.insert("isnull".to_string(), is_null_bif as BxNativeFunction);
     bifs.insert("nullvalue".to_string(), null_value_bif as BxNativeFunction);
     bifs.insert("isnumeric".to_string(), is_numeric_bif as BxNativeFunction);
-    bifs.insert("lsisnumeric".to_string(), is_numeric_bif as BxNativeFunction);
+    bifs.insert(
+        "lsisnumeric".to_string(),
+        is_numeric_bif as BxNativeFunction,
+    );
     bifs.insert("isarray".to_string(), is_array_bif as BxNativeFunction);
     bifs.insert("isstruct".to_string(), is_struct_bif as BxNativeFunction);
     bifs.insert("isboolean".to_string(), is_boolean_bif as BxNativeFunction);
@@ -480,11 +577,23 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
     );
     bifs.insert("dateadd".to_string(), date_add as BxNativeFunction);
     bifs.insert("datediff".to_string(), date_diff as BxNativeFunction);
-    bifs.insert("toepochmillis".to_string(), to_epoch_millis as BxNativeFunction);
-    bifs.insert("timeformat".to_string(), time_format_bif as BxNativeFunction);
+    bifs.insert(
+        "toepochmillis".to_string(),
+        to_epoch_millis as BxNativeFunction,
+    );
+    bifs.insert(
+        "timeformat".to_string(),
+        time_format_bif as BxNativeFunction,
+    );
     bifs.insert("offset".to_string(), offset_bif as BxNativeFunction);
-    bifs.insert("gettimezone".to_string(), get_timezone_bif as BxNativeFunction);
-    bifs.insert("getnumericdate".to_string(), get_numeric_date_bif as BxNativeFunction);
+    bifs.insert(
+        "gettimezone".to_string(),
+        get_timezone_bif as BxNativeFunction,
+    );
+    bifs.insert(
+        "getnumericdate".to_string(),
+        get_numeric_date_bif as BxNativeFunction,
+    );
     bifs.insert("gettime".to_string(), get_time_bif as BxNativeFunction);
     bifs.insert(
         "dateformat".to_string(),
@@ -689,7 +798,10 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
             "createtempfile".to_string(),
             fs::create_temp_file as BxNativeFunction,
         );
-        bifs.insert("gettempfile".to_string(), fs::create_temp_file as BxNativeFunction);
+        bifs.insert(
+            "gettempfile".to_string(),
+            fs::create_temp_file as BxNativeFunction,
+        );
         bifs.insert(
             "directorycopy".to_string(),
             fs::directory_copy as BxNativeFunction,
@@ -988,10 +1100,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
 
 // --- Implementation ---
 
-fn preserve_single_quotes_bif(
-    _vm: &mut dyn BxVM,
-    args: &[BxValue],
-) -> Result<BxValue, String> {
+fn preserve_single_quotes_bif(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     args.first()
         .copied()
         .ok_or_else(|| "preserveSingleQuotes() expects a string argument".to_string())
@@ -1033,12 +1142,20 @@ impl BxNativeObject for StringBuilderObject {
                 self.value.clear();
                 Ok(self_value())
             }
-            "contains" => Ok(BxValue::new_bool(self.value.contains(&builder_arg_string(vm, args, 0)?))),
-            "containsnocase" => Ok(BxValue::new_bool(
-                self.value.to_lowercase().contains(&builder_arg_string(vm, args, 0)?.to_lowercase()),
+            "contains" => Ok(BxValue::new_bool(
+                self.value.contains(&builder_arg_string(vm, args, 0)?),
             )),
-            "startswith" => Ok(BxValue::new_bool(self.value.starts_with(&builder_arg_string(vm, args, 0)?))),
-            "endswith" => Ok(BxValue::new_bool(self.value.ends_with(&builder_arg_string(vm, args, 0)?))),
+            "containsnocase" => {
+                Ok(BxValue::new_bool(self.value.to_lowercase().contains(
+                    &builder_arg_string(vm, args, 0)?.to_lowercase(),
+                )))
+            }
+            "startswith" => Ok(BxValue::new_bool(
+                self.value.starts_with(&builder_arg_string(vm, args, 0)?),
+            )),
+            "endswith" => Ok(BxValue::new_bool(
+                self.value.ends_with(&builder_arg_string(vm, args, 0)?),
+            )),
             "find" | "findnocase" => {
                 let needle = builder_arg_string(vm, args, 0)?;
                 let (haystack, needle) = if name == "findnocase" {
@@ -1088,12 +1205,23 @@ impl BxNativeObject for StringBuilderObject {
                 self.value = self.value.trim().to_string();
                 Ok(self_value())
             }
-            "left" => Ok(BxValue::new_ptr(vm.string_new(builder_left(&self.value, builder_position(args, 0)?)))),
-            "right" => Ok(BxValue::new_ptr(vm.string_new(builder_right(&self.value, builder_position(args, 0)?)))),
+            "left" => Ok(BxValue::new_ptr(
+                vm.string_new(builder_left(&self.value, builder_position(args, 0)?)),
+            )),
+            "right" => Ok(BxValue::new_ptr(
+                vm.string_new(builder_right(&self.value, builder_position(args, 0)?)),
+            )),
             "mid" => {
                 let start = builder_position(args, 0)?;
-                let count = args.get(1).map(BxValue::as_number).map(|value| value as usize);
-                Ok(BxValue::new_ptr(vm.string_new(builder_mid(&self.value, start, count))))
+                let count = args
+                    .get(1)
+                    .map(BxValue::as_number)
+                    .map(|value| value as usize);
+                Ok(BxValue::new_ptr(vm.string_new(builder_mid(
+                    &self.value,
+                    start,
+                    count,
+                ))))
             }
             _ => Err(format!("StringBuilder method '{}' not found", name)),
         }
@@ -1116,7 +1244,10 @@ fn builder_position(args: &[BxValue], index: usize) -> Result<isize, String> {
 }
 
 fn char_to_byte_offset(value: &str, index: usize) -> usize {
-    value.char_indices().nth(index).map_or(value.len(), |(offset, _)| offset)
+    value
+        .char_indices()
+        .nth(index)
+        .map_or(value.len(), |(offset, _)| offset)
 }
 
 fn byte_to_char_count(value: &str) -> usize {
@@ -1134,7 +1265,12 @@ fn builder_replace_range(value: &str, start: isize, end: isize, replacement: &st
     let end = end.max(start as isize) as usize;
     let start_offset = char_to_byte_offset(value, start - 1);
     let end_offset = char_to_byte_offset(value, end);
-    format!("{}{}{}", &value[..start_offset], replacement, &value[end_offset..])
+    format!(
+        "{}{}{}",
+        &value[..start_offset],
+        replacement,
+        &value[end_offset..]
+    )
 }
 
 fn builder_left(value: &str, count: isize) -> String {
@@ -1172,12 +1308,20 @@ fn is_string_builder_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue,
         return Ok(BxValue::new_bool(false));
     };
     Ok(BxValue::new_bool(
-        vm.native_object_call_method(id, "__is_string_builder", &[]).is_ok(),
+        vm.native_object_call_method(id, "__is_string_builder", &[])
+            .is_ok(),
     ))
 }
 
-fn string_builder_call(vm: &mut dyn BxVM, args: &[BxValue], method: &str) -> Result<BxValue, String> {
-    let id = args.first().and_then(BxValue::as_gc_id).ok_or("Expected a StringBuilder")?;
+fn string_builder_call(
+    vm: &mut dyn BxVM,
+    args: &[BxValue],
+    method: &str,
+) -> Result<BxValue, String> {
+    let id = args
+        .first()
+        .and_then(BxValue::as_gc_id)
+        .ok_or("Expected a StringBuilder")?;
     vm.native_object_call_method(id, method, &args[1..])
 }
 
@@ -1927,9 +2071,7 @@ fn cast_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     let value = args[0];
     let type_name = vm.to_string(args[1]);
     match type_name.trim().to_ascii_lowercase().as_str() {
-        "string" if value.is_null() => {
-            Err("Could not cast null to type [string]".to_string())
-        }
+        "string" if value.is_null() => Err("Could not cast null to type [string]".to_string()),
         "numeric" | "number" if value.is_null() => Ok(BxValue::new_number(0.0)),
         "numeric" | "number" if value.is_bool() => Err(format!(
             "Could not cast object [{}] to type [{}]",
@@ -2719,7 +2861,9 @@ fn round(_vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args[0].is_number() {
         let precision = args.get(1).map_or(0, |value| value.as_number() as i32);
         let factor = 10_f64.powi(precision);
-        Ok(BxValue::new_number((args[0].as_number() * factor).round() / factor))
+        Ok(BxValue::new_number(
+            (args[0].as_number() * factor).round() / factor,
+        ))
     } else {
         Err("round() expects a number".to_string())
     }
@@ -2933,7 +3077,9 @@ fn len(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
         return Ok(BxValue::new_number(0.0));
     }
     if args[0].is_number() || args[0].is_int() {
-        return Ok(BxValue::new_number(vm.to_string(args[0]).chars().count() as f64));
+        return Ok(BxValue::new_number(
+            vm.to_string(args[0]).chars().count() as f64
+        ));
     }
     if let Some(id) = args[0].as_gc_id() {
         Ok(BxValue::new_number(vm.get_len(id) as f64))
@@ -3148,7 +3294,9 @@ fn array_new(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
         .map_err(|_| "Array dimension metadata lock poisoned".to_string())?
         .insert(key, dimensions);
     let arrays = UNSYNCHRONIZED_ARRAYS.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut arrays = arrays.lock().map_err(|_| "Array metadata lock poisoned".to_string())?;
+    let mut arrays = arrays
+        .lock()
+        .map_err(|_| "Array metadata lock poisoned".to_string())?;
     if args.len() > 1 && !args[1].as_bool() {
         arrays.insert(key);
     } else {
@@ -3157,10 +3305,7 @@ fn array_new(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     Ok(BxValue::new_ptr(id))
 }
 
-fn array_is_synchronized_bif(
-    vm: &mut dyn BxVM,
-    args: &[BxValue],
-) -> Result<BxValue, String> {
+fn array_is_synchronized_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.is_empty() || !vm.is_array_value(args[0]) {
         return Ok(BxValue::new_bool(true));
     }
@@ -3169,7 +3314,9 @@ fn array_is_synchronized_bif(
         .ok_or_else(|| "arrayIsSynchronized() expects an array".to_string())?;
     let key = (vm as *mut dyn BxVM as *mut () as usize, id);
     let arrays = UNSYNCHRONIZED_ARRAYS.get_or_init(|| Mutex::new(HashSet::new()));
-    let arrays = arrays.lock().map_err(|_| "Array metadata lock poisoned".to_string())?;
+    let arrays = arrays
+        .lock()
+        .map_err(|_| "Array metadata lock poisoned".to_string())?;
     Ok(BxValue::new_bool(!arrays.contains(&key)))
 }
 
@@ -3386,7 +3533,10 @@ fn is_bytes_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> 
 // --- Struct BIFs ---
 
 fn struct_new(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let options = args.iter().map(|value| vm.to_string(*value)).collect::<Vec<_>>();
+    let options = args
+        .iter()
+        .map(|value| vm.to_string(*value))
+        .collect::<Vec<_>>();
     Ok(BxValue::new_ptr(vm.struct_new_with_options(&options)))
 }
 
@@ -3425,7 +3575,9 @@ fn struct_update_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Str
 fn struct_get_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if args.len() == 1 {
         let path = vm.to_string(args[0]);
-        return Ok(vm.resolve_variable_path(&path).unwrap_or(BxValue::new_null()));
+        return Ok(vm
+            .resolve_variable_path(&path)
+            .unwrap_or(BxValue::new_null()));
     }
     if args.len() < 2 {
         return Err("structGet() expects 2 arguments: (struct, key)".to_string());
@@ -3708,12 +3860,7 @@ fn struct_to_sorted_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, 
     Ok(BxValue::new_ptr(new_id))
 }
 
-fn struct_key_translate_path(
-    vm: &mut dyn BxVM,
-    struct_id: usize,
-    parts: &[&str],
-    value: BxValue,
-) {
+fn struct_key_translate_path(vm: &mut dyn BxVM, struct_id: usize, parts: &[&str], value: BxValue) {
     if parts.len() == 1 {
         vm.struct_set(struct_id, parts[0], value);
         return;
@@ -3880,7 +4027,23 @@ pub(super) fn parse_timezone_offset(tz: Option<&str>) -> Option<FixedOffset> {
         "us/hawaii" | "pacific/honolulu" => -10 * 3600,
         _ => 0,
     };
-    if matches!(normalized.as_str(), "america/new_york" | "america/chicago" | "america/los_angeles" | "europe/zurich" | "europe/berlin" | "europe/london" | "asia/tokyo" | "australia/sydney" | "pst" | "mst" | "cst" | "est" | "us/hawaii" | "pacific/honolulu") {
+    if matches!(
+        normalized.as_str(),
+        "america/new_york"
+            | "america/chicago"
+            | "america/los_angeles"
+            | "europe/zurich"
+            | "europe/berlin"
+            | "europe/london"
+            | "asia/tokyo"
+            | "australia/sydney"
+            | "pst"
+            | "mst"
+            | "cst"
+            | "est"
+            | "us/hawaii"
+            | "pacific/honolulu"
+    ) {
         return FixedOffset::east_opt(named_offset);
     }
     if tz.is_empty()
@@ -4046,7 +4209,7 @@ pub(super) fn format_datetime(
         translate_datetime_format(alias.unwrap())
     };
 
-        let formatted = if let Some(offset) = parse_timezone_offset(tz) {
+    let formatted = if let Some(offset) = parse_timezone_offset(tz) {
         dt.with_timezone(&offset).format(&chrono_format).to_string()
     } else {
         dt.format(&chrono_format).to_string()
@@ -4132,22 +4295,68 @@ fn parse_named_month_datetime(input: &str, tz: Option<&str>) -> Option<DateTime<
     let cleaned = input.replace(',', "");
     let parts: Vec<&str> = cleaned.split_whitespace().collect();
     let months = [
-        "jan", "january", "feb", "february", "mar", "march", "apr", "april", "may", "jun", "june", "jul", "july", "aug", "august", "sep", "september", "oct", "october", "nov", "november", "dec", "december",
+        "jan",
+        "january",
+        "feb",
+        "february",
+        "mar",
+        "march",
+        "apr",
+        "april",
+        "may",
+        "jun",
+        "june",
+        "jul",
+        "july",
+        "aug",
+        "august",
+        "sep",
+        "september",
+        "oct",
+        "october",
+        "nov",
+        "november",
+        "dec",
+        "december",
     ];
-    let month_index = parts.iter().position(|part| months.iter().any(|month| part.eq_ignore_ascii_case(month)))?;
-    let month = months.iter().position(|month| month.eq_ignore_ascii_case(parts[month_index]))? as u32 / 2 + 1;
+    let month_index = parts
+        .iter()
+        .position(|part| months.iter().any(|month| part.eq_ignore_ascii_case(month)))?;
+    let month = months
+        .iter()
+        .position(|month| month.eq_ignore_ascii_case(parts[month_index]))? as u32
+        / 2
+        + 1;
     let day = parts[..month_index]
         .iter()
         .rev()
-        .find_map(|part| part.parse::<u32>().ok().filter(|day| (1..=31).contains(day)))
+        .find_map(|part| {
+            part.parse::<u32>()
+                .ok()
+                .filter(|day| (1..=31).contains(day))
+        })
         .or_else(|| parts.get(month_index + 1)?.parse::<u32>().ok())?;
-    let year = parts.iter().find_map(|part| part.parse::<i32>().ok().filter(|year| *year >= 1000))?;
-    let time = parts.iter().find(|part| part.matches(':').count() >= 1).copied()?;
+    let year = parts
+        .iter()
+        .find_map(|part| part.parse::<i32>().ok().filter(|year| *year >= 1000))?;
+    let time = parts
+        .iter()
+        .find(|part| part.matches(':').count() >= 1)
+        .copied()?;
     let time = NaiveTime::parse_from_str(time, "%H:%M:%S")
         .or_else(|_| NaiveTime::parse_from_str(time, "%H:%M"))
         .ok()?;
-    let timezone = parts.iter().find(|part| matches!(part.to_ascii_uppercase().as_str(), "UTC" | "GMT" | "CET" | "CEST" | "PST" | "PDT"));
-    if timezone.is_none() && parts.iter().any(|part| part.to_ascii_uppercase().starts_with("GMT")) {
+    let timezone = parts.iter().find(|part| {
+        matches!(
+            part.to_ascii_uppercase().as_str(),
+            "UTC" | "GMT" | "CET" | "CEST" | "PST" | "PDT"
+        )
+    });
+    if timezone.is_none()
+        && parts
+            .iter()
+            .any(|part| part.to_ascii_uppercase().starts_with("GMT"))
+    {
         return None;
     }
     let offset = match timezone.map(|value| value.to_ascii_uppercase()).as_deref() {
@@ -4159,7 +4368,10 @@ fn parse_named_month_datetime(input: &str, tz: Option<&str>) -> Option<DateTime<
         _ => parse_timezone_offset(tz),
     }?;
     let date = NaiveDate::from_ymd_opt(year, month, day)?.and_time(time);
-    offset.from_local_datetime(&date).single().map(|value| value.with_timezone(&Utc))
+    offset
+        .from_local_datetime(&date)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 pub(super) fn parse_datetime_input(
@@ -4185,9 +4397,14 @@ pub(super) fn parse_datetime_input(
         let value = &input[..paren];
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() == 6 && parts[4].contains(':') && parts[5].starts_with("GMT") {
-            let date = NaiveDate::parse_from_str(&format!("{} {} {}", parts[1], parts[2], parts[3]), "%b %d %Y");
+            let date = NaiveDate::parse_from_str(
+                &format!("{} {} {}", parts[1], parts[2], parts[3]),
+                "%b %d %Y",
+            );
             let time = NaiveTime::parse_from_str(parts[4], "%H:%M:%S");
-            if let (Ok(date), Ok(time), Some(offset)) = (date, time, parse_timezone_offset(Some(parts[5]))) {
+            if let (Ok(date), Ok(time), Some(offset)) =
+                (date, time, parse_timezone_offset(Some(parts[5])))
+            {
                 return Ok(offset
                     .from_local_datetime(&date.and_time(time))
                     .single()
@@ -4251,7 +4468,11 @@ pub(super) fn parse_datetime_input(
         "%m/%d/%Y %I:%M %p",
     ];
     let lower_input = input.to_ascii_lowercase();
-    if lower_input.ends_with(" am") || lower_input.ends_with(" pm") || lower_input.ends_with("am") || lower_input.ends_with("pm") {
+    if lower_input.ends_with(" am")
+        || lower_input.ends_with(" pm")
+        || lower_input.ends_with("am")
+        || lower_input.ends_with("pm")
+    {
         let is_pm = lower_input.ends_with("pm") || lower_input.ends_with(" pm");
         let core = input[..input.len() - if input.ends_with(' ') { 3 } else { 2 }].trim();
         let parts: Vec<&str> = core.split_whitespace().collect();
@@ -4259,7 +4480,14 @@ pub(super) fn parse_datetime_input(
             let date = if parts[0].contains('/') {
                 let values: Vec<&str> = parts[0].split('/').collect();
                 if values.len() == 3 {
-                    values[0].parse::<u32>().ok().and_then(|month| values[1].parse::<u32>().ok().and_then(|day| values[2].parse::<i32>().ok().and_then(|year| NaiveDate::from_ymd_opt(year, month, day))))
+                    values[0].parse::<u32>().ok().and_then(|month| {
+                        values[1].parse::<u32>().ok().and_then(|day| {
+                            values[2]
+                                .parse::<i32>()
+                                .ok()
+                                .and_then(|year| NaiveDate::from_ymd_opt(year, month, day))
+                        })
+                    })
                 } else {
                     None
                 }
@@ -4269,11 +4497,26 @@ pub(super) fn parse_datetime_input(
                     .ok()
             };
             let time_parts: Vec<&str> = parts[1].split(':').collect();
-            if let (Some(date), Some(hour), Some(minute)) = (date, time_parts.first().and_then(|v| v.parse::<u32>().ok()), time_parts.get(1).and_then(|v| v.parse::<u32>().ok())) {
-                let hour = if is_pm { if hour == 12 { 12 } else { hour + 12 } } else if hour == 12 { 0 } else { hour };
+            if let (Some(date), Some(hour), Some(minute)) = (
+                date,
+                time_parts.first().and_then(|v| v.parse::<u32>().ok()),
+                time_parts.get(1).and_then(|v| v.parse::<u32>().ok()),
+            ) {
+                let hour = if is_pm {
+                    if hour == 12 { 12 } else { hour + 12 }
+                } else if hour == 12 {
+                    0
+                } else {
+                    hour
+                };
                 if let Some(naive) = date.and_hms_opt(hour, minute, 0) {
-                    let offset = parse_timezone_offset(tz).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-                    return Ok(offset.from_local_datetime(&naive).single().unwrap().with_timezone(&Utc));
+                    let offset = parse_timezone_offset(tz)
+                        .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
+                    return Ok(offset
+                        .from_local_datetime(&naive)
+                        .single()
+                        .unwrap()
+                        .with_timezone(&Utc));
                 }
             }
         }
@@ -4282,20 +4525,42 @@ pub(super) fn parse_datetime_input(
         let parsed = NaiveDateTime::parse_from_str(input, pattern)
             .or_else(|_| NaiveDateTime::parse_from_str(&input.to_ascii_uppercase(), pattern));
         if let Ok(parsed) = parsed {
-            let offset = parse_timezone_offset(tz).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-            return Ok(offset.from_local_datetime(&parsed).single().unwrap().with_timezone(&Utc));
+            let offset =
+                parse_timezone_offset(tz).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
+            return Ok(offset
+                .from_local_datetime(&parsed)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc));
         }
     }
-    if let Some((month, year)) = input.split_once('/').and_then(|(month, year)| Some((month.parse::<u32>().ok()?, year.parse::<i32>().ok()?))) {
-        let date = NaiveDate::from_ymd_opt(year, month, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+    if let Some((month, year)) = input
+        .split_once('/')
+        .and_then(|(month, year)| Some((month.parse::<u32>().ok()?, year.parse::<i32>().ok()?)))
+    {
+        let date = NaiveDate::from_ymd_opt(year, month, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
         let offset = parse_timezone_offset(tz).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-        return Ok(offset.from_local_datetime(&date).single().unwrap().with_timezone(&Utc));
+        return Ok(offset
+            .from_local_datetime(&date)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc));
     }
     for pattern in ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
         if let Ok(parsed) = NaiveTime::parse_from_str(input, pattern) {
-            let date = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_time(parsed);
-            let offset = parse_timezone_offset(tz).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-            return Ok(offset.from_local_datetime(&date).single().unwrap().with_timezone(&Utc));
+            let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_time(parsed);
+            let offset =
+                parse_timezone_offset(tz).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
+            return Ok(offset
+                .from_local_datetime(&date)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc));
         }
     }
     for pattern in naive_patterns {
@@ -4351,7 +4616,9 @@ fn parse_date_value(vm: &dyn BxVM, value: BxValue) -> Result<DateTime<Utc>, Stri
             .timestamp_millis_opt(0)
             .single()
             .ok_or_else(|| "Invalid epoch".to_string())?;
-        return Ok(epoch + Duration::milliseconds((value.as_number() * 86_400_000.0).round() as i64));
+        return Ok(
+            epoch + Duration::milliseconds((value.as_number() * 86_400_000.0).round() as i64)
+        );
     }
     parse_datetime_input(&vm.to_string(value), None, None)
 }
@@ -4416,7 +4683,10 @@ fn date_diff_weekdays(left: DateTime<Utc>, right: DateTime<Utc>) -> i64 {
     let mut current = start;
     let mut weekdays = 0;
     while current < end {
-        if !matches!(current.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+        if !matches!(
+            current.weekday(),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        ) {
             weekdays += 1;
         }
         current += chrono::Duration::days(1);
@@ -4429,7 +4699,9 @@ fn now(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
     if let Some(timezone) = args.first().map(|value| vm.to_string(*value)) {
         parse_timezone_offset(Some(&timezone))
             .ok_or_else(|| format!("Unknown timezone '{}'", timezone))?;
-        return Ok(BxValue::new_ptr(vm.datetime_new_with_timezone(now, &timezone)));
+        return Ok(BxValue::new_ptr(
+            vm.datetime_new_with_timezone(now, &timezone),
+        ));
     }
     Ok(BxValue::new_ptr(vm.datetime_new(now)))
 }
@@ -4519,14 +4791,19 @@ fn date_diff(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
         "h" | "hour" | "hours" => right_dt.signed_duration_since(left_dt).num_hours() as f64,
         "n" | "minute" | "minutes" => right_dt.signed_duration_since(left_dt).num_minutes() as f64,
         "s" | "second" | "seconds" => right_dt.signed_duration_since(left_dt).num_seconds() as f64,
-        "l" | "millisecond" | "milliseconds" => right_dt.signed_duration_since(left_dt).num_milliseconds() as f64,
+        "l" | "millisecond" | "milliseconds" => {
+            right_dt.signed_duration_since(left_dt).num_milliseconds() as f64
+        }
         _ => return Err(format!("Unsupported date part '{}'", datepart)),
     };
     Ok(BxValue::new_number(diff))
 }
 
 fn to_epoch_millis(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let value = args.first().copied().ok_or_else(|| "toEpochMillis() expects a date".to_string())?;
+    let value = args
+        .first()
+        .copied()
+        .ok_or_else(|| "toEpochMillis() expects a date".to_string())?;
     let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
     Ok(BxValue::new_number(dt.timestamp_millis() as f64))
 }
@@ -4536,20 +4813,29 @@ fn time_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Strin
         return Err("timeFormat() expects at least 1 argument".to_string());
     }
     let value = args[0];
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
+    let format = args
+        .get(1)
+        .filter(|v| !v.is_null())
+        .map(|v| vm.to_string(*v));
     let tz = args
         .get(2)
         .filter(|v| !v.is_null())
         .map(|v| vm.to_string(*v))
         .or_else(|| vm.datetime_timezone(value))
-        .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
+        .or_else(|| {
+            vm.resolve_variable_path("__default_timezone")
+                .map(|v| vm.to_string(v))
+        });
     let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
     let formatted = format_datetime(dt, format.as_deref(), "hh:mm a", tz.as_deref())?;
     Ok(BxValue::new_ptr(vm.string_new(formatted)))
 }
 
 fn offset_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let date = args.first().copied().unwrap_or_else(|| BxValue::new_ptr(vm.string_new("1970-01-01T00:00:00Z".to_string())));
+    let date = args
+        .first()
+        .copied()
+        .unwrap_or_else(|| BxValue::new_ptr(vm.string_new("1970-01-01T00:00:00Z".to_string())));
     let timezone = args.get(1).copied();
     let mut forwarded = vec![BxValue::new_ptr(vm.string_new("offset".to_string())), date];
     if let Some(timezone) = timezone {
@@ -4559,8 +4845,14 @@ fn offset_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
 }
 
 fn get_timezone_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let date = args.first().copied().unwrap_or_else(|| BxValue::new_ptr(vm.string_new("1970-01-01T00:00:00Z".to_string())));
-    let mut forwarded = vec![BxValue::new_ptr(vm.string_new("gettimezone".to_string())), date];
+    let date = args
+        .first()
+        .copied()
+        .unwrap_or_else(|| BxValue::new_ptr(vm.string_new("1970-01-01T00:00:00Z".to_string())));
+    let mut forwarded = vec![
+        BxValue::new_ptr(vm.string_new("gettimezone".to_string())),
+        date,
+    ];
     if let Some(timezone) = args.get(1).copied() {
         forwarded.push(timezone);
     }
@@ -4568,13 +4860,22 @@ fn get_timezone_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Stri
 }
 
 fn get_numeric_date_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let date = args.first().copied().ok_or_else(|| "getNumericDate() expects a date".to_string())?;
-    let forwarded = [BxValue::new_ptr(vm.string_new("getnumericdate".to_string())), date];
+    let date = args
+        .first()
+        .copied()
+        .ok_or_else(|| "getNumericDate() expects a date".to_string())?;
+    let forwarded = [
+        BxValue::new_ptr(vm.string_new("getnumericdate".to_string())),
+        date,
+    ];
     math_datetime::time_units(vm, &forwarded)
 }
 
 fn get_time_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    let date = args.first().copied().ok_or_else(|| "getTime() expects a date".to_string())?;
+    let date = args
+        .first()
+        .copied()
+        .ok_or_else(|| "getTime() expects a date".to_string())?;
     let forwarded = [BxValue::new_ptr(vm.string_new("gettime".to_string())), date];
     math_datetime::time_units(vm, &forwarded)
 }
@@ -4584,17 +4885,30 @@ fn date_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Strin
         return Err("dateFormat() expects at least 1 argument".to_string());
     }
     let value = args[0];
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
+    let format = args
+        .get(1)
+        .filter(|v| !v.is_null())
+        .map(|v| vm.to_string(*v));
     let tz = args
         .get(2)
         .filter(|v| !v.is_null())
         .map(|v| vm.to_string(*v))
         .or_else(|| vm.datetime_timezone(value))
-        .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
+        .or_else(|| {
+            vm.resolve_variable_path("__default_timezone")
+                .map(|v| vm.to_string(v))
+        });
     let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
     let mut formatted = format_datetime(dt, format.as_deref(), "dd-MMM-yy", tz.as_deref())?;
-    if format.as_deref().is_some_and(|mask| mask.eq_ignore_ascii_case("mmmm")) {
-        if let Some(locale) = args.get(3).filter(|v| !v.is_null()).map(|v| vm.to_string(*v)) {
+    if format
+        .as_deref()
+        .is_some_and(|mask| mask.eq_ignore_ascii_case("mmmm"))
+    {
+        if let Some(locale) = args
+            .get(3)
+            .filter(|v| !v.is_null())
+            .map(|v| vm.to_string(*v))
+        {
             if locale.to_ascii_lowercase().starts_with("de") {
                 formatted = match formatted.as_str() {
                     "January" => "Januar",
@@ -4610,7 +4924,8 @@ fn date_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, Strin
                     "November" => "November",
                     "December" => "Dezember",
                     _ => formatted.as_str(),
-                }.to_string();
+                }
+                .to_string();
             }
         }
     }
@@ -4622,13 +4937,19 @@ fn date_time_format_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, 
         return Err("dateTimeFormat() expects at least 1 argument".to_string());
     }
     let value = args[0];
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
+    let format = args
+        .get(1)
+        .filter(|v| !v.is_null())
+        .map(|v| vm.to_string(*v));
     let tz = args
         .get(2)
         .filter(|v| !v.is_null())
         .map(|v| vm.to_string(*v))
         .or_else(|| vm.datetime_timezone(value))
-        .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
+        .or_else(|| {
+            vm.resolve_variable_path("__default_timezone")
+                .map(|v| vm.to_string(v))
+        });
     let dt = parse_datetime_input(&vm.to_string(value), None, None)?;
     let formatted = format_datetime(dt, format.as_deref(), "dd-MMM-yyyy HH:mm:ss", tz.as_deref())?;
     Ok(BxValue::new_ptr(vm.string_new(formatted)))
@@ -4639,44 +4960,100 @@ fn parse_date_time_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, S
         return Err("parseDateTime() expects at least 1 argument".to_string());
     }
     let value = vm.to_string(args[0]);
-    let format = args.get(1).filter(|v| !v.is_null()).map(|v| vm.to_string(*v));
+    let format = args
+        .get(1)
+        .filter(|v| !v.is_null())
+        .map(|v| vm.to_string(*v));
     let tz = args
         .get(2)
         .filter(|v| !v.is_null())
         .map(|v| vm.to_string(*v))
-        .or_else(|| vm.resolve_variable_path("__default_timezone").map(|v| vm.to_string(v)));
+        .or_else(|| {
+            vm.resolve_variable_path("__default_timezone")
+                .map(|v| vm.to_string(v))
+        });
     let locale = args
         .get(3)
         .filter(|v| !v.is_null())
         .map(|v| vm.to_string(*v))
-        .or_else(|| vm.resolve_variable_path("__default_locale").map(|v| vm.to_string(v)))
+        .or_else(|| {
+            vm.resolve_variable_path("__default_locale")
+                .map(|v| vm.to_string(v))
+        })
         .unwrap_or_else(|| "en_US".to_string());
     let locale_lower = locale.to_ascii_lowercase();
-    let dt = if format.is_none() && locale_lower.starts_with("es") && value.to_ascii_lowercase().contains(" de ") {
+    let dt = if format.is_none()
+        && locale_lower.starts_with("es")
+        && value.to_ascii_lowercase().contains(" de ")
+    {
         let words: Vec<&str> = value.split_whitespace().collect();
-        let month_names = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+        let month_names = [
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ];
         let month = words
             .get(2)
-            .and_then(|name| month_names.iter().position(|month| month.eq_ignore_ascii_case(name)))
+            .and_then(|name| {
+                month_names
+                    .iter()
+                    .position(|month| month.eq_ignore_ascii_case(name))
+            })
             .map(|month| month as u32 + 1)
             .ok_or_else(|| format!("Unable to parse date '{}'", value))?;
-        let day = words.first().and_then(|value| value.parse::<u32>().ok()).ok_or_else(|| format!("Unable to parse date '{}'", value))?;
-        let year = words.last().and_then(|value| value.parse::<i32>().ok()).ok_or_else(|| format!("Unable to parse date '{}'", value))?;
+        let day = words
+            .first()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| format!("Unable to parse date '{}'", value))?;
+        let year = words
+            .last()
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or_else(|| format!("Unable to parse date '{}'", value))?;
         datetime_from_parts(year, month, day, 0, 0, 0, 0, tz.as_deref())?
     } else if format.is_none() && locale_lower.starts_with("zh") && value.contains('年') {
-        let parts: Vec<&str> = value.split(['年', '月', '日']).filter(|part| !part.is_empty()).collect();
+        let parts: Vec<&str> = value
+            .split(['年', '月', '日'])
+            .filter(|part| !part.is_empty())
+            .collect();
         if parts.len() != 3 {
             return Err(format!("Unable to parse date '{}'", value));
         }
-        let year = parts[0].parse::<i32>().map_err(|_| format!("Unable to parse date '{}'", value))?;
-        let month = parts[1].parse::<u32>().map_err(|_| format!("Unable to parse date '{}'", value))?;
-        let day = parts[2].parse::<u32>().map_err(|_| format!("Unable to parse date '{}'", value))?;
+        let year = parts[0]
+            .parse::<i32>()
+            .map_err(|_| format!("Unable to parse date '{}'", value))?;
+        let month = parts[1]
+            .parse::<u32>()
+            .map_err(|_| format!("Unable to parse date '{}'", value))?;
+        let day = parts[2]
+            .parse::<u32>()
+            .map_err(|_| format!("Unable to parse date '{}'", value))?;
         datetime_from_parts(year, month, day, 0, 0, 0, 0, tz.as_deref())?
-    } else if format.is_none() && value.matches('/').count() == 2 && (locale_lower.starts_with("en_au") || locale_lower.starts_with("en_gb")) {
+    } else if format.is_none()
+        && value.matches('/').count() == 2
+        && (locale_lower.starts_with("en_au") || locale_lower.starts_with("en_gb"))
+    {
         let parts: Vec<&str> = value.split('/').collect();
-        let day = parts[0].trim().parse::<u32>().map_err(|_| format!("Unable to parse date '{}'", value))?;
-        let month = parts[1].trim().parse::<u32>().map_err(|_| format!("Unable to parse date '{}'", value))?;
-        let year = parts[2].trim().parse::<i32>().map_err(|_| format!("Unable to parse date '{}'", value))?;
+        let day = parts[0]
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("Unable to parse date '{}'", value))?;
+        let month = parts[1]
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("Unable to parse date '{}'", value))?;
+        let year = parts[2]
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| format!("Unable to parse date '{}'", value))?;
         datetime_from_parts(year, month, day, 0, 0, 0, 0, tz.as_deref())?
     } else {
         parse_datetime_input(&value, format.as_deref(), tz.as_deref())?
@@ -4778,7 +5155,10 @@ impl BxNativeObject for JavaClassPlaceholder {
         name: &str,
         _args: &[BxValue],
     ) -> Result<BxValue, String> {
-        Err(format!("Java class placeholder method '{}' not found", name))
+        Err(format!(
+            "Java class placeholder method '{}' not found",
+            name
+        ))
     }
 }
 
@@ -4817,7 +5197,9 @@ fn is_array_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> 
             return Ok(BxValue::new_bool(dimension == declared));
         }
     }
-    Ok(BxValue::new_bool(dimension > 0 && array_depth(vm, args[0]) == dimension))
+    Ok(BxValue::new_bool(
+        dimension > 0 && array_depth(vm, args[0]) == dimension,
+    ))
 }
 
 fn array_depth(vm: &dyn BxVM, value: BxValue) -> usize {
@@ -4911,7 +5293,9 @@ fn is_instance_of_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, St
         return Ok(BxValue::new_bool(false));
     }
     let type_name = vm.to_string(args[1]);
-    Ok(BxValue::new_bool(vm.value_matches_type_name(args[0], &type_name)))
+    Ok(BxValue::new_bool(
+        vm.value_matches_type_name(args[0], &type_name),
+    ))
 }
 
 fn is_numeric_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
@@ -4926,10 +5310,13 @@ fn is_numeric_bif(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String
         return Ok(BxValue::new_bool(false));
     }
     let mut s = vm.to_string(*val).trim().to_string();
-    if let Some(locale) = args.get(1).map(|value| vm.to_string(*value).to_ascii_lowercase()) {
+    if let Some(locale) = args
+        .get(1)
+        .map(|value| vm.to_string(*value).to_ascii_lowercase())
+    {
         let comma_decimal = [
-            "de_", "fr_", "it_", "es_", "pt_", "da_", "nl_", "el_", "tr_", "ru_", "pl_",
-            "cs_", "hu_",
+            "de_", "fr_", "it_", "es_", "pt_", "da_", "nl_", "el_", "tr_", "ru_", "pl_", "cs_",
+            "hu_",
         ]
         .iter()
         .any(|prefix| locale.starts_with(prefix));

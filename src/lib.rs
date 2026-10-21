@@ -1873,7 +1873,7 @@ fn process_file_with_args(
 
             match t {
                 "wasi" => produce_wasi_binary(&chunk, source_path, output)?,
-                "wasm" => produce_wasm_binary(&chunk, source_path, output)?,
+                "wasm" => produce_wasi_binary(&chunk, source_path, output)?,
                 "js" => browser::packaging::produce_js_bundle(&chunk, source_path, &ast, output)?,
                 "esp32" => {
                     let esp32_config = read_esp32_box_config(&cwd)?;
@@ -2975,29 +2975,6 @@ fn patch_wasi_http_runner_payload(wasm_bytes: &mut [u8], payload_bytes: &[u8]) -
     wasm_bytes[len_offset..len_offset + 4]
         .copy_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
     wasm_bytes[data_offset..end].copy_from_slice(payload_bytes);
-    Ok(())
-}
-
-fn produce_wasm_binary(chunk: &Chunk, source_path: &Path, output: Option<&Path>) -> Result<()> {
-    let wasm_bytes = stubs::get_stub("wasi")?.to_vec();
-    let chunk_bytes = postcard::to_stdvec(chunk)?;
-
-    let mut out_bytes = wasm_bytes;
-    use wasm_encoder::Encode;
-    let custom_section = wasm_encoder::CustomSection {
-        name: "boxlang_bytecode".into(),
-        data: (&chunk_bytes).into(),
-    };
-    let mut section_bytes = Vec::new();
-    custom_section.encode(&mut section_bytes);
-    out_bytes.extend_from_slice(&section_bytes);
-
-    let out_path = output
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| source_path.with_extension("wasm"));
-    fs::write(&out_path, out_bytes)?;
-
-    println!("WASM binary produced: {}", out_path.display());
     Ok(())
 }
 

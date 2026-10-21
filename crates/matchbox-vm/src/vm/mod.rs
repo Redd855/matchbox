@@ -29,7 +29,8 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 use std::vec;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -3517,13 +3518,10 @@ impl VM {
 
             if all_waiting && !self.fibers.is_empty() {
                 if let Some(until) = earliest_wait {
-                    let now = Instant::now();
-                    if until > now {
-                        std::thread::sleep(until - now);
-                    }
+                    wait_until_instant(until);
                 } else {
                     // Fallback if somehow all_waiting but no earliest_wait
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    wait_until_instant(Instant::now() + std::time::Duration::from_millis(1));
                 }
             }
 
@@ -3598,10 +3596,7 @@ impl VM {
             }
 
             if let Some(until) = self.fibers[fiber_idx].wait_until {
-                let now = Instant::now();
-                if until > now {
-                    std::thread::sleep(until - now);
-                }
+                wait_until_instant(until);
                 if fiber_idx < self.fibers.len() {
                     self.fibers[fiber_idx].wait_until = None;
                 }
@@ -9124,5 +9119,40 @@ mod tests {
         assert_eq!(vm.config.initial_capacity, 128);
         assert_eq!(vm.config.initial_threshold, 256);
         assert_eq!(vm.heap.gc_threshold(), 256);
+    }
+}
+
+/// Wait until `until`. A browser (`wasm32`) cannot park a thread, and `std::thread::sleep` panics there, so on that
+/// target the wait polls the clock instead, as the cooperative `pump_until_blocked` path already does.
+fn wait_until_instant(until: Instant) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let now = Instant::now();
+        if until > now {
+            std::thread::sleep(until - now);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    while Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    #[test]
+    fn wait_until_instant_waits_at_least_the_requested_time() {
+        let start = Instant::now();
+        wait_until_instant(start + std::time::Duration::from_millis(30));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    fn wait_until_instant_returns_immediately_for_a_past_deadline() {
+        let start = Instant::now();
+        wait_until_instant(start);
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
     }
 }

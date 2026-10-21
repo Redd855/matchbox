@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **HTML Encoding**: Added `encodeForHTML()` and its `htmlEditFormat()` alias, matching BoxLang JVM output.
+- **SQLite Datasources**: Register SQLite databases programmatically or through minimal `matchbox.toml` datasource configuration.
+- **Inline CLI Execution**: Execute source with `--eval` or `-e`, including prelude functions and source-located diagnostics.
+
 ### Changed
 - `dateFormat`, `timeFormat` and `dateTimeFormat` now mirror BoxLang's `DateTimeFormat` BIF: masks are Java `DateTimeFormatter` patterns (case sensitive, `mm` is minutes, `MM` is month, invalid letters and repeat counts raise Java's errors), with Java's default masks, named masks (`short`, `medium`, `long`, `full`, `iso`, `iso8601`, `odbc`, `javascript`, `epoch`, `epochms`), `timezone` and `locale` arguments and English, German, Spanish, French, Italian, Portuguese, Dutch, Russian, Japanese and Chinese locale text. Locales without bundled data fall back to `en_US`; named regions other than UTC/GMT use MatchBox's fixed-offset zone table (no tz database).
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- **WASM time traps**: The VM scheduler and `getTickCount()` now use `web_time` clocks; synchronous scheduler waits poll instead of calling unsupported `std::thread::sleep` in WASM builds.
 - `<bx:switch>` evaluates its `expression`, runs only the matching `<bx:case>` (no fall-through, `value` with `delimiters` matches any listed item) and `<bx:defaultcase>` only when nothing matches; text after the switch is kept (`#93`).
 - `super.method( args )` works in class methods: it calls the parent class implementation with `this` bound to the current instance, across any depth of inheritance and inside closures. Named arguments are not supported with `super`.
 - `new Child()` calls `init()` inherited from a parent class when `Child` defines none (the compiler only looked at the class itself).

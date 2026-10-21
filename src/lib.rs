@@ -843,12 +843,16 @@ pub fn run() -> Result<()> {
         let script_args = vec![all_args[0].clone()];
         #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
-        let result = run_inline_code(code, cli.no_shaking, cli.no_std_lib, script_args);
+        let result = run_inline_code("inline", code, cli.no_shaking, cli.no_std_lib, script_args);
         #[cfg(not(target_arch = "wasm32"))]
         if cli.bx_debug {
             eprintln!("[matchbox] executed in {:?}", started.elapsed());
         }
         return result;
+    }
+
+    if let Some(code) = &cli.eval {
+        return run_inline_code("<eval>", code, cli.no_shaking, cli.no_std_lib, vec![all_args[0].clone()]);
     }
 
     let is_build = cli.build;
@@ -1016,6 +1020,7 @@ struct CliOptions {
     bx_config: Option<String>,
     bx_home: Option<String>,
     bx_code: Option<String>,
+    eval: Option<String>,
     bx_print_ast: bool,
     bx_transpile: bool,
 }
@@ -1068,6 +1073,13 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
                 );
                 break;
             }
+            "--eval" | "-e" => {
+                if cli.eval.is_some() { return Err("--eval may only be specified once".into()); }
+                i += 1;
+                let source = rest.get(i).ok_or("--eval requires inline source")?;
+                if source.trim().is_empty() { return Err("--eval was given empty source code".into()); }
+                cli.eval = Some(source.clone());
+            }
             "--verbose" => cli.verbose = true,
             "--build" => cli.build = true,
             "--flash" => cli.flash = true,
@@ -1105,8 +1117,13 @@ fn parse_cli(args: &[String]) -> std::result::Result<CliOptions, String> {
         }
         i += 1;
     }
+    if cli.eval.is_some() && (cli.file.is_some() || cli.bx_code.is_some() || cli.bx_print_ast
+        || cli.build || cli.target.is_some() || cli.serve || cli.watch || cli.flash
+        || cli.full_flash || cli.output.is_some()) {
+        return Err("--eval cannot be combined with file arguments, --bx-code, --bx-printAST, --build, --target, --serve, --watch, --flash, --full-flash or --output".into());
+    }
     // Help and version are global only when nothing else is left (BoxLang: `cliArgs.size() == 1`).
-    if cli.bx_code.is_none() && cli.script_args.is_empty() {
+    if cli.bx_code.is_none() && cli.eval.is_none() && cli.script_args.is_empty() {
         match cli.file.as_deref().map(|f| f.to_ascii_lowercase()).as_deref() {
             Some("-h" | "--help") => {
                 cli.help = true;
@@ -1133,6 +1150,7 @@ fn usage_text() -> String {
     let _ = writeln!(out, "  --verbose           Emit verbose build logging");
     let _ = writeln!(out, "  --bx-debug          Enable debug mode (verbose logging and timing); honored anywhere, never passed to the script");
     let _ = writeln!(out, "  --bx-code <code>    Execute inline BoxLang code");
+    let _ = writeln!(out, "  -e, --eval <source> Execute inline BoxLang source (cannot combine with files or build/server options)");
     let _ = writeln!(out, "  --bx-printAST       Print the AST (JSON) of a file, --bx-code or stdin");
     let _ = writeln!(out, "  --bx-config <path>, --bx-home <path>, --bx-transpile");
     let _ = writeln!(out, "                      Accepted for BoxLang compatibility; not supported by MatchBox");
@@ -1325,11 +1343,11 @@ fn print_ast(cli: &CliOptions) -> Result<()> {
 }
 
 /// `--bx-code`: compile and run a source string like a script file.
-fn run_inline_code(code: &str, no_shaking: bool, no_std_lib: bool, cli_args: Vec<String>) -> Result<()> {
-    let ast = parser::parse(code, Some("inline"))
+fn run_inline_code(filename: &str, code: &str, no_shaking: bool, no_std_lib: bool, cli_args: Vec<String>) -> Result<()> {
+    let ast = parser::parse(code, Some(filename))
         .map_err(|e| anyhow::anyhow!("{} {}", "Parse Error:".red().bold(), e))?;
     let mut chunk = matchbox_compiler::compile_with_treeshaking(
-        "inline",
+        filename,
         &ast,
         code,
         Vec::new(),
@@ -1338,7 +1356,7 @@ fn run_inline_code(code: &str, no_shaking: bool, no_std_lib: bool, cli_args: Vec
         false,
         &[],
     )
-    .map_err(|e| anyhow::anyhow!("Compiler Error: {}", e))?;
+    .map_err(|e| anyhow::anyhow!("Compiler Error in {}: {}", filename, e))?;
     chunk.reconstruct_functions();
     run_chunk_with_args(chunk, &[], cli_args)
 }
@@ -2017,6 +2035,11 @@ fn register_datasources_from_config(project_dir: &Path) -> Result<()> {
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to create datasource '{}': {}", name, e)
                         })?;
+                matchbox_vm::datasource::registry::register(&name, Arc::new(driver));
+            }
+            "sqlite" => {
+                let driver = matchbox_vm::datasource::drivers::sqlite::SqliteDriver::new(&config)
+                    .map_err(|error| anyhow::anyhow!("Failed to create datasource '{}': {}", name, error))?;
                 matchbox_vm::datasource::registry::register(&name, Arc::new(driver));
             }
             other => {
@@ -3596,6 +3619,28 @@ fn watch_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "bif-datasource")]
+    fn sqlite_datasource_toml_registration_accepts_minimal_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = format!(
+            "[datasources.db]\ndriver = \"sqlite\"\ndatabase = {}\n",
+            toml::Value::String(tmp.path().join("app.db").to_string_lossy().into_owned())
+        );
+        fs::write(tmp.path().join("matchbox.toml"), manifest).unwrap();
+        let configs = modules::read_datasource_configs(tmp.path()).unwrap();
+        let entry = configs.get("db").unwrap();
+        assert_eq!(entry.driver, "sqlite");
+        assert_eq!(entry.host, "localhost");
+        assert_eq!(entry.username, "");
+        assert_eq!(entry.password, "");
+        register_datasources_from_config(tmp.path()).unwrap();
+        let result = matchbox_vm::datasource::registry::get("db").unwrap()
+            .execute("SELECT 1 AS val", &[]).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], matchbox_vm::datasource::traits::SqlValue::Int(1));
+    }
 
     #[test]
     fn native_manifest_dependencies_become_fusion_dependency_lines() {

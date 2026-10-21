@@ -23,10 +23,11 @@ fn run(args: &[&str]) -> (bool, String, String) {
 fn script_arguments_are_not_matchbox_options() {
     let file = script("args.bxs");
     let file = file.to_str().unwrap();
-    let (ok, out, _) = run(&[file, "-v", "--build", "-h"]);
+    let (ok, out, _) = run(&[file, "-v", "--build", "-h", "--eval", "-e"]);
     assert!(ok);
     assert!(!out.contains("matchbox version"), "{out}");
     assert!(out.contains(r#""v":true"#) && out.contains(r#""build":true"#) && out.contains(r#""h":true"#), "{out}");
+    assert!(out.contains(r#""eval":true"#) && out.contains(r#""e":true"#), "{out}");
     assert!(!PathBuf::from(file).with_extension("bxb").exists());
 }
 

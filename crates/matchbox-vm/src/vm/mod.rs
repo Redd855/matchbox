@@ -10019,6 +10019,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_until_instant_waits_at_least_the_requested_time() {
+        let start = Instant::now();
+        wait_until_instant(start + Duration::from_millis(30));
+        assert!(start.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn wait_until_instant_returns_immediately_for_a_past_deadline() {
+        let start = Instant::now();
+        wait_until_instant(start);
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
     fn runtime_error_out_of_memory_display() {
         let err = RuntimeError::OutOfMemory("Heap exhausted after GC".to_string());
         let display_str = format!("{}", err);

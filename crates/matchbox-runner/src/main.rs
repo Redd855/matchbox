@@ -138,8 +138,58 @@ mod wasm {
 // Native Entry Point (CLI)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// WASI embedded bytecode
+//
+// A WASI module cannot read its own file, so `matchbox --target wasi` patches the
+// bytecode into this region of the stub (see `produce_wasi_binary` in src/lib.rs).
+// Layout: [0..8] magic "BXLG\0\0\0\x01", [8..12] bytecode length (u32 LE), [12..] bytecode.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "wasi")]
+mod wasi_embed {
+    use super::*;
+
+    const EMBED_CAPACITY: usize = 1024 * 1024; // keep in sync with produce_wasi_binary
+
+    #[used]
+    #[no_mangle]
+    static mut BOXLANG_EMBED: [u8; EMBED_CAPACITY] = {
+        let mut arr = [0u8; EMBED_CAPACITY];
+        arr[0] = b'B';
+        arr[1] = b'X';
+        arr[2] = b'L';
+        arr[3] = b'G';
+        arr[7] = 1;
+        arr
+    };
+
+    /// The patched-in bytecode, or `None` for an unpatched stub.
+    pub fn load() -> Result<Option<Chunk>> {
+        // Safety: WASI modules run single-threaded and nothing writes to the region at run time.
+        let embed: &[u8] =
+            unsafe { std::slice::from_raw_parts((&raw const BOXLANG_EMBED) as *const u8, EMBED_CAPACITY) };
+        if embed[0..8] != [b'B', b'X', b'L', b'G', 0, 0, 0, 1] {
+            anyhow::bail!("BOXLANG_EMBED sentinel missing: the runner stub is corrupt");
+        }
+        let len = u32::from_le_bytes([embed[8], embed[9], embed[10], embed[11]]) as usize;
+        if len == 0 {
+            return Ok(None);
+        }
+        if 12 + len > EMBED_CAPACITY {
+            anyhow::bail!("Embedded bytecode length {} exceeds the embed capacity", len);
+        }
+        let mut chunk: Chunk = postcard::from_bytes(&embed[12..12 + len])?;
+        chunk.reconstruct_functions();
+        Ok(Some(chunk))
+    }
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn load_embedded_bytecode() -> Result<Chunk> {
+    #[cfg(target_os = "wasi")]
+    if let Some(chunk) = wasi_embed::load()? {
+        return Ok(chunk);
+    }
     let exe_path = std_env::current_exe()?;
     let bytes = fs::read(exe_path)?;
     

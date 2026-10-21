@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `createDateTime` and `createDate` accept every argument as optional, like BoxLang (`createDateTime( 2024, 3, 5, 14, 7, 9 )` works, no arguments returns now).
 
 ### Fixed
+- `<bx:switch>` evaluates its `expression`, runs only the matching `<bx:case>` (no fall-through, `value` with `delimiters` matches any listed item) and `<bx:defaultcase>` only when nothing matches; text after the switch is kept (`#93`).
 - `super.method( args )` works in class methods: it calls the parent class implementation with `this` bound to the current instance, across any depth of inheritance and inside closures. Named arguments are not supported with `super`.
 - `new Child()` calls `init()` inherited from a parent class when `Child` defines none (the compiler only looked at the class itself).
 - `--target wasi` works again: the WASI runner stub lost its embed region in an earlier refactor, so packaging always failed with "WASI stub is missing the BOXLANG_EMBED sentinel". `--target wasm` produced an invalid module (a custom section written without its header) that no runtime could load; it is now the same as `--target wasi`. The docs said `--target wasm` was browser oriented; use `--target js` for the browser.

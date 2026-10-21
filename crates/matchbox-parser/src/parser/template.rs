@@ -584,47 +584,68 @@ impl<'a> TemplateParser<'a> {
     fn parse_switch_tag(&mut self) -> Result<Option<Statement>> {
         // <bx:switch expression="#expr#"> <bx:case value="1">...</bx:case> <bx:defaultcase>...</bx:defaultcase> </bx:switch>
         let line = self.peek_line();
-        self.skip_to_close();
+        let (attributes, self_closing) = self.parse_tag_attributes(line)?;
+        let value = attributes
+            .iter()
+            .find(|(key, _)| key == "expression")
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| anyhow::anyhow!("<bx:switch> requires an expression attribute"))?;
         let mut cases = Vec::new();
         let mut default_case = None;
-        loop {
-            if self.peek_kind() == Some(TokenKind::ComponentName) {
-                let name = self.peek_lexeme().unwrap_or("");
-                if name == "case" {
+        while !self_closing {
+            match self.peek_kind() {
+                Some(TokenKind::ContentText) => {
+                    // Whitespace between the case tags is not output.
+                    let text = self.peek_lexeme().unwrap_or("");
+                    if !text.trim().is_empty() {
+                        anyhow::bail!("Only <bx:case> and <bx:defaultcase> are allowed inside <bx:switch>");
+                    }
                     self.pos += 1;
-                    // Read value attribute
-                    let mut val_text = String::new();
-                    loop {
-                        match self.peek_kind() {
-                            Some(TokenKind::ComponentClose) => { self.pos += 1; break; }
-                            _ => {
-                                if !val_text.is_empty() { val_text.push(' '); }
-                                val_text.push_str(&self.advance_lexeme().unwrap_or_default());
+                }
+                Some(TokenKind::ComponentName) if !self.is_closing_tag() => {
+                    let name = self.advance_lexeme().unwrap_or_default().to_ascii_lowercase();
+                    match name.as_str() {
+                        "case" => {
+                            let case_line = self.peek_line();
+                            let (case_attributes, _) = self.parse_tag_attributes(case_line)?;
+                            let mut body = self.parse_template_body(&["case"])?;
+                            self.skip_closing("case");
+                            // Template cases do not fall through.
+                            body.push(Statement::new(StatementKind::Break(None), case_line));
+                            let attribute = |key: &str| case_attributes.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+                            let value = attribute("value").ok_or_else(|| anyhow::anyhow!("<bx:case> requires a value attribute"))?;
+                            // value="a,b" with delimiters="," matches any of the listed values.
+                            let delimiters = attribute("delimiters").and_then(|d| literal_text(&d));
+                            match (delimiters, literal_text(&value)) {
+                                (Some(delimiters), Some(list)) => {
+                                    for item in list.split(|c| delimiters.contains(c)) {
+                                        let item = Expression::new(
+                                            ExpressionKind::Literal(Literal::String(vec![StringPart::Text(item.trim().to_string())])),
+                                            case_line,
+                                        );
+                                        cases.push(SwitchCase { value: number_literal(item), body: body.clone() });
+                                    }
+                                }
+                                _ => cases.push(SwitchCase { value: number_literal(value), body }),
                             }
                         }
-                    }
-                    let body = self.parse_template_body(&["case", "defaultcase", "switch"])?;
-                    if let Ok(stmts) = crate::parser::parse(&val_text, None) {
-                        if let Some(s) = stmts.into_iter().next() {
-                            if let StatementKind::Expression(val) = s.kind {
-                                cases.push(SwitchCase { value: val, body });
-                            }
+                        "defaultcase" => {
+                            let default_line = self.peek_line();
+                            self.parse_tag_attributes(default_line)?;
+                            default_case = Some(self.parse_template_body(&["defaultcase"])?);
+                            self.skip_closing("defaultcase");
                         }
+                        other => anyhow::bail!("Unexpected <bx:{other}> inside <bx:switch>"),
                     }
-                    continue;
                 }
-                if name == "defaultcase" {
-                    self.pos += 1;
-                    self.skip_to_close();
-                    default_case = Some(self.parse_template_body(&["switch"])?);
-                    break;
-                }
+                _ => break,
             }
-            break;
         }
-        self.skip_closing("switch");
+        if !self_closing {
+            self.skip_closing("switch");
+        }
         Ok(Some(Statement::new(StatementKind::Switch {
-            value: Expression::new(ExpressionKind::Literal(Literal::Null), line),
+            value: number_literal(value),
             cases, default_case,
         }, line)))
     }

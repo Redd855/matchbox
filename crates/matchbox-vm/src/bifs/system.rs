@@ -101,6 +101,16 @@ pub fn box_module_reload(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValu
     Err("Module hot reload is not supported; rebuild and restart the application".into())
 }
 
+/// `super.method( args )`, compiled as `__supercall( this, definingClass, method, args... )`.
+pub fn super_call(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    if args.len() < 3 {
+        return Err("super call requires this, the defining class and a method name".into());
+    }
+    let defining_class = vm.to_string(args[1]);
+    let method = vm.to_string(args[2]);
+    vm.call_super_method(args[0], &defining_class, &method, args[3..].to_vec())
+}
+
 pub fn lock(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
     Ok(BxValue::new_ptr(vm.string_new("bar".to_string())))
 }

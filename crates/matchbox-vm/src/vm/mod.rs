@@ -589,6 +589,39 @@ impl VM {
 }
 
 impl BxVM for VM {
+    fn call_super_method(&mut self, receiver: BxValue, defining_class: &str, name: &str, args: Vec<BxValue>) -> Result<BxValue, String> {
+        let id = receiver.as_gc_id().ok_or("super can only be used on a class instance")?;
+        let mut current = match self.heap.get(id) {
+            GcObject::Instance(instance) => Rc::clone(&instance.class),
+            _ => return Err("super can only be used on a class instance".into()),
+        };
+        // Find the class that wrote the calling method, then start from its parent.
+        let parent = loop {
+            let (is_defining, parent_name) = {
+                let class = current.borrow();
+                (class.name.eq_ignore_ascii_case(defining_class), class.extends.clone())
+            };
+            let parent_class = parent_name.and_then(|parent_name| match self.get_global(&parent_name).and_then(|v| v.as_gc_id()) {
+                Some(parent_id) => match self.heap.get(parent_id) {
+                    GcObject::Class(parent_class) => Some(Rc::clone(parent_class)),
+                    _ => None,
+                },
+                None => None,
+            });
+            if is_defining {
+                break parent_class.ok_or_else(|| format!("{defining_class} has no parent class, so super.{name}() cannot be called"))?;
+            }
+            current = parent_class.ok_or_else(|| format!("{defining_class} is not in the class chain of this instance"))?;
+        };
+        let method = self
+            .resolve_method(parent, name)
+            .ok_or_else(|| format!("Method {name} not found in the parent class of {defining_class}"))?;
+        let mut method = (*method).clone();
+        method.captured_receiver = Some(receiver);
+        let function = BxValue::new_ptr(self.heap.alloc(GcObject::CompiledFunction(Rc::new(method))));
+        self.call_function_value_named(function, args, None).map_err(|e| e.to_string())
+    }
+
     fn current_chunk(&self) -> Option<Rc<RefCell<crate::vm::chunk::Chunk>>> {
         if let Some(idx) = self.current_fiber_idx {
             self.fibers[idx].frames.last().map(|f| Rc::clone(&f.chunk))

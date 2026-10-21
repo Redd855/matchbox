@@ -1873,7 +1873,7 @@ fn process_file_with_args(
 
             match t {
                 "wasi" => produce_wasi_binary(&chunk, source_path, output)?,
-                "wasm" => produce_wasm_binary(&chunk, source_path, output)?,
+                "wasm" => produce_wasi_binary(&chunk, source_path, output)?,
                 "js" => browser::packaging::produce_js_bundle(&chunk, source_path, &ast, output)?,
                 "esp32" => {
                     let esp32_config = read_esp32_box_config(&cwd)?;
@@ -2295,6 +2295,11 @@ fn produce_fusion_artifact(
         format!("matchbox_vm = {{ path = \"{}\" }}", vm_path)
     };
 
+    let native_dep_lines = read_native_dependencies(
+        native_dir,
+        &["matchbox_vm", "postcard", "bincode", "anyhow", "fusion_build"],
+    )?;
+
     let wasm_extra_dependencies = if is_wasm {
         r#"
 wasm-bindgen = "0.2"
@@ -2322,6 +2327,7 @@ bincode = "1.3.3"
 anyhow = "1.0"
 {wasm_extra_dependencies}
 {extra_dep_lines}
+{native_dep_lines}
 "#
     );
 
@@ -2752,6 +2758,57 @@ impl BoxLangVM {
     Ok(())
 }
 
+/// The `[dependencies]` of `native/Cargo.toml` as lines for the generated fusion manifest.
+/// Relative `path` dependencies are resolved against the `native/` directory.
+fn read_native_dependencies(native_dir: &Path, reserved: &[&str]) -> Result<String> {
+    let manifest = native_dir.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Ok(String::new());
+    }
+    let table: toml::Table = fs::read_to_string(&manifest)?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid {}: {}", manifest.display(), e))?;
+    let Some(dependencies) = table.get("dependencies").and_then(|d| d.as_table()) else {
+        return Ok(String::new());
+    };
+    let mut lines = String::new();
+    for (name, spec) in dependencies {
+        if reserved.contains(&name.as_str()) {
+            bail!(
+                "{} declares `{}`, which the fusion build already provides",
+                manifest.display(),
+                name
+            );
+        }
+        let mut spec = spec.clone();
+        if let Some(path) = spec.get("path").and_then(|p| p.as_str()).map(PathBuf::from) {
+            if path.is_relative() {
+                let absolute = native_dir.join(path).to_string_lossy().replace('\\', "/");
+                spec.as_table_mut().unwrap().insert("path".into(), toml::Value::String(absolute));
+            }
+        }
+        lines.push_str(&format!("{} = {}\n", toml::Value::String(name.clone()), inline_toml(&spec)));
+    }
+    Ok(lines)
+}
+
+/// Render a TOML value on one line (dependency specs are strings or small tables).
+fn inline_toml(value: &toml::Value) -> String {
+    match value {
+        toml::Value::Table(table) => {
+            let fields: Vec<String> = table
+                .iter()
+                .map(|(key, value)| format!("{} = {}", toml::Value::String(key.clone()), inline_toml(value)))
+                .collect();
+            format!("{{ {} }}", fields.join(", "))
+        }
+        toml::Value::Array(items) => {
+            format!("[{}]", items.iter().map(inline_toml).collect::<Vec<_>>().join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Extract the `[package] name` value from a `Cargo.toml` file.
 fn read_crate_name(cargo_toml_path: &Path) -> Result<String> {
     let text = fs::read_to_string(cargo_toml_path)?;
@@ -2918,29 +2975,6 @@ fn patch_wasi_http_runner_payload(wasm_bytes: &mut [u8], payload_bytes: &[u8]) -
     wasm_bytes[len_offset..len_offset + 4]
         .copy_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
     wasm_bytes[data_offset..end].copy_from_slice(payload_bytes);
-    Ok(())
-}
-
-fn produce_wasm_binary(chunk: &Chunk, source_path: &Path, output: Option<&Path>) -> Result<()> {
-    let wasm_bytes = stubs::get_stub("wasi")?.to_vec();
-    let chunk_bytes = postcard::to_stdvec(chunk)?;
-
-    let mut out_bytes = wasm_bytes;
-    use wasm_encoder::Encode;
-    let custom_section = wasm_encoder::CustomSection {
-        name: "boxlang_bytecode".into(),
-        data: (&chunk_bytes).into(),
-    };
-    let mut section_bytes = Vec::new();
-    custom_section.encode(&mut section_bytes);
-    out_bytes.extend_from_slice(&section_bytes);
-
-    let out_path = output
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| source_path.with_extension("wasm"));
-    fs::write(&out_path, out_bytes)?;
-
-    println!("WASM binary produced: {}", out_path.display());
     Ok(())
 }
 
@@ -3562,6 +3596,42 @@ fn watch_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_manifest_dependencies_become_fusion_dependency_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "native"
+version = "0.1.0"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+helper = { path = "../helper" }
+"#,
+        )
+        .unwrap();
+        let lines = read_native_dependencies(dir.path(), &["matchbox_vm"]).unwrap();
+        assert!(lines.contains("\"base64\" = \"0.22\"\n"), "{lines}");
+        assert!(lines.contains("\"serde\" = { \"features\" = [\"derive\"], \"version\" = \"1\" }"), "{lines}");
+        let helper_path = dir.path().join("../helper").to_string_lossy().replace('\\', "/");
+        assert!(lines.contains(&format!("\"helper\" = {{ \"path\" = \"{helper_path}\" }}")), "{lines}");
+    }
+
+    #[test]
+    fn native_manifest_is_optional_and_cannot_redeclare_reserved_crates() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_native_dependencies(dir.path(), &["matchbox_vm"]).unwrap(), "");
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"native\"\n\n[dependencies]\nmatchbox_vm = \"1\"\n",
+        )
+        .unwrap();
+        let error = read_native_dependencies(dir.path(), &["matchbox_vm"]).unwrap_err();
+        assert!(error.to_string().contains("matchbox_vm"), "{error}");
+    }
 
     #[test]
     fn esp32_validator_allows_route_and_middleware_registration() {

@@ -116,6 +116,73 @@ mod yaml;
 mod zip;
 pub(crate) mod xml;
 
+
+/// Build feature that provides a BIF, for BIFs that are compiled out by default-off features.
+const GATED: &[(&str, &[&str])] = &[
+    ("bif-crypto", &[
+        "decrypt", "encrypt", "generatepbkdfkey", "generatesecretkey", "hash", "hash40",
+        "hmac",
+    ]),
+    ("bif-cli", &[
+        "cliclear", "cliconfirm", "cliexit", "cligetargs", "cliisterminal", "cliread",
+        "clireadkey", "clireadpassword", "cliselect", "exit",
+    ]),
+    ("bif-io", &[
+        "contractpath", "createtempdirectory", "createtempfile", "directorycopy", "directorycreate", "directorydelete",
+        "directoryexists", "directorylist", "directorymove", "directoryrename", "expandpath", "fileappend",
+        "fileclose", "filecopy", "filecreatesymlink", "filedelete", "fileexists", "filegetmimetype",
+        "fileinfo", "fileiseof", "filemove", "fileopen", "filepublishexclusive", "fileread",
+        "filereadline", "fileseek", "filesetaccessmode", "filesetattribute", "filesetexecutable", "filesetlastmodified",
+        "filewrite", "filewriteexclusive", "filewriteline", "getcanonicalpath", "getdirectoryfrompath", "getfileinfo",
+        "gettempdirectory", "gettempfile", "propertyfile",
+    ]),
+    ("bif-http", &[
+        "http",
+    ]),
+    ("bif-zip", &[
+        "compress", "extract", "iszipfile",
+    ]),
+    ("bif-datasource", &[
+        "datasourceregister", "datasourceunregister", "isintransaction", "iswithintransaction", "queryaddcolumn", "queryaddrow",
+        "queryappend", "queryclear", "querycolumnarray", "querycolumncount", "querycolumndata", "querycolumnexists",
+        "querycolumnlist", "querycurrentrow", "querydeletecolumn", "querydeleterow", "queryexecute", "querygetcell",
+        "querygetresult", "queryinsertat", "querykeyexists", "querynew", "queryprepend", "queryrecordcount",
+        "queryreverse", "queryrowdata", "queryrowswap", "querysetcell", "querysetrow", "queryslice",
+        "transactionbegin", "transactioncommit", "transactionrollback",
+    ]),
+];
+
+pub fn required_feature(name: &str) -> Option<&'static str> {
+    GATED
+        .iter()
+        .find(|(_, names)| names.contains(&name))
+        .map(|(feature, _)| *feature)
+}
+
+#[cfg(test)]
+mod gated_tests {
+    use super::*;
+
+    #[test]
+    fn gated_bifs_are_registered_when_their_feature_is_on() {
+        let bifs = register_all();
+        for (feature, names) in GATED {
+            let enabled = match *feature {
+                "bif-crypto" => cfg!(feature = "bif-crypto"),
+                "bif-cli" => cfg!(feature = "bif-cli"),
+                "bif-io" => cfg!(feature = "bif-io"),
+                "bif-http" => cfg!(feature = "bif-http"),
+                "bif-zip" => cfg!(feature = "bif-zip"),
+                "bif-datasource" => cfg!(feature = "bif-datasource"),
+                other => panic!("unknown feature {other}"),
+            };
+            for name in *names {
+                assert_eq!(bifs.contains_key(*name), enabled, "{name} ({feature})");
+            }
+        }
+    }
+}
+
 pub fn register_all() -> HashMap<String, BxNativeFunction> {
     let mut bifs = HashMap::new();
 
@@ -146,6 +213,7 @@ pub fn register_all() -> HashMap<String, BxNativeFunction> {
         system::run_thread_in_context as BxNativeFunction,
     );
     bifs.insert("lock".to_string(), system::lock as BxNativeFunction);
+    bifs.insert("__supercall".to_string(), system::super_call as BxNativeFunction);
     bifs.insert("getbasetagdata".to_string(), system::get_base_tag_data as BxNativeFunction);
     bifs.insert("getbasetaglist".to_string(), system::get_base_tag_list as BxNativeFunction);
     bifs.insert("getbasetemplatepath".to_string(), system::get_base_template_path as BxNativeFunction);

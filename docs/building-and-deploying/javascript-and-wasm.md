@@ -5,7 +5,7 @@ MatchBox can compile BoxLang for browser-oriented WebAssembly workflows. There a
 | Mode | Command | Use case |
 | :--- | :--- | :--- |
 | **JS Module (AOT)** | `--target js` | Ship a pre-compiled browser app/library as an ES module |
-| **WASM binary (AOT)** | `--target wasm` | Raw browser-oriented `.wasm` binary, bring your own loader |
+| **WASI binary (AOT)** | `--target wasm` / `--target wasi` | A `.wasm` module for WASI runtimes, not for browsers |
 | **Runtime (JIT-like)** | Build `pkg/` once, call `run_boxlang()` | Execute source strings at runtime in the browser |
 
 ---
@@ -80,24 +80,16 @@ A hosted playground that builds the runtime with default features off therefore 
 
 ---
 
-## Mode 2: Raw WASM Binary (AOT)
+## Mode 2: WASI Binary (AOT)
 
-Use `--target wasm` when you want the raw `.wasm` file and full control over how it is loaded in a browser-oriented environment.
+`--target wasm` (the same as `--target wasi`) produces a `.wasm` module built for WASI preview1 runtimes such as Wasmtime or Node's `node:wasi`. It is not a browser module: for the browser use Mode 1 (`--target js`) or Mode 3.
 
 ```bash
 matchbox --target wasm my_app.bxs
 # Produces: my_app.wasm
 ```
 
-Load it manually using the standard WebAssembly API:
-
-```js
-const response = await fetch('./my_app.wasm');
-const buffer   = await response.arrayBuffer();
-const module   = await WebAssembly.instantiate(buffer, importObject);
-```
-
-Refer to the [MDN WebAssembly docs](https://developer.mozilla.org/en-US/docs/WebAssembly) for the full instantiation API.
+See [WASM container deployment](wasm-container.md) for running it.
 
 ---
 

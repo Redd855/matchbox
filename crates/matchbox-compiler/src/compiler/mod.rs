@@ -1,4 +1,5 @@
 use crate::ast::{
+    Argument,
     ClassMember, Expression, ExpressionKind, FunctionBody,
     FunctionModifiers as AstFunctionModifiers, Literal, Statement, StatementKind, StringPart,
 };
@@ -30,6 +31,8 @@ pub struct Compiler {
     locals: Vec<Local>,
     scope_depth: i32,
     is_class: bool,
+    /// Name of the class whose method is being compiled, for `super.method()`.
+    class_name: Option<String>,
     imports: HashMap<String, String>, // Alias -> Full dotted path
     /// Module namespaces are resolved by the application VM, not by running descriptors here.
     pub runtime_module_classes: bool,
@@ -38,6 +41,9 @@ pub struct Compiler {
     continue_patches: Vec<Vec<usize>>,
     break_patches: Vec<Vec<usize>>,
     loop_locals: Vec<usize>,
+    // Parallel to break_patches: the label of each loop or switch, and whether it is a loop.
+    jump_targets: Vec<(Option<String>, bool)>,
+    pending_label: Option<String>,
     catch_exception_slots: Vec<usize>,
     class_methods: HashSet<String>, // Method names of the current class being compiled
     /// Directory to resolve unqualified source paths against (e.g. sibling interfaces).
@@ -60,6 +66,7 @@ impl Compiler {
             locals: Vec::new(),
             scope_depth: 0,
             is_class: false,
+            class_name: None,
             imports: HashMap::new(),
             runtime_module_classes: false,
             current_line: 0,
@@ -67,6 +74,8 @@ impl Compiler {
             continue_patches: Vec::new(),
             break_patches: Vec::new(),
             loop_locals: Vec::new(),
+            jump_targets: Vec::new(),
+            pending_label: None,
             catch_exception_slots: Vec::new(),
             class_methods: HashSet::new(),
             source_dir,
@@ -85,6 +94,7 @@ impl Compiler {
             locals: Vec::new(),
             scope_depth: 0,
             is_class: false,
+            class_name: None,
             imports: HashMap::new(),
             runtime_module_classes: false,
             current_line: 0,
@@ -92,6 +102,8 @@ impl Compiler {
             continue_patches: Vec::new(),
             break_patches: Vec::new(),
             loop_locals: Vec::new(),
+            jump_targets: Vec::new(),
+            pending_label: None,
             catch_exception_slots: Vec::new(),
             class_methods: HashSet::new(),
             source_dir,
@@ -110,6 +122,7 @@ impl Compiler {
     fn child_compiler(&self, chunk: Chunk) -> Self {
         let mut compiler = Self::with_chunk(chunk);
         compiler.source_dependencies = Arc::clone(&self.source_dependencies);
+        compiler.class_name = self.class_name.clone();
         compiler
     }
 
@@ -128,6 +141,30 @@ impl Compiler {
         }
         self.chunk.emit0(op::RETURN, self.current_line as u32);
         Ok(self.chunk.clone())
+    }
+
+    /// Index into `jump_targets` of the loop (or switch, for `break`) a jump leaves.
+    fn jump_target_index(&self, label: Option<&str>, loops_only: bool) -> Result<usize> {
+        let found = match label {
+            Some(name) => self
+                .jump_targets
+                .iter()
+                .rposition(|(l, is_loop)| l.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(name)) && *is_loop),
+            None => self.jump_targets.iter().rposition(|(_, is_loop)| *is_loop || !loops_only),
+        };
+        found.ok_or_else(|| match (label, loops_only) {
+            (Some(name), _) => anyhow::anyhow!("label '{name}' not found for enclosing loop"),
+            (None, true) => anyhow::anyhow!("'continue' used outside of a loop"),
+            (None, false) => anyhow::anyhow!("'break' used outside of a loop or switch"),
+        })
+    }
+
+    /// Pops the locals declared since the target loop or switch began.
+    fn emit_jump_out(&mut self, target: usize, line: u32) {
+        let target_local_count = self.loop_locals[target];
+        for _ in target_local_count..self.locals.len() {
+            self.chunk.emit0(op::POP, line);
+        }
     }
 
     fn compile_statement(&mut self, stmt: &Statement, is_last: bool) -> Result<()> {
@@ -276,6 +313,7 @@ impl Compiler {
                                 let mut method_compiler =
                                     self.child_compiler(self.chunk.new_sub_chunk());
                                 method_compiler.is_class = true;
+                                method_compiler.class_name = Some(name.clone());
                                 method_compiler.imports = self.imports.clone();
                                 method_compiler.runtime_module_classes = self.runtime_module_classes;
                                 method_compiler.source_dir = self.source_dir.clone();
@@ -341,6 +379,11 @@ impl Compiler {
                             let name_idx = setter_chunk
                                 .add_constant(Constant::String(BoxString::new(prop.as_str())));
                             setter_chunk.emit1(op::SET_PRIVATE, name_idx as u32, stmt.line as u32);
+                            setter_chunk.emit0(op::POP, stmt.line as u32);
+                            // BoxLang's generated setter returns the instance so calls can chain.
+                            let this_idx = setter_chunk
+                                .add_constant(Constant::String(BoxString::new("this")));
+                            setter_chunk.emit1(op::GET_PRIVATE, this_idx as u32, stmt.line as u32);
                             setter_chunk.emit0(op::RETURN, stmt.line as u32);
 
                             let func = BxCompiledFunction {
@@ -415,7 +458,10 @@ impl Compiler {
                     chunk: constructor_compiler.chunk,
                 };
 
-                let has_init = methods.keys().any(|n| n.eq_ignore_ascii_case("init"));
+                let has_init = methods.keys().any(|n| n.eq_ignore_ascii_case("init"))
+                    || extends
+                        .as_deref()
+                        .is_some_and(|parent| self.class_chain_has_init(parent, 0));
                 self.class_has_init_map
                     .insert(name.to_lowercase(), has_init);
 
@@ -500,6 +546,19 @@ impl Compiler {
                 }
                 Ok(())
             }
+            StatementKind::Component { name, body, .. } if name.eq_ignore_ascii_case("lock") => {
+                // The VM runs one thread, so a lock never contends: run the body in place.
+                let Some(body) = body else { bail!("The lock component requires a body") };
+                self.begin_scope();
+                for inner in body {
+                    self.compile_statement(inner, false)?;
+                }
+                self.end_scope();
+                Ok(())
+            }
+            StatementKind::Component { name, .. } if name.eq_ignore_ascii_case("thread") => {
+                bail!("The thread component is not supported yet in MatchBox")
+            }
             StatementKind::Component { name, attributes, body } => {
                 self.compile_component(name, attributes, body.as_deref(), stmt.line)
             }
@@ -528,54 +587,40 @@ impl Compiler {
                 self.chunk.emit0(op::THROW, stmt.line as u32);
                 Ok(())
             }
-            StatementKind::Continue => {
+            StatementKind::Continue(label) => {
                 if self.is_component_body && self.continue_patches.is_empty() {
                     self.compile_body_result(3, None, stmt.line)?;
                     self.chunk.emit0(op::RETURN, stmt.line);
                     return Ok(());
                 }
-                // Pop any locals added within the loop body
-                if let Some(target_local_count) = self.loop_locals.last() {
-                    let current_local_count = self.locals.len();
-                    if current_local_count > *target_local_count {
-                        for _ in 0..(current_local_count - *target_local_count) {
-                            self.chunk.emit0(op::POP, stmt.line as u32);
-                        }
-                    }
-                }
-
+                let target = self.jump_target_index(label.as_deref(), true)?;
+                self.emit_jump_out(target, stmt.line as u32);
                 let jump_idx = self.chunk.code.len();
                 self.chunk.emit1(op::JUMP, 0, stmt.line as u32);
-                if let Some(patches) = self.continue_patches.last_mut() {
-                    patches.push(jump_idx);
-                } else {
-                    bail!("'continue' used outside of a loop");
-                }
+                // continue_patches only has entries for loops, so skip switch targets.
+                let loop_pos = self.jump_targets[..=target].iter().filter(|(_, is_loop)| *is_loop).count() - 1;
+                self.continue_patches[loop_pos].push(jump_idx);
                 Ok(())
             }
-            StatementKind::Break => {
+            StatementKind::Break(label) => {
                 if self.is_component_body && self.break_patches.is_empty() {
                     self.compile_body_result(2, None, stmt.line)?;
                     self.chunk.emit0(op::RETURN, stmt.line);
                     return Ok(());
                 }
-                // Pop any locals added within the loop/switch body
-                if let Some(target_local_count) = self.loop_locals.last() {
-                    let current_local_count = self.locals.len();
-                    if current_local_count > *target_local_count {
-                        for _ in 0..(current_local_count - *target_local_count) {
-                            self.chunk.emit0(op::POP, stmt.line as u32);
-                        }
-                    }
-                }
-
+                let target = self.jump_target_index(label.as_deref(), false)?;
+                self.emit_jump_out(target, stmt.line as u32);
                 let jump_idx = self.chunk.code.len();
                 self.chunk.emit1(op::JUMP, 0, stmt.line as u32);
-                if let Some(patches) = self.break_patches.last_mut() {
-                    patches.push(jump_idx);
-                } else {
-                    bail!("'break' used outside of a loop or switch");
+                self.break_patches[target].push(jump_idx);
+                Ok(())
+            }
+            StatementKind::Labeled { label, body } => {
+                self.pending_label = Some(label.clone());
+                for inner in body {
+                    self.compile_statement(inner, false)?;
                 }
+                self.pending_label = None;
                 Ok(())
             }
             StatementKind::Rethrow => {
@@ -1038,6 +1083,7 @@ impl Compiler {
 
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1175,6 +1221,7 @@ impl Compiler {
 
                 // Patch any break jumps to land at the end of the loop
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1200,6 +1247,7 @@ impl Compiler {
                 self.begin_scope();
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1230,6 +1278,7 @@ impl Compiler {
 
                 // Patch any break jumps to land at the end of the loop
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1246,6 +1295,7 @@ impl Compiler {
                 self.begin_scope();
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1282,6 +1332,7 @@ impl Compiler {
 
                 // 7. Patch break jumps
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1302,6 +1353,7 @@ impl Compiler {
                 self.begin_scope();
                 // Not pushing continue_patches since 'continue' isn't for switch, only 'break'.
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((None, false));
                 self.loop_locals.push(self.locals.len());
 
                 let mut jump_to_bodies = Vec::new();
@@ -1372,6 +1424,7 @@ impl Compiler {
 
                 // 6. Patch breaks
                 let end_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = end_target - idx - 1;
@@ -1465,6 +1518,7 @@ impl Compiler {
 
                 self.continue_patches.push(Vec::new());
                 self.break_patches.push(Vec::new());
+                self.jump_targets.push((self.pending_label.take(), true));
                 self.loop_locals.push(self.locals.len());
                 for stmt in body {
                     self.compile_statement(stmt, false)?;
@@ -1504,6 +1558,7 @@ impl Compiler {
 
                 // Patch any break jumps to land at the end of the loop
                 let break_target = self.chunk.code.len();
+                self.jump_targets.pop();
                 if let Some(breaks) = self.break_patches.pop() {
                     for idx in breaks {
                         let offset = break_target - idx - 1;
@@ -1607,7 +1662,11 @@ impl Compiler {
                         class_has_init = cls
                             .methods
                             .iter()
-                            .any(|(n, _)| n.eq_ignore_ascii_case("init"));
+                            .any(|(n, _)| n.eq_ignore_ascii_case("init"))
+                            || cls
+                                .extends
+                                .as_deref()
+                                .is_some_and(|parent| self.class_chain_has_init(parent, 0));
                     }
                     let class_idx = self.chunk.add_constant(class_val);
                     self.chunk.emit1(op::CONSTANT, class_idx, expr.line);
@@ -1642,6 +1701,9 @@ impl Compiler {
                                 false
                             }
                         });
+                    }
+                    if !class_has_init {
+                        class_has_init = self.class_chain_has_init(&resolved_path, 0);
                     }
                     let class_idx = self
                         .chunk
@@ -2166,6 +2228,13 @@ impl Compiler {
                 Ok(())
             }
             ExpressionKind::FunctionCall { base, args } => {
+                if let ExpressionKind::MemberAccess { base: owner, member } = &base.kind {
+                    if matches!(&owner.kind, ExpressionKind::Identifier(id) if id.eq_ignore_ascii_case("super"))
+                        && self.resolve_local("super").is_none()
+                    {
+                        return self.compile_super_call(member, args, expr.line);
+                    }
+                }
                 if let ExpressionKind::Identifier(name) = &base.kind {
                     if self.resolve_local(name).is_none() {
                         if let Some(path) = self.imports.get(&name.to_ascii_lowercase()).filter(|path| path.to_ascii_lowercase().starts_with("java:") || self.is_runtime_module_class(path)).cloned() {
@@ -2750,6 +2819,51 @@ impl Compiler {
         None
     }
 
+    /// `super.method( args )`: run the parent's `method` with `this` bound to the current instance.
+    fn compile_super_call(&mut self, method: &str, args: &[Argument], line: u32) -> Result<()> {
+        let Some(class_name) = self.class_name.clone() else {
+            bail!("'super' can only be used inside a class method");
+        };
+        if args.iter().any(|arg| arg.name.is_some()) {
+            bail!("super.{method}() does not support named arguments");
+        }
+        self.compile_expression(&Expression::new(ExpressionKind::Identifier("__supercall".into()), line))?;
+        let this_idx = self.chunk.add_constant(Constant::String(BoxString::new("this")));
+        self.chunk.emit1(op::GET_PRIVATE, this_idx as u32, line);
+        let class_idx = self.chunk.add_constant(Constant::String(BoxString::new(class_name.as_str())));
+        self.chunk.emit1(op::CONSTANT, class_idx as u32, line);
+        let method_idx = self.chunk.add_constant(Constant::String(BoxString::new(method)));
+        self.chunk.emit1(op::CONSTANT, method_idx as u32, line);
+        for arg in args {
+            self.compile_expression(&arg.value)?;
+        }
+        self.chunk.emit1(op::CALL, (args.len() + 3) as u32, line);
+        Ok(())
+    }
+
+    /// Whether `class_name` or one of its ancestors defines `init()`, as far as the compiler can see.
+    fn class_chain_has_init(&mut self, class_name: &str, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if self
+            .class_has_init_map
+            .get(&class_name.to_lowercase())
+            .copied()
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let Ok(Some(class)) = self.find_class_constant(class_name) else {
+            return false;
+        };
+        class.methods.iter().any(|(n, _)| n.eq_ignore_ascii_case("init"))
+            || class
+                .extends
+                .as_deref()
+                .is_some_and(|parent| self.class_chain_has_init(parent, depth + 1))
+    }
+
     fn find_class_constant(&mut self, class_name: &str) -> Result<Option<BxClass>> {
         let lower_name = class_name.to_lowercase();
         for constant in &self.chunk.constants {
@@ -3271,6 +3385,12 @@ pub fn member_function_candidates(member: &str) -> Vec<String> {
         .iter()
         .map(|prefix| format!("{prefix}{member}"))
         .collect();
+    // Members whose BIF does not follow the `<type><member>` naming.
+    match member.as_str() {
+        "join" => candidates.push("arraytolist".to_string()),
+        "isdefined" => candidates.push("arrayindexexists".to_string()),
+        _ => {}
+    }
     candidates.push(member);
     candidates
 }
@@ -3371,7 +3491,8 @@ impl DependencyTracker {
                     self.track_expression(e);
                 }
             }
-            StatementKind::Break | StatementKind::Continue | StatementKind::Rethrow => {}
+            StatementKind::Labeled { body, .. } => self.track_statements(body),
+            StatementKind::Break(_) | StatementKind::Continue(_) | StatementKind::Rethrow => {}
             StatementKind::Assert { condition, message } => {
                 self.track_expression(condition);
                 if let Some(m) = message {

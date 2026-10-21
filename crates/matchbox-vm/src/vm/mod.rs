@@ -295,11 +295,14 @@ pub(crate) fn resolve_js_property(target: &JsValue, name: &str) -> JsValue {
 #[derive(Debug)]
 struct VariablesScopeProxy {
     variables: Rc<RefCell<HashMap<String, BxValue>>>,
+    /// Script-level `variables`: the VM globals are the real store (a bare `x` is `variables.x`).
+    script: bool,
 }
 
 impl BxNativeObject for VariablesScopeProxy {
     fn native_data(&self, kind: &str) -> Option<*mut std::ffi::c_void> {
-        (kind == "matchbox.variables_scope").then_some(self as *const Self as *mut std::ffi::c_void)
+        (kind == "matchbox.variables_scope" || (self.script && kind == "matchbox.script_variables"))
+            .then_some(self as *const Self as *mut std::ffi::c_void)
     }
 
     fn get_property(&self, name: &str) -> BxValue {
@@ -586,6 +589,39 @@ impl VM {
 }
 
 impl BxVM for VM {
+    fn call_super_method(&mut self, receiver: BxValue, defining_class: &str, name: &str, args: Vec<BxValue>) -> Result<BxValue, String> {
+        let id = receiver.as_gc_id().ok_or("super can only be used on a class instance")?;
+        let mut current = match self.heap.get(id) {
+            GcObject::Instance(instance) => Rc::clone(&instance.class),
+            _ => return Err("super can only be used on a class instance".into()),
+        };
+        // Find the class that wrote the calling method, then start from its parent.
+        let parent = loop {
+            let (is_defining, parent_name) = {
+                let class = current.borrow();
+                (class.name.eq_ignore_ascii_case(defining_class), class.extends.clone())
+            };
+            let parent_class = parent_name.and_then(|parent_name| match self.get_global(&parent_name).and_then(|v| v.as_gc_id()) {
+                Some(parent_id) => match self.heap.get(parent_id) {
+                    GcObject::Class(parent_class) => Some(Rc::clone(parent_class)),
+                    _ => None,
+                },
+                None => None,
+            });
+            if is_defining {
+                break parent_class.ok_or_else(|| format!("{defining_class} has no parent class, so super.{name}() cannot be called"))?;
+            }
+            current = parent_class.ok_or_else(|| format!("{defining_class} is not in the class chain of this instance"))?;
+        };
+        let method = self
+            .resolve_method(parent, name)
+            .ok_or_else(|| format!("Method {name} not found in the parent class of {defining_class}"))?;
+        let mut method = (*method).clone();
+        method.captured_receiver = Some(receiver);
+        let function = BxValue::new_ptr(self.heap.alloc(GcObject::CompiledFunction(Rc::new(method))));
+        self.call_function_value_named(function, args, None).map_err(|e| e.to_string())
+    }
+
     fn current_chunk(&self) -> Option<Rc<RefCell<crate::vm::chunk::Chunk>>> {
         if let Some(idx) = self.current_fiber_idx {
             self.fibers[idx].frames.last().map(|f| Rc::clone(&f.chunk))
@@ -1894,6 +1930,25 @@ impl BxVM for VM {
 }
 
 impl VM {
+    /// Property read on a native object. The script-level `variables` scope is the VM globals.
+    fn native_object_get(&self, object: &Rc<RefCell<dyn BxNativeObject>>, name: &str) -> BxValue {
+        if object.borrow().native_data("matchbox.script_variables").is_some() {
+            if let Some(value) = self.get_global(&name.to_lowercase()) {
+                return value;
+            }
+        }
+        object.borrow().get_property(name)
+    }
+
+    /// Property write on a native object; see `native_object_get`.
+    fn native_object_set(&mut self, object: &Rc<RefCell<dyn BxNativeObject>>, name: &str, value: BxValue) {
+        if object.borrow().native_data("matchbox.script_variables").is_some() {
+            self.insert_global(name.to_lowercase(), value);
+            return;
+        }
+        object.borrow_mut().set_property(name, value);
+    }
+
     /// Shared GET_PRIVATE resolution; JIT intrinsic guards must respect the same scopes.
     fn private_value(&mut self, fiber: usize, name: &str) -> Option<BxValue> {
         let mut found = self.function_scope_value(fiber, name);
@@ -1906,7 +1961,7 @@ impl VM {
             } else if let Some(id) = self.receiver_instance_gc_id(receiver) {
                 if name == "variables" {
                     if let GcObject::Instance(inst) = self.heap.get(id) {
-                        let proxy = VariablesScopeProxy { variables: Rc::clone(&inst.variables) };
+                        let proxy = VariablesScopeProxy { variables: Rc::clone(&inst.variables), script: false };
                         found = Some(BxValue::new_ptr(self.heap.alloc(
                             GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
                         )));
@@ -1920,7 +1975,7 @@ impl VM {
             }
         }
         if found.is_none() && !lambda && name == "variables" {
-            let proxy = VariablesScopeProxy { variables: Rc::clone(&self.fibers[fiber].variables) };
+            let proxy = VariablesScopeProxy { variables: Rc::clone(&self.fibers[fiber].variables), script: true };
             found = Some(BxValue::new_ptr(self.heap.alloc(
                 GcObject::NativeObject(Rc::new(RefCell::new(proxy))),
             )));
@@ -2778,6 +2833,8 @@ impl VM {
 
         let server_ptr = self.heap.alloc(GcObject::Struct(server_struct));
         self.insert_global("server".to_string(), BxValue::new_ptr(server_ptr));
+        // BoxLang's request context owns a `request` scope in CLI scripts too.
+        self.insert_empty_struct_global("request");
     }
 
     pub fn register_global_bif(&mut self, name: String, value: BxValue) {
@@ -2833,6 +2890,44 @@ impl VM {
         }
     }
 
+    /// One step of `for ( row in query )`: the row struct and the 1-based row number.
+    #[cfg(target_arch = "wasm32")]
+    fn query_iteration_step(
+        &mut self,
+        _collection: BxValue,
+        _cursor: usize,
+    ) -> Result<Option<(bool, Option<BxValue>, Option<BxValue>)>> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn query_iteration_step(
+        &mut self,
+        collection: BxValue,
+        cursor: usize,
+    ) -> Result<Option<(bool, Option<BxValue>, Option<BxValue>)>> {
+        let Some(id) = collection.as_gc_id() else { return Ok(None) };
+        if !matches!(self.heap.get_opt(id), Some(GcObject::NativeObject(_)))
+            || BxVM::native_object_query_columns(self, id).is_none()
+        {
+            return Ok(None);
+        }
+        let count = BxVM::native_object_call_method(self, id, "recordcount", &[])
+            .map_err(anyhow::Error::msg)?
+            .as_number() as usize;
+        if cursor >= count {
+            return Ok(Some((true, None, None)));
+        }
+        let row = BxVM::native_object_call_method(
+            self,
+            id,
+            "getrow",
+            &[BxValue::new_number((cursor + 1) as f64)],
+        )
+        .map_err(anyhow::Error::msg)?;
+        Ok(Some((false, Some(row), Some(BxValue::new_number(cursor as f64 + 1.0)))))
+    }
+
     fn resolve_member_method(&self, receiver: &BxValue, method_name: &str) -> Option<String> {
         let name = method_name.to_ascii_lowercase();
         if receiver.is_bool() {
@@ -2856,6 +2951,9 @@ impl VM {
                 "sgn" => Some("sgn".to_string()),
                 "sqr" => Some("sqr".to_string()),
                 "decimalformat" => Some("decimalformat".to_string()),
+                "max" => Some("max".to_string()),
+                "min" => Some("min".to_string()),
+                "formatbasen" => Some("formatbasen".to_string()),
                 "numberformat" => Some("numberformat".to_string()),
                 "currencyformat" => Some("currencyformat".to_string()),
                 "booleanformat" | "truefalseformat" => Some("booleanformat".to_string()),
@@ -2895,6 +2993,9 @@ impl VM {
                     "filter" => "arrayfilter",
                     "some" => "arraysome",
                     "none" => "arraynone",
+                    "findnocase" => "arrayfindnocase",
+                    "join" => "arraytolist",
+                    "isdefined" => "arrayindexexists",
                     _ => "",
                 };
                 if !bif.is_empty() {
@@ -3022,6 +3123,24 @@ impl VM {
                      "reduceright" => Some("stringreduceright".to_string()),
                      "some" => Some("stringsome".to_string()),
                      "sort" => Some("stringsort".to_string()),
+                    "listindexexists" => Some("listindexexists".to_string()),
+                    "listinsertat" => Some("listinsertat".to_string()),
+                    "listitemtrim" => Some("listitemtrim".to_string()),
+                    "listprepend" => Some("listprepend".to_string()),
+                    "listreduce" => Some("listreduce".to_string()),
+                    "listsetat" => Some("listsetat".to_string()),
+                    "listtoarray" => Some("listtoarray".to_string()),
+                    "listtrim" => Some("listcompact".to_string()),
+                    "jsondeserialize" => Some("deserializejson".to_string()),
+                    "jsonprettify" => Some("jsonprettify".to_string()),
+                    "inputbasen" => Some("inputbasen".to_string()),
+                    "tobase64" => Some("tobase64".to_string()),
+                    "tobinary" => Some("tobinary".to_string()),
+                    "yesnoformat" => Some("yesnoformat".to_string()),
+                    "parsedatetime" => Some("parsedatetime".to_string()),
+                    "stringreduceright" => Some("stringreduceright".to_string()),
+                    "stringsome" => Some("stringsome".to_string()),
+                    "stringsort" => Some("stringsort".to_string()),
                      _ => None,
                  },
                  GcObject::Array(_) => match name.as_str() {
@@ -3125,11 +3244,29 @@ impl VM {
                      "findkey" => Some("structfindkey".to_string()),
                      "keyset" => Some("structkeyset".to_string()),
                      "valueset" => Some("structvalueset".to_string()),
+                    "clear" => Some("structclear".to_string()),
+                    "copy" => Some("structcopy".to_string()),
+                    "delete" => Some("structdelete".to_string()),
+                    "every" => Some("structevery".to_string()),
+                    "filter" => Some("structfilter".to_string()),
+                    "findvalue" => Some("structfindvalue".to_string()),
+                    "hash" => Some("hash".to_string()),
+                    "insert" => Some("structinsert".to_string()),
+                    "keyarray" => Some("structkeyarray".to_string()),
+                    "keylist" => Some("structkeylist".to_string()),
+                    "map" => Some("structmap".to_string()),
+                    "none" => Some("structnone".to_string()),
+                    "reduce" => Some("structreduce".to_string()),
+                    "some" => Some("structsome".to_string()),
+                    "sort" => Some("structsort".to_string()),
+                    "update" => Some("structupdate".to_string()),
+                    "valuearray" => Some("structvaluearray".to_string()),
                     _ => None,
                 },
                 GcObject::Future(_) => match name.as_str() {
                     "onerror" => Some("futureonerror".to_string()),
                     "get" => Some("futureget".to_string()),
+                    "isdone" => Some("futureisdone".to_string()),
                     "completeexceptionally" => Some("futurecompleteexceptionally".to_string()),
                     "completeontimeout" => Some("futurecompleteontimeout".to_string()),
                     "joinordefault" => Some("futurejoinordefault".to_string()),
@@ -3156,6 +3293,7 @@ impl VM {
                      "toodbcdate" => Some("createodbcdate".to_string()),
                      "toodbctime" => Some("createodbctime".to_string()),
                      "toepochmillis" => Some("toepochmillis".to_string()),
+                     "hash" => Some("hash".to_string()),
                      "offset" => Some("offset".to_string()),
                      "timezone" | "gettimezone" => Some("gettimezone".to_string()),
                      "getnumericdate" => Some("getnumericdate".to_string()),
@@ -5867,7 +6005,8 @@ impl VM {
                                     flush_ip!(); self.throw_error(fiber_idx, "Native object is read-only")?;
                                     frame_changed = true; continue 'quantum;
                                 }
-                                object.borrow_mut().set_property(&index_string, val);
+                                let object = object.clone();
+                                self.native_object_set(&object, &index_string, val);
                                 self.fibers[fiber_idx].stack.push(val);
                             }
                             _ => {
@@ -6015,6 +6154,16 @@ impl VM {
                                     let name = self.interner.resolve(name_id).to_string();
                                     if let Ok(value) = self.method_reference(base_val, &name) {
                                         self.fibers[fiber_idx].stack.push(value);
+                                    } else if let Some(getter) = Self::accessor_method_name("get", &name)
+                                        .filter(|getter| self.instance_has_method(base_val, getter))
+                                    {
+                                        // BoxLang invokeImplicitAccessor: `obj.name` calls `getName()`.
+                                        flush_ip!();
+                                        match self.call_method_value(base_val, &getter, Vec::new()) {
+                                            Ok(value) => self.fibers[fiber_idx].stack.push(value),
+                                            Err(error) => self.throw_error(fiber_idx, &error.to_string())?,
+                                        }
+                                        frame_changed = true; continue 'quantum;
                                     } else {
                                         self.fibers[fiber_idx].stack.push(BxValue::new_null());
                                     }
@@ -6034,7 +6183,8 @@ impl VM {
                                 let is_query = obj.borrow().query_columns().is_some();
                                 #[cfg(target_arch = "wasm32")]
                                 let is_query = false;
-                                let property = obj.borrow().get_property(&name);
+                                let obj = obj.clone();
+                                let property = self.native_object_get(&obj, &name);
                                 let val = if !property.is_null() {
                                     property
                                 } else if is_query {
@@ -6208,6 +6358,23 @@ impl VM {
                             None
                         };
 
+                        // BoxLang invokeImplicitAccessor: `obj.name = v` calls `setName( v )` unless `name` is a field.
+                        if let Some(GcObject::Instance(inst)) = self.heap.get_opt(id) {
+                            if self.shapes.get_index(inst.shape_id, name_id).is_none() {
+                                let name = self.interner.resolve(name_id).to_string();
+                                if let Some(setter) = Self::accessor_method_name("set", &name)
+                                    .filter(|setter| self.instance_has_method(base_val, setter))
+                                {
+                                    flush_ip!();
+                                    match self.call_method_value(base_val, &setter, vec![val]) {
+                                        Ok(_) => self.fibers[fiber_idx].stack.push(val),
+                                        Err(error) => self.throw_error(fiber_idx, &error.to_string())?,
+                                    }
+                                    frame_changed = true; continue 'quantum;
+                                }
+                            }
+                        }
+
                         match self.heap.get_mut(id) {
                             GcObject::Struct(s) => {
                                 let name_id = struct_name_id.unwrap_or(name_id);
@@ -6319,7 +6486,8 @@ impl VM {
                                     flush_ip!(); self.throw_error(fiber_idx, "Native object is read-only")?;
                                     frame_changed = true; continue 'quantum;
                                 }
-                                obj.borrow_mut().set_property(&name, val);
+                                let obj = obj.clone();
+                                self.native_object_set(&obj, &name, val);
                                 self.fibers[fiber_idx].stack.push(val);
                             }
                             _ => {
@@ -6359,10 +6527,10 @@ impl VM {
                             let object = object.clone();
                             if object.borrow().native_data("matchbox.variables_scope").is_some() {
                                 let name = self.interner.resolve(name_id).to_string();
-                                let old = object.borrow().get_property(&name);
+                                let old = self.native_object_get(&object, &name);
                                 if old.is_number() {
                                     let new = BxValue::new_number(old.as_number() + 1.0);
-                                    object.borrow_mut().set_property(&name, new);
+                                    self.native_object_set(&object, &name, new);
                                     self.fibers[fiber_idx].stack.push(new);
                                 } else {
                                     flush_ip!();
@@ -6949,7 +7117,9 @@ impl VM {
                             )
                         };
 
-                        if let Some(id) = collection.as_gc_id() {
+                        if let Some(step) = self.query_iteration_step(collection, cursor_val)? {
+                            step
+                        } else if let Some(id) = collection.as_gc_id() {
                             match self.heap.get(id) {
                                 GcObject::Array(arr) => {
                                     if cursor_val < arr.len() {
@@ -7012,7 +7182,7 @@ impl VM {
                                 _ => {
                                     self.throw_error(
                                         fiber_idx,
-                                        "Iteration only supported for arrays and structs",
+                                        "Iteration only supported for arrays, structs, queries and ranges",
                                     )?;
                                     (true, None, None)
                                 }
@@ -7020,7 +7190,7 @@ impl VM {
                         } else {
                             self.throw_error(
                                 fiber_idx,
-                                "Iteration only supported for arrays and structs",
+                                "Iteration only supported for arrays, structs, queries and ranges",
                             )?;
                             (true, None, None)
                         }
@@ -8045,6 +8215,48 @@ impl VM {
         instance.properties.get(index as usize).copied()
     }
 
+    /// `class` and its ancestors, nearest first.
+    fn class_chain(&self, class: &Rc<RefCell<BxClass>>) -> Vec<Rc<RefCell<BxClass>>> {
+        let mut chain = vec![Rc::clone(class)];
+        loop {
+            let parent = chain.last().and_then(|current| {
+                let extends = current.borrow().extends.clone()?;
+                let id = self.get_global(&extends)?.as_gc_id()?;
+                match self.heap.get(id) {
+                    GcObject::Class(parent) => Some(Rc::clone(parent)),
+                    _ => None,
+                }
+            });
+            match parent {
+                Some(parent) if !chain.iter().any(|seen| Rc::ptr_eq(seen, &parent)) => chain.push(parent),
+                _ => return chain,
+            }
+        }
+    }
+
+    /// Private methods are callable from code running inside the class or a related class
+    /// (the caller's receiver is an instance of `class`, a subclass, or an ancestor of it).
+    fn caller_inside_class(&self, fiber_idx: usize, class: &Rc<RefCell<BxClass>>) -> bool {
+        let Some(receiver) = self.fibers[fiber_idx].frames.last().and_then(|frame| frame.receiver) else {
+            return false;
+        };
+        let Some(caller_class) = self.receiver_instance_gc_id(receiver).and_then(|id| match self.heap.get(id) {
+            GcObject::Instance(instance) => Some(Rc::clone(&instance.class)),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.class_chain(&caller_class).iter().any(|c| Rc::ptr_eq(c, class))
+            || self.class_chain(class).iter().any(|c| Rc::ptr_eq(c, &caller_class))
+    }
+
+    /// `get`/`set` + capitalized property name, e.g. ("get", "title") -> "getTitle".
+    fn accessor_method_name(prefix: &str, name: &str) -> Option<String> {
+        let mut chars = name.chars();
+        let first = chars.next()?;
+        Some(format!("{prefix}{}{}", first.to_uppercase(), chars.as_str()))
+    }
+
     pub fn instance_has_method(&self, receiver: BxValue, name: &str) -> bool {
         match receiver.as_gc_id().and_then(|id| self.heap.get_opt(id)) {
             Some(GcObject::Instance(instance)) => self.resolve_method(instance.class.clone(), name).is_some(),
@@ -8818,6 +9030,18 @@ impl VM {
                         method
                     };
 
+                    if let Some(func) = &method {
+                        if func.modifiers.access.as_deref().is_some_and(|a| a.eq_ignore_ascii_case("private"))
+                            && !self.caller_inside_class(fiber_idx, &class)
+                        {
+                            let class_name = class.borrow().name.clone();
+                            return self.throw_error(
+                                fiber_idx,
+                                &format!("The function [{name}] in class [{class_name}] is private and can only be called from within its class"),
+                            );
+                        }
+                    }
+
                     if let Some(func) = method {
                         let mut args = Vec::with_capacity(arg_count);
                         for _ in 0..arg_count {
@@ -9029,7 +9253,10 @@ impl VM {
                 }
             }
         }
-        self.throw_error(fiber_idx, &format!("BIF {} not found.", bif_name))
+        let hint = crate::bifs::required_feature(&bif_name.to_ascii_lowercase())
+            .map(|feature| format!(" It requires the `{feature}` build feature."))
+            .unwrap_or_default();
+        self.throw_error(fiber_idx, &format!("BIF {} not found.{}", bif_name, hint))
     }
 
     fn read_constant(&mut self, fiber_idx: usize, idx: usize) -> Result<BxValue> {

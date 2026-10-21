@@ -154,6 +154,10 @@ pub trait BxVM {
     fn is_string_value(&self, val: BxValue) -> bool;
     fn is_bytes(&self, val: BxValue) -> bool;
     fn type_name_from_value(&self, val: BxValue) -> Option<String>;
+    /// `super.name( args )`: call the parent of `defining_class`'s `name` with `receiver` as `this`.
+    fn call_super_method(&mut self, _receiver: BxValue, _defining_class: &str, _name: &str, _args: Vec<BxValue>) -> Result<BxValue, String> {
+        Err("super is unavailable".into())
+    }
     fn find_global_class_by_name(&self, type_name: &str) -> Option<Rc<RefCell<BxClass>>>;
     fn find_global_interface_by_name(&self, type_name: &str) -> Option<Rc<RefCell<BxInterface>>>;
     fn class_matches_type_name(&self, class: &Rc<RefCell<BxClass>>, type_name: &str) -> bool;

@@ -269,8 +269,15 @@ impl<'a> Parser<'a> {
             TokenKind::CastAs => "castas".to_string(),
             TokenKind::Xor => "xor".to_string(),
             TokenKind::Eqv => "eqv".to_string(),
+            TokenKind::Identifier if raw.eq_ignore_ascii_case("mod") => "%".to_string(),
             _ => raw.to_string(),
         }
+    }
+
+    // `mod` is only an operator between operands, so it stays usable as an identifier.
+    fn is_mod_operator(&self) -> bool {
+        self.token_text_lower(0).as_deref() == Some("mod")
+            && !matches!(self.kind(1), Some(TokenKind::Equal) | Some(TokenKind::Dot) | Some(TokenKind::LeftParen))
     }
 
     fn token_text_lower(&self, offset: usize) -> Option<String> {
@@ -420,8 +427,17 @@ impl<'a> Parser<'a> {
         let bare_abort = self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("abort"))
             && (self.kind(1) == Some(TokenKind::Semicolon)
                 || self.tokens.get(self.pos + 1).is_some_and(|token| { let name = &self.source[token.span.start..token.span.end]; name.eq_ignore_ascii_case("type") || name.eq_ignore_ascii_case("showerror") }));
-        if bare_abort || (self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon)) {
+        if bare_abort || self.is_script_component_start() || (self.peek_lexeme().is_some_and(|name| name.eq_ignore_ascii_case("bx")) && self.kind(1) == Some(TokenKind::Colon)) {
             return self.parse_component_statement(line);
+        }
+        if self.kind(1) == Some(TokenKind::Colon)
+            && matches!(self.kind(2), Some(TokenKind::For) | Some(TokenKind::While) | Some(TokenKind::Do))
+            && self.peek_kind() == Some(TokenKind::Identifier)
+        {
+            let label = self.advance_lexeme().unwrap_or_default();
+            self.pos += 1; // :
+            let body = self.parse_statement()?;
+            return Ok(Statement::new(StatementKind::Labeled { label, body: vec![body] }, line));
         }
         match self.peek_kind() {
             Some(TokenKind::Import) => self.parse_import(line),
@@ -559,6 +575,15 @@ impl<'a> Parser<'a> {
 
     // ---- Statement parsers ----
 
+    /// `lock name="a" { ... }` and `thread name="t" { ... }`: a component name followed by
+    /// an attribute or a body, so plain variables named `lock` or `thread` still work.
+    fn is_script_component_start(&self) -> bool {
+        self.kind(0) == Some(TokenKind::Identifier)
+            && self.token_text_lower(0).as_deref().is_some_and(|name| name == "lock" || name == "thread")
+            && (self.kind(1) == Some(TokenKind::LeftBrace)
+                || (self.kind(1) == Some(TokenKind::Identifier) && self.kind(2) == Some(TokenKind::Equal)))
+    }
+
     fn parse_component_statement(&mut self, line: u32) -> Result<Statement> {
         let name = self.expect_get(TokenKind::Identifier)?;
         let name = if name.eq_ignore_ascii_case("bx") {
@@ -625,7 +650,8 @@ impl<'a> Parser<'a> {
             String::new()
         };
         let mut extends = None;
-        let mut accessors = false;
+        // BoxLang generates property accessors unless `accessors=false`.
+        let mut accessors = true;
         let mut implements = Vec::new();
 
         while matches!(self.peek_kind(),
@@ -642,6 +668,17 @@ impl<'a> Parser<'a> {
                     match part { StringPart::Text(text) => Some(text.as_str()), _ => None }
                 }).collect::<Option<String>>(),
                 ExpressionKind::Literal(Literal::Boolean(value)) => Some(value.to_string()),
+                // BoxLang annotation values may be a bare fqn: `class extends=Base implements=models.Y`.
+                ExpressionKind::Identifier(_) | ExpressionKind::MemberAccess { .. } => {
+                    fn path(expr: &Expression) -> Option<String> {
+                        match &expr.kind {
+                            ExpressionKind::Identifier(name) => Some(name.clone()),
+                            ExpressionKind::MemberAccess { base, member } => Some(format!("{}.{}", path(base)?, member)),
+                            _ => None,
+                        }
+                    }
+                    path(v)
+                }
                 _ => None,
             });
             match attr_name.to_ascii_lowercase().as_str() {
@@ -1109,23 +1146,25 @@ impl<'a> Parser<'a> {
         Ok(Statement::new(StatementKind::Throw(expr), line))
     }
 
+    fn parse_jump_label(&mut self) -> Option<String> {
+        if self.peek_is(TokenKind::Semicolon) || self.at_statement_boundary() {
+            return None;
+        }
+        self.advance_lexeme()
+    }
+
     fn parse_continue(&mut self, line: u32) -> Result<Statement> {
         self.pos += 1; // continue
-        // Optional label (Phase 2 feature)
-        if !self.peek_is(TokenKind::Semicolon) && !self.at_statement_boundary() {
-            let _label = self.advance_lexeme();
-        }
+        let label = self.parse_jump_label();
         if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
-        Ok(Statement::new(StatementKind::Continue, line))
+        Ok(Statement::new(StatementKind::Continue(label), line))
     }
 
     fn parse_break(&mut self, line: u32) -> Result<Statement> {
         self.pos += 1; // break
-        if !self.peek_is(TokenKind::Semicolon) && !self.at_statement_boundary() {
-            let _label = self.advance_lexeme();
-        }
+        let label = self.parse_jump_label();
         if self.peek_is(TokenKind::Semicolon) { self.pos += 1; }
-        Ok(Statement::new(StatementKind::Break, line))
+        Ok(Statement::new(StatementKind::Break(label), line))
     }
 
     fn parse_rethrow(&mut self, line: u32) -> Result<Statement> {
@@ -1479,6 +1518,7 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Plus) | Some(TokenKind::Minus) => 10,
                 Some(TokenKind::Star) | Some(TokenKind::Slash) | Some(TokenKind::Percent)
                 | Some(TokenKind::Backslash) => 11,
+                Some(TokenKind::Identifier) if self.is_mod_operator() => 11,
                 Some(TokenKind::Caret) => 12, // power ^
                 _ => 0,
             };
@@ -1565,7 +1605,7 @@ impl<'a> Parser<'a> {
     fn parse_unary_inner(&mut self) -> Result<Expression> {
         let line = self.peek_line();
         match self.peek_kind() {
-            Some(TokenKind::Bang) => {
+            Some(TokenKind::Bang) | Some(TokenKind::Not) => {
                 self.pos += 1;
                 let expr = self.parse_unary()?;
                 Ok(Expression::new(ExpressionKind::UnaryNot(Box::new(expr)), line))

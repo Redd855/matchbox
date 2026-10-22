@@ -158,7 +158,7 @@ fn object(call: &Call<'_>, resource: Resource) -> Result<Value, String> {
 #[allow(clippy::mut_from_ref)]
 unsafe fn handle<'a>(call: &'a Call<'_>) -> Result<&'a mut Handle, String> {
     let data = unsafe { call.object_data(call.argument(0)?, KIND)? };
-    Ok(unsafe { &mut *data.cast::<Handle>() })
+    Ok(unsafe { data.cast::<Handle>().as_mut() })
 }
 #[allow(clippy::mut_from_ref)]
 unsafe fn resource<'a>(call: &'a Call<'_>) -> Result<&'a mut Resource, String> {

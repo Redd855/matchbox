@@ -123,7 +123,7 @@ unsafe extern "C" fn info(
             let call = Call::new(ctx, api, args, len);
             let number = *call
                 .object_data(call.argument(0)?, "fixture.number.v1")?
-                .cast::<f64>();
+                .cast::<f64>().as_ref();
             let result = call.struct_new()?;
             call.struct_set(result, "value", call.number_new(number)?)?;
             Ok(result)
@@ -273,9 +273,9 @@ unsafe extern "C" fn held(
     unsafe {
         guarded(ctx, api, out, || {
             let call = Call::new(ctx, api, args, len);
-            let root = &*call
+            let root = call
                 .object_data(call.argument(0)?, "fixture.root.v1")?
-                .cast::<RetainedValue>();
+                .cast::<RetainedValue>().as_ref();
             root.value(&call)
         })
     }

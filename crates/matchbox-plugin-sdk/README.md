@@ -77,6 +77,8 @@ The SDK has its own Cargo version, independent of MatchBox releases. Binary comp
 
 Value handles, context pointers, and borrowed strings expire at the end of each invocation. Request `require_roots()` during initialization to obtain the immutable roots table; `Call::retain()` creates an owned `RetainedValue` for use between calls. Release needs no live invocation and remains valid after VM shutdown. Reads are restricted to the original VM and provider. Roots do not keep the VM alive; avoid strong cycles involving the owning native object.
 
+`Call::object_data()` returns `NonNull<c_void>` after checking the host status and payload. Rust callers use `.cast::<T>().as_ref()` or `.as_mut()` inside `unsafe`; correct payload type, exclusive mutable access, and invocation-bounded lifetimes remain their responsibility. This changes the Rust helper's source API, not the `ValuesV1` C ABI or compatibility with existing compiled plugins.
+
 All operations, including root destruction, are synchronous on the VM thread. Rust-owned payloads remain private to the plugin and are destroyed by its registered drop callback. Each side frees its own allocations. No Rust trait object, `String`, `Vec`, or VM/NaN-box layout crosses the ABI.
 
 Use `guarded()` to catch Rust panics inside callbacks; never unwind across the C ABI, including initialization and destructors. Recovery requires `panic = "unwind"`; `panic = "abort"` terminates the process. Plugins are trusted native code, not sandboxed. No async callbacks, unload, or hot reload are provided.

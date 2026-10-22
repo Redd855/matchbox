@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-use std::ffi::c_void;
+use std::{ffi::c_void, ptr::NonNull};
 
 pub const ABI_MAJOR: u32 = 1;
 pub const VALUES_V1: &str = "matchbox.values.v1";
@@ -232,17 +232,15 @@ impl<'a> Call<'a> {
             )
         })
     }
+    /// Returns a non-null payload borrowed for this invocation.
     /// # Safety
     /// Cast/dereference the returned pointer only as the payload type registered for `kind`.
-    pub unsafe fn object_data(&self, value: Value, kind: &str) -> Result<*mut c_void, String> {
+    pub unsafe fn object_data(&self, value: Value, kind: &str) -> Result<NonNull<c_void>, String> {
         let mut out = std::ptr::null_mut();
-        if unsafe { (self.api.object_data)(self.context, value, Text::new(kind), &mut out) } == 0
-            && !out.is_null()
-        {
-            Ok(out)
-        } else {
-            Err(format!("Expected {kind}"))
+        if unsafe { (self.api.object_data)(self.context, value, Text::new(kind), &mut out) } != 0 {
+            return Err(format!("Expected {kind}"));
         }
+        NonNull::new(out).ok_or_else(|| format!("Expected {kind}"))
     }
 }
 
@@ -362,9 +360,11 @@ mod tests {
             let call = unsafe {
                 Call::new((&mut context as *mut (i32, *mut c_void)).cast(), &api, std::ptr::null(), 0)
             };
-            let result = unsafe { call.object_data(1, "test.payload") };
+            let result: Result<NonNull<c_void>, String> = unsafe { call.object_data(1, "test.payload") };
             if status == 0 && !output.is_null() {
-                assert_eq!(result.unwrap(), pointer);
+                let result = result.unwrap();
+                assert_eq!(result.as_ptr(), pointer);
+                assert_eq!(unsafe { *result.cast::<u64>().as_ref() }, 42);
             } else {
                 assert!(result.is_err(), "accepted status={status} with payload={output:p}");
             }

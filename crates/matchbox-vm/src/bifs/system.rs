@@ -345,30 +345,56 @@ pub fn get_file_from_path(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue
     Ok(BxValue::new_ptr(vm.string_new(file.to_string())))
 }
 
-pub fn box_announce(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+pub fn box_announce(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    let state = args.first().filter(|value| !value.is_null()).ok_or("boxAnnounce() requires state")?;
+    if args.len() > 3 { return Err("boxAnnounce() accepts at most three arguments".into()); }
+    if args.get(2).is_some_and(|value| !value.is_null() && !vm.to_string(*value).eq_ignore_ascii_case("global")) {
+        return Err("Only the global interception pool is supported".into());
+    }
+    let state = vm.to_string(*state);
+    let data = args.get(1).copied().filter(|value| !value.is_null()).unwrap_or_else(|| BxValue::new_ptr(vm.struct_new()));
+    vm.announce(&state, data)?;
     Ok(BxValue::new_bool(true))
 }
 
 pub fn box_ast(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
-    if args.is_empty() {
-        return Err("boxAST() expects source".to_string());
+    if args.len() > 6 { return Err("boxAST() accepts source, filepath, returnType, sourceType, recover, includeTokens".into()); }
+    let text_arg = |index: usize, default: &str| args.get(index).filter(|value| !value.is_null()).map(|value| vm.to_string(*value)).unwrap_or_else(|| default.into());
+    let mut source = text_arg(0, "");
+    let filepath = text_arg(1, "");
+    let return_type = text_arg(2, "struct").to_ascii_lowercase();
+    let mut source_type = text_arg(3, "script").to_ascii_lowercase();
+    let bool_arg = |index: usize| -> Result<bool, String> {
+        match args.get(index).filter(|value| !value.is_null()) {
+            None => Ok(false), Some(value) if value.is_bool() => Ok(value.as_bool()),
+            _ => Err("boxAST() recover and includeTokens must be booleans".into()),
+        }
+    };
+    let recover = bool_arg(4)?;
+    let include_tokens = bool_arg(5)?;
+    if !matches!(return_type.as_str(), "struct" | "json" | "text" | "native") { return Err("boxAST() returnType must be one of struct, json, text, native".into()); }
+    if !matches!(source_type.as_str(), "script" | "template" | "cfscript" | "cftemplate") { return Err("boxAST() sourceType must be one of script, template, cfscript, cftemplate".into()); }
+    if source.trim().is_empty() && !filepath.trim().is_empty() {
+        #[cfg(feature = "bif-io")]
+        {
+            source = std::fs::read_to_string(&filepath).map_err(|error| format!("boxAST() {}: {}", filepath, error))?;
+            if filepath.to_ascii_lowercase().ends_with(".bxm") { source_type = "template".into(); }
+        }
+        #[cfg(not(feature = "bif-io"))]
+        return Err("boxAST() filepath requires the bif-io build feature".into());
+    } else if source.trim().is_empty() && !recover {
+        return Err("Either 'source' or 'filepath' argument must be provided to boxAST()".into());
     }
-    let return_type = args
-        .get(1)
-        .map(|value| vm.to_string(*value).to_ascii_lowercase())
-        .unwrap_or_else(|| "struct".to_string());
-    if matches!(return_type.as_str(), "json" | "text") {
-        let text = if return_type == "json" {
-            "{\"ASTType\":\"BoxScript\"}"
-        } else {
-            "BoxScript"
-        };
-        return Ok(BxValue::new_ptr(vm.string_new(text.to_string())));
+    // Template ASTs currently contain compiler stubs/desugaring, not faithful source data.
+    if source_type != "script" { return Err(format!("boxAST() {} AST inspection is not implemented", source_type)); }
+    if return_type == "native" { return super::ast_visit::parse(vm, source, if filepath.is_empty() { None } else { Some(&filepath) }, recover, include_tokens); }
+    let root = matchbox_parser::inspect::inspect(&source, if filepath.is_empty() { None } else { Some(&filepath) }, recover, include_tokens).map_err(|error| error.to_string())?;
+    match return_type.as_str() {
+        "struct" => Ok(super::json::json_to_bx(vm, root)),
+        "json" => Ok(BxValue::new_ptr(vm.string_new(serde_json::to_string(&root).map_err(|error| error.to_string())?))),
+        // Text is source text, not a placeholder or invented pretty-print transformation.
+        _ => Ok(BxValue::new_ptr(vm.string_new(source))),
     }
-    let id = vm.struct_new();
-    let ast_type = vm.string_new("BoxScript".to_string());
-    vm.struct_set(id, "ASTType", BxValue::new_ptr(ast_type));
-    Ok(BxValue::new_ptr(id))
 }
 
 pub fn get_function_called_name(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
@@ -378,10 +404,7 @@ pub fn get_function_called_name(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<
 }
 
 pub fn get_box_context(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    let id = vm.struct_new();
-    let context_type = vm.string_new("MatchBoxContext".to_string());
-    vm.struct_set(id, "type", BxValue::new_ptr(context_type));
-    Ok(BxValue::new_ptr(id))
+    vm.execution_context()
 }
 
 pub fn run_thread_in_context(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
@@ -395,7 +418,17 @@ pub fn run_thread_in_context(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxVa
 }
 
 pub fn box_module_reload(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_null())
+    Err("Module hot reload is not supported; rebuild and restart the application".into())
+}
+
+/// `super.method( args )`, compiled as `__supercall( this, definingClass, method, args... )`.
+pub fn super_call(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    if args.len() < 3 {
+        return Err("super call requires this, the defining class and a method name".into());
+    }
+    let defining_class = vm.to_string(args[1]);
+    let method = vm.to_string(args[2]);
+    vm.call_super_method(args[0], &defining_class, &method, args[3..].to_vec())
 }
 
 pub fn lock(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
@@ -410,12 +443,16 @@ pub fn write_log(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, Strin
     Ok(BxValue::new_null())
 }
 
-pub fn get_base_tag_data(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_null())
+pub fn get_base_tag_data(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    let tag = args.first().filter(|value| vm.is_string_value(**value)).ok_or("getBaseTagData() requires a tag name")?;
+    Err(format!("{} not found; source-backed custom tags are not supported", vm.to_string(*tag)))
 }
 
 pub fn get_base_tag_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.string_new(String::new())))
+    let names = vm.execution_components()?.into_iter().map(|state| {
+        vm.to_string(vm.struct_get(state.as_gc_id().unwrap(), "name"))
+    }).collect::<Vec<_>>().join(",");
+    Ok(BxValue::new_ptr(vm.string_new(names)))
 }
 
 pub fn get_base_template_path(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
@@ -440,20 +477,42 @@ pub fn get_box_version_info(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxVa
     Ok(BxValue::new_ptr(id))
 }
 
-pub fn get_component_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.struct_new()))
+pub fn get_component_list(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+    Err("Component descriptor reflection is not supported; use componentService.getComponentNames()".into())
 }
 
-pub fn get_function_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.struct_new()))
+pub fn get_function_list(_vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+    Err("BIF descriptor reflection is not supported; use functionService.getGlobalFunctionNames()".into())
 }
 
-pub fn get_module_info(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
+fn module_registry(vm: &mut dyn BxVM) -> Result<Option<usize>, String> {
+    let Some(service) = vm.get_global_value("__mb_moduleservice") else { return Ok(None); };
+    vm.native_object_call_method(service.as_gc_id().ok_or("Invalid module service")?, "getRegistry", &[])?
+        .as_gc_id().map(Some).ok_or("Invalid module registry".into())
+}
+
+pub fn get_module_info(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {
+    if args.len() != 1 || !vm.is_string_value(args[0]) { return Err("getModuleInfo() requires a module name".into()); }
+    if let Some(registry) = module_registry(vm)? {
+        let name = vm.to_string(args[0]);
+        if vm.struct_key_exists(registry, &name) {
+            let record = vm.struct_get(registry, &name);
+            return vm.native_object_call_method(record.as_gc_id().ok_or("Invalid module record")?, "asStruct", &[]);
+        }
+    }
     Ok(BxValue::new_ptr(vm.struct_new()))
 }
 
 pub fn get_module_list(vm: &mut dyn BxVM, _args: &[BxValue]) -> Result<BxValue, String> {
-    Ok(BxValue::new_ptr(vm.struct_new()))
+    let result = vm.struct_new();
+    if let Some(registry) = module_registry(vm)? {
+        for name in vm.struct_key_array(registry) {
+            let record = vm.struct_get(registry, &name);
+            let value = vm.native_object_call_method(record.as_gc_id().ok_or("Invalid module record")?, "asStruct", &[])?;
+            vm.struct_set(result, &name, value);
+        }
+    }
+    Ok(BxValue::new_ptr(result))
 }
 
 pub fn invoke(vm: &mut dyn BxVM, args: &[BxValue]) -> Result<BxValue, String> {

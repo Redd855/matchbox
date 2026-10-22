@@ -139,6 +139,31 @@ impl BoxString {
     }
 }
 
+impl Drop for BoxString {
+    fn drop(&mut self) {
+        if !matches!(self.repr, StringRepr::Rope(_)) {
+            return;
+        }
+        let empty = || StringRepr::Inline { len: 0, buf: [0; SSO_CAPACITY] };
+        let StringRepr::Rope(mut node) = std::mem::replace(&mut self.repr, empty()) else {
+            unreachable!();
+        };
+        let mut pending = Vec::new();
+        loop {
+            // Shared nodes keep their owners; drain only uniquely owned children.
+            if let Some(mut rope) = Arc::into_inner(node) {
+                for child in [&mut rope.left, &mut rope.right] {
+                    if let StringRepr::Rope(child) = std::mem::replace(&mut child.repr, empty()) {
+                        pending.push(child);
+                    }
+                }
+            }
+            let Some(next) = pending.pop() else { break };
+            node = next;
+        }
+    }
+}
+
 // ------------------------------------------------------------------------
 // Traits
 // ------------------------------------------------------------------------
@@ -243,9 +268,11 @@ impl fmt::Display for BoxString {
                 write!(f, "{}", s)
             }
             StringRepr::Flat(s) => write!(f, "{}", s),
-            StringRepr::Rope(rope) => {
-                write!(f, "{}", rope.left)?;
-                write!(f, "{}", rope.right)
+            StringRepr::Rope(_) => {
+                for chunk in BoxStringChunkIter::new(self) {
+                    f.write_str(std::str::from_utf8(chunk).map_err(|_| fmt::Error)?)?;
+                }
+                Ok(())
             }
         }
     }

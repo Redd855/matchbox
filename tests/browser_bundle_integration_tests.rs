@@ -448,6 +448,12 @@ class PrinterState {
     this.isSupported = true;
     this.error = "";
 
+    function getDescription() {
+        if (this.status == "Rejected") throw "getter rejected";
+        return this.status & ":ready";
+    }
+    function setRejected(value) { throw "setter rejected"; }
+
     function connect() {
         this.connection = "connected";
         this.characteristic = "writeable";
@@ -511,6 +517,16 @@ try {
     report(`fail-error-${String(printer.error)}`);
     throw new Error("bad-error");
   }
+  if (printer.description !== "Ready:ready" || !Object.keys(printer).includes("status")) {
+    throw new Error("bad-implicit-getter-or-keys");
+  }
+  printer.status = "Rejected";
+  let readRejected = false, writeRejected = false;
+  try { printer.description; } catch (error) { readRejected = String(error).includes("getter rejected"); }
+  try { printer.rejected = "bad"; } catch (error) { writeRejected = String(error).includes("setter rejected"); }
+  if (!readRejected || !writeRejected) throw new Error("accessor-errors-were-swallowed");
+  printer.status = "Changed";
+  if (await printer.getStatus() !== "Changed") throw new Error("bad-implicit-setter");
 
   await printer.connect();
   if (
@@ -1093,6 +1109,32 @@ try {
         "browser_bundle_invokes_bluetooth_gatt_methods_from_instance_property",
         source,
         html,
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn browser_bundle_supports_clocks_and_synchronous_sleep() {
+    run_browser_page(
+        "browser_bundle_supports_clocks_and_synchronous_sleep",
+        r#"
+function clockProbe() {
+    start = getTickCount();
+    sleep(1);
+    values = [1,2,3].map((n) => n * 2);
+    return getTickCount() >= start && values.sum() == 12;
+}
+"#,
+        r#"<!DOCTYPE html><script type="module">
+import { ready, clockProbe } from "./browser_bundle_supports_clocks_and_synchronous_sleep.js";
+try {
+    await ready;
+    const result = await clockProbe();
+    await fetch(`/report/${result === true ? "ok" : "fail-result"}`);
+} catch (error) {
+    await fetch(`/report/fail-${encodeURIComponent(String(error))}`);
+}
+</script>"#,
     );
 }
 

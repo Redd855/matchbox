@@ -92,7 +92,7 @@ try {
     errored = true;
 }
 if (!errored) {
-    throw("struct: expected an error"); 
+    throw("struct: expected an error");
 }
 errored = false;
 try {

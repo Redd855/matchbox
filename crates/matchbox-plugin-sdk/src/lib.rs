@@ -236,7 +236,9 @@ impl<'a> Call<'a> {
     /// Cast/dereference the returned pointer only as the payload type registered for `kind`.
     pub unsafe fn object_data(&self, value: Value, kind: &str) -> Result<*mut c_void, String> {
         let mut out = std::ptr::null_mut();
-        if unsafe { (self.api.object_data)(self.context, value, Text::new(kind), &mut out) } == 0 {
+        if unsafe { (self.api.object_data)(self.context, value, Text::new(kind), &mut out) } == 0
+            && !out.is_null()
+        {
             Ok(out)
         } else {
             Err(format!("Expected {kind}"))
@@ -322,6 +324,52 @@ unsafe fn require_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! unavailable {
+        ($name:ident($($ty:ty),*)) => {
+            unsafe extern "C" fn $name($(_: $ty),*) -> i32 { 1 }
+        };
+    }
+    unavailable!(string_get(Context, Value, *mut Text));
+    unavailable!(number_get(Context, Value, *mut f64));
+    unavailable!(number_new(Context, f64, *mut Value));
+    unavailable!(string_new(Context, Text, *mut Value));
+    unavailable!(bool_new(Context, bool, *mut Value));
+    unavailable!(null_new(Context, *mut Value));
+    unavailable!(struct_set(Context, Value, Text, Value));
+    unavailable!(object_new(Context, Text, *mut c_void, DropObject, Text, *mut Value));
+    unsafe extern "C" fn error(_: Context, _: Text) {}
+    unsafe extern "C" fn object_data(
+        ctx: Context, _: Value, _: Text, out: *mut *mut c_void,
+    ) -> i32 {
+        let (status, payload) = unsafe { &*ctx.cast::<(i32, *mut c_void)>() };
+        if !payload.is_null() {
+            unsafe { *out = *payload };
+        }
+        *status
+    }
+
+    #[test]
+    fn object_data_requires_success_and_a_nonnull_payload() {
+        let api = ValuesV1 {
+            string_get, number_get, number_new, string_new, bool_new, null_new,
+            struct_new: null_new, struct_set, object_new, object_data, error,
+        };
+        let mut payload = 42_u64;
+        let pointer = (&mut payload as *mut u64).cast::<c_void>();
+        for (status, output) in [(0, std::ptr::null_mut()), (0, pointer), (1, pointer), (1, std::ptr::null_mut())] {
+            let mut context = (status, output);
+            let call = unsafe {
+                Call::new((&mut context as *mut (i32, *mut c_void)).cast(), &api, std::ptr::null(), 0)
+            };
+            let result = unsafe { call.object_data(1, "test.payload") };
+            if status == 0 && !output.is_null() {
+                assert_eq!(result.unwrap(), pointer);
+            } else {
+                assert!(result.is_err(), "accepted status={status} with payload={output:p}");
+            }
+        }
+    }
 
     #[test]
     fn published_capability_layouts_remain_fixed() {

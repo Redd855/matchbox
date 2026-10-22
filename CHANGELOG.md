@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-22
+
 ### Added
 - **HTML Encoding**: Added `encodeForHTML()` and its `htmlEditFormat()` alias, matching BoxLang JVM output.
 - **SQLite Datasources**: Register SQLite databases programmatically or through minimal `matchbox.toml` datasource configuration.
